@@ -28,6 +28,10 @@ Rules
   R12 the scan after the lane is a report (ticket 1639): its report function returns 0 and never exits, it is called once, from the
       lane's entry, as `|| true`, after the lock is released and before the scratch is freed; the facts it rests on (what was
       published, which project) have owners.
+  R13 the report document has one writer (ticket 1639): `safe-core project-report` is started only by safe_gate_project_lane_report_write,
+      which returns 0 only and is called once, from the lane's entry, as `|| true`, between the scan and the scratch's removal; a path
+      into `reports` (the lane's reports directory) appears only on the line that makes it private: nothing of the gate reads, lists, copies
+      or removes a report. The facts the document rests on have owners.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -66,7 +70,20 @@ STATE = {
     "SAFE_GATE_LANE_FACT_PUBLISHED": {"": {"safe_gate_project_lane_in_subshell"}, "tree": {"safe_gate_project_lane_run"},
                                       "lockfile": {"safe_gate_project_lane_run"}},
     "SAFE_GATE_LANE_FACT_PROJECT": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
+    # R13: what the report document rests on has owners: the decision's moment (the runner) and the prompts' loop
+    "SAFE_GATE_LANE_FACT_VERB": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
+    "SAFE_GATE_LANE_FACT_DRYRUN": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
+    "SAFE_GATE_LANE_FACT_LOCKONLY": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
+    "SAFE_GATE_LANE_FACT_DATA": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
+    "SAFE_GATE_LANE_FACT_ASKED": {"0": {"safe_gate_project_lane_in_subshell"}, "*": {"safe_gate_project_lane_prompts"}},
+    "SAFE_GATE_LANE_FACT_ENDED": {"none": {"safe_gate_project_lane_in_subshell"}, "accepted": {"safe_gate_project_lane_prompts"},
+                                  "declined": {"safe_gate_project_lane_prompts"}, "unread": {"safe_gate_project_lane_prompts"}},
 }
+# R13: the report document has ONE writer (the core's `project-report write`, started by the one function below, called once from the
+# entry as `|| true` after the scan and before the scratch is freed, and returning 0 only); the lane's reports directory is named where it
+# is made private and nowhere else: nothing of the gate reads, lists, copies or removes a report
+REPORT_WRITER = "safe_gate_project_lane_report_write"
+REPORTS_DIR = re.compile(r"/reports(?![A-Za-z0-9_-])|(?<![A-Za-z0-9_-])reports/")
 # R12: the scan after the lane is a report: it ends the lane's own business never (its function returns 0 and nothing else, never exits),
 # it is called once, from the entry, as `|| true`, after the lock is released and before the scratch is freed
 SCAN_ENTRY = "safe_gate_project_lane_scan_report"
@@ -290,6 +307,20 @@ def main(path):
                 problems.append(f"{number}:{fn}:R11: the report's text function is not one jq program (it names something of the shell)")
             before = text
             continue
+        # R13: one writer of the report, one place that names the reports directory, nothing that reads it
+        if command_at(bare, REPORT_WRITER) and not FN.match(text):
+            if fn != ENTRY:
+                problems.append(f"{number}:{fn}:R13: the report is written outside the lane's entry")
+            elif not re.search(r"(?:^|[;&|({]|\bthen\b)\s*" + REPORT_WRITER + r"\s.*\|\|\s*true\s*$", bare.strip()):
+                problems.append(f"{number}:{fn}:R13: the report's writer is not called as `|| true`: its status would become the command's")
+        if fn == REPORT_WRITER and not FN.match(text) and re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:exit|return\s+(?!0\s*(?:$|[;&|)}]))\S)", bare + " "):
+            problems.append(f"{number}:{fn}:R13: the report's writer returns a status other than 0")
+        if "project-report" in text and fn != REPORT_WRITER:
+            problems.append(f"{number}:{fn}:R13: the report's core command is started outside its one writer")
+        if fn == REPORT_WRITER and "project-report" in text and "project-report write" not in text:
+            problems.append(f"{number}:{fn}:R13: the writer starts something other than the write command")
+        if REPORTS_DIR.search(re.sub(r"#.*$", "", text)) and not (fn == RUNNER and "safe_gate_lane_private_dir" in text) and not text.lstrip().startswith("#"):
+            problems.append(f"{number}:{fn}:R13: the reports directory is named outside the place that makes it private")
         # R12: the scan is a report
         if command_at(bare, SCAN_ENTRY) and not FN.match(text):
             if fn != ENTRY:
@@ -327,9 +358,9 @@ def main(path):
         problems.append(f"0:{SCRIPT_TEXT}:R11: the report's text function holds {jq_words} jq words, not exactly one")
     # R12: order at the entry: unlock, then the scan, then the scratch is freed
     entry_calls = [(n, w) for n, fn, t, b in lane if fn == ENTRY and not FN.match(t)
-                   for w in ("safe_gate_project_lane_unlock", SCAN_ENTRY, "safe_gate_project_lane_cleanup") if command_at(b, w)]
-    if [w for n, w in entry_calls] != ["safe_gate_project_lane_unlock", SCAN_ENTRY, "safe_gate_project_lane_cleanup"]:
-        problems.append(f"0:{ENTRY}:R12: the entry does not release the lock, scan and free the scratch exactly once each, in that order")
+                   for w in ("safe_gate_project_lane_unlock", SCAN_ENTRY, REPORT_WRITER, "safe_gate_project_lane_cleanup") if command_at(b, w)]
+    if [w for n, w in entry_calls] != ["safe_gate_project_lane_unlock", SCAN_ENTRY, REPORT_WRITER, "safe_gate_project_lane_cleanup"]:
+        problems.append(f"0:{ENTRY}:R12: the entry does not release the lock, scan, write the report and free the scratch exactly once each, in that order")
     if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
         problems.append("0::R9: the runner does not read the standing decision exactly once")
     # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them

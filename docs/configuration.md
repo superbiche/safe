@@ -629,8 +629,34 @@ pass and warnings under `environment.release_follow`.
   publishes the judged `package.json` and `package-lock.json` (the binder's
   files-only mode: the same checks on the live inputs, the same atomic exchange of
   each file, no staged tree, no tree exchange, no install command) and installs
-  nothing. Each decision report is kept under
-  `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
+  nothing. Spec: Safe Lanes slice 1.
+  **The report document** (ticket 1639): one document per command, written once, at the very end (after the scan, before the scratch is
+  removed), for every end the lane controls at or after the decision: a pass (a lockfile-only one included), a refusal, a declined
+  prompt, an answer that could not be read, a failed installation, a dry run, an interruption it could end. A command killed outright
+  (SIGKILL, a power cut) leaves none, and so does a command that ended before its decision (a refusal by a guard, a hand-over to today's
+  gate). `safe-core project-report write` is its one writer: it builds the document from the pieces the run left (the decision report, the
+  binder's result, the answers, the scripts, the scan's summary) and from nothing else, and writes it as
+  `<data>/project-lane/reports/<key>/<UTC time>-<pid>-<random>.json`, where `<key>` is the digest of the project's physical path (the key
+  is the directory's name and is no member of any document). The directories are the user's, closed to others (0700), opened one name at a
+  time without following a link; the file is created 0600, synced and renamed into place without replacing anything, so two commands
+  that end in one second keep both documents. The last 50 of a project are kept: the oldest are removed when one is written, only regular
+  files of the report's own name, by name below the held project directory, never through a link, never outside the project's directory;
+  a pruning that fails is one line. A document is never cut short: past 1 MiB (measured: a document of 1000 advisories is 164 KB) it is
+  not written and one line says so. Any failure to write is one line before the lane's own last line, and never changes the status. The
+  gate itself never reads, lists or removes a report (a lane lint rule): they are for the operator, and for the asynchronous follow-up that
+  is not built here.
+  Members (schema 1): `schema_version`, `written_at` (UTC), `safe_version`, `command` (`verb`, `dry_run`, `package_lock_only`; the
+  arguments are not kept), `end` (one of `published`, `published_lockfile`, `dry_run`, `refused`, `declined`, `unread_answer`,
+  `stopped`, `bind_refused`, `install_failed`, `verification_failed`, `inputs_changed`, `interrupted`, `publication_failed`,
+  `install_unsettled`, `bind_unreadable`), `status` (the lane's exit status), `passed` (true only for a publication with status 0),
+  `lockfile_sha256` (the lockfile on disk at the end), `decision` (the baseline, the outcome, `entries` and the counts of the difference
+  and never the list of entries, the advisories fixed, already present with whether the exposure changed and the count by severity, and
+  introduced, the malice facts, the cooldown, the Socket judgement of the named roots, the artifacts the evidence is on with their
+  host, and the counts of what was left out), `prompts` (how many were asked, how they ended, the answers recorded), `binder`, `scripts`
+  (the packages with install-time scripts by identity and closed event; no path), `scan` (the summary and the digest of the lockfile it
+  read, not its full result: `safe audit repo-audit .` shows the detail). Every string is a member of a closed list or has passed a
+  grammar; what does not is counted in an `*_other` member and never kept. No text of npm, of the scanner, of a registry or of the
+  environment is in it, and a source is shown as its host alone, never as a location.
   **The project scan is a report** (ticket 1639): the lane asks nothing of a scan at install time. After a verified publication
   (a lockfile-only one included; not after a refusal, a dry run or a hand-over to today's gate, which runs its own) and after the
   project's lock is released, the lane runs the scan of the project (`safe audit repo-audit . --deps-only`, the auditor beside the

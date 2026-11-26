@@ -117,6 +117,8 @@ exactly as judged (a staged, verified tree published by `safe-core project-bind`
 `npm ci` introduces nothing: its lockfile is read whole for malice and installed the
 same way; see [configuration](configuration.md). The lane asks nothing of the project scan at install time: after a
 verified publication it runs the scan and prints its findings as a report that never changes the command's status.
+Each lane command that reaches its decision also leaves one report document in safe's data directory, written once at
+the end by `safe-core project-report` and never read by the gate (see [configuration](configuration.md)).
 
 ## Release Binaries
 

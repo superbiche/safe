@@ -599,6 +599,18 @@ ul = find(r'  safe_gate_project_lane_unlock\n  if \(\( rc == 0 \)\)')
 write("the-scan-before-the-lock-is-released", src[:ul.start()] + '  safe_gate_project_lane_scan_report || true\n' + src[ul.start():])
 pf = find(r'    SAFE_GATE_LANE_FACT_PUBLISHED=tree\n')
 write("the-published-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_PUBLISHED=tree\n' + src[fz.end():])
+# R13 (ticket 1639): the report document has one writer, one caller, and nothing of the gate reads the reports directory
+wr = find(r'(safe_gate_project_lane_report_write\(\) \{\n)')
+write("the-report-writer-returns-a-status", src[:wr.end()] + '  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" ]] || return 1\n' + src[wr.end():])
+write("the-report-is-written-outside-the-entry", src[:fz.end()] + '  safe_gate_project_lane_report_write 0 || true\n' + src[fz.end():])
+rw = find(r'    safe_gate_project_lane_report_write "\$\{rc\}" \|\| true\n')
+write("the-report-status-is-not-swallowed", src[:rw.start()] + '    safe_gate_project_lane_report_write "${rc}"\n' + src[rw.end():])
+write("the-report-core-command-outside-its-writer", src[:fz.end()] + '  "${SAFE_GATE_LANE_CORE}" project-report write\n' + src[fz.end():])
+write("a-reader-of-the-reports-in-the-gate", src[:fz.end()] + '  cat -- "${SAFE_DATA_DIR}/project-lane/reports/x" 2>/dev/null\n' + src[fz.end():])
+write("a-listing-of-the-reports-in-the-runner", src[:fo.end()] + '  ls -- "${lane_dir}/reports"\n' + src[fo.end():])
+write("the-prompt-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_ENDED=accepted\n' + src[fz.end():])
+rs = find(r'    safe_gate_project_lane_scan_report \|\| true\n  fi\n')
+write("the-report-is-written-before-the-scan", src[:rs.start()] + '    safe_gate_project_lane_report_write "${rc}" || true\n' + src[rs.start():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
 def under_timeout(name, plain):
@@ -618,7 +630,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 56 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 64 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

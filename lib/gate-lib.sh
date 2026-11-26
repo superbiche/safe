@@ -5268,7 +5268,7 @@ safe_gate_project_lane_window_refuse() {
 # a late reading refused the command (late_rc is the status).
 safe_gate_project_lane_prompts() {
   local conf="${scratch}/confirmations.json" mal_file="${scratch}/confirm-malice.tsv" sock_file="${scratch}/confirm-socket.tsv" ans_file="${scratch}/answered.tsv"
-  local iter=0 status class signature previous="" sub=0 rate_given=0
+  local iter=0 status class signature previous="" sub=0 rate_given=0 asked_n=0
   : >"${mal_file}"; : >"${sock_file}"; : >"${ans_file}"
   safe_gate_project_lane_confirmations "${conf}" "${mal_file}" "${sock_file}" 0 "${ans_file}"
   while (( iter < 20 )); do
@@ -5276,6 +5276,7 @@ safe_gate_project_lane_prompts() {
     status="$(jq -r '.outcome.status' "${report}")"
     if [[ "${status}" == clear ]]; then
       rc=0
+      if (( asked_n > 0 )); then SAFE_GATE_LANE_FACT_ENDED=accepted; fi
       return 0
     fi
     signature="$(jq -c '[.outcome, .outstanding]' "${report}" | sha256sum | cut -d' ' -f1)"
@@ -5286,6 +5287,10 @@ safe_gate_project_lane_prompts() {
     fi
     previous="${signature}"
     sub=0
+    if [[ "${status}" != unbound ]]; then
+      asked_n=$((asked_n + 1))
+      SAFE_GATE_LANE_FACT_ASKED=${asked_n}
+    fi
     if [[ "${status}" == unbound ]]; then
       # a graph the lane cannot bind has no override at the terminal (ticket 1686): it ends as it does unattended
       sub=1
@@ -5303,6 +5308,9 @@ safe_gate_project_lane_prompts() {
     if (( sub != 0 )); then
       rc="$(jq -r '.outcome.exit' "${report}")"
       (( read_failed == 0 )) || rc=102
+      if (( asked_n > 0 )); then
+        if (( read_failed == 0 )); then SAFE_GATE_LANE_FACT_ENDED=declined; else SAFE_GATE_LANE_FACT_ENDED=unread; fi
+      fi
       return 1
     fi
     safe_gate_project_lane_confirmations "${conf}" "${mal_file}" "${sock_file}" "${gap_confirmed}" "${ans_file}"
@@ -5708,7 +5716,7 @@ safe_gate_project_lane_scripts_lines() {
 # cannot be read says so and says what failed (the reader's status, no document, a document of another version, a token outside its
 # grammar): it is never an empty section.
 safe_gate_project_lane_scripts_report() {
-  local verb="$1" source="$2" lockfile="$3" previous="$4" want_root="$5" doc="" rc=0 lines="" why="" line=""
+  local verb="$1" source="$2" lockfile="$3" previous="$4" want_root="$5" doc="" rc=0 lines="" why="" line="" full=""
   local -a args=(project-scripts --lock "${lockfile}" --limit 25)
   [[ "${source}" != tree ]] || args+=(--tree "${project_dir}/node_modules")
   case "${previous}" in
@@ -5735,6 +5743,10 @@ safe_gate_project_lane_scripts_report() {
   if [[ -n "${why}" ]]; then
     safe_gate_err "safe: project lane: install scripts did not run (the lane installs with scripts off); the report of which packages have them could not be read: ${why}"
     return 0
+  fi
+  # the report document keeps the whole list (the lines above are cut at 25 per list; the document is held to its own bound)
+  if command -v timeout >/dev/null 2>&1; then
+    full="$(timeout --kill-after=2s 60s "${safe_core}" "${args[@]/#25/100000}" </dev/null 2>/dev/null)" && [[ -n "${full}" ]] && printf '%s\n' "${full}" >"${scratch}/scripts.json" 2>/dev/null
   fi
   while IFS= read -r line; do
     [[ -z "${line}" ]] || safe_gate_err "${line}"
@@ -5834,6 +5846,37 @@ safe_gate_project_lane_scan_report() {
   else
     safe_gate_err "safe: project lane: project scan: its summary could not be read; the project's other ecosystems were not reported"
   fi
+  return 0
+}
+
+# The command's report document (ticket 1639): written ONCE, here, by `safe-core project-report write`, after the scan, for every end the
+# lane controls at or after the decision (a pass, a refusal, a declined prompt, a failed installation); a command that is killed leaves
+# none. The core builds it from the pieces the run left in the scratch and from nothing else, checks the directories it writes in, keeps
+# the last 50 of the project and never writes past its size bound. It never changes the command's status: a document that cannot be written
+# is one line, before the lane's own last line. Reads SAFE_GATE_LANE_SCRATCH, _CORE and the facts the run noted. $1 the status.
+safe_gate_project_lane_report_write() {
+  local status="$1" dir="${SAFE_GATE_LANE_SCRATCH:-}" core="${SAFE_GATE_LANE_CORE:-}" project="${SAFE_GATE_LANE_FACT_PROJECT:-}" data="${SAFE_GATE_LANE_FACT_DATA:-}"
+  local published="${SAFE_GATE_LANE_FACT_PUBLISHED:-}" result="" rc=0
+  local -a args=()
+  [[ -n "${data}" && -n "${dir}" && -d "${dir}" && -n "${project}" && -x "${core}" && "${status}" =~ ^[0-9]{1,3}$ ]] || return 0
+  [[ -n "${published}" ]] || published=none
+  args=(project-report write --data "${data}" --project "${project}" --scratch "${dir}" --lockfile "${project}/package-lock.json"
+        --verb "${SAFE_GATE_LANE_FACT_VERB:-}" --status "${status}" --version "${SAFE_VERSION:-0}" --published "${published}"
+        --asked "${SAFE_GATE_LANE_FACT_ASKED:-0}" --ended "${SAFE_GATE_LANE_FACT_ENDED:-none}")
+  [[ "${SAFE_GATE_LANE_FACT_DRYRUN:-0}" != 1 ]] || args+=(--dry-run)
+  [[ "${SAFE_GATE_LANE_FACT_LOCKONLY:-0}" != 1 ]] || args+=(--lock-only)
+  if command -v timeout >/dev/null 2>&1; then
+    result="$(timeout --kill-after=2s 30s "${core}" "${args[@]}" </dev/null 2>/dev/null)" || rc=$?
+  else
+    result="$("${core}" "${args[@]}" </dev/null 2>/dev/null)" || rc=$?
+  fi
+  case "${result}" in
+    written) ;;
+    written-prune-failed) safe_gate_err "safe: project lane: the report was written; older reports of this project could not be removed" ;;
+    too-large) safe_gate_err "safe: project lane: the report was not written: it is past its size bound" ;;
+    no-decision) ;;
+    *) safe_gate_err "safe: project lane: the report could not be written in safe's data directory" ;;
+  esac
   return 0
 }
 
@@ -6030,6 +6073,12 @@ safe_gate_project_lane_in_subshell() {
   SAFE_GATE_LANE_CONFIG_NEVER=0
   SAFE_GATE_LANE_FACT_PUBLISHED=
   SAFE_GATE_LANE_FACT_PROJECT=
+  SAFE_GATE_LANE_FACT_VERB=
+  SAFE_GATE_LANE_FACT_DRYRUN=0
+  SAFE_GATE_LANE_FACT_LOCKONLY=0
+  SAFE_GATE_LANE_FACT_DATA=
+  SAFE_GATE_LANE_FACT_ASKED=0
+  SAFE_GATE_LANE_FACT_ENDED=none
   SAFE_GATE_LANE_ARGS=("$@")
   SAFE_GATE_LANE_REFUSAL_CODE=""
   SAFE_GATE_LANE_REFUSAL_MARK=0
@@ -6044,6 +6093,9 @@ safe_gate_project_lane_in_subshell() {
   safe_gate_project_lane_unlock
   if (( rc == 0 )) && [[ "${SAFE_GATE_LANE_PASS:-0}" == "0" ]] && [[ "${SAFE_GATE_LANE_FACT_PUBLISHED:-}" == tree || "${SAFE_GATE_LANE_FACT_PUBLISHED:-}" == lockfile ]]; then
     safe_gate_project_lane_scan_report || true
+  fi
+  if [[ "${SAFE_GATE_LANE_PASS:-0}" == "0" ]]; then
+    safe_gate_project_lane_report_write "${rc}" || true
   fi
   safe_gate_project_lane_cleanup
   if (( rc != 0 )) && [[ "${SAFE_GATE_LANE_PASS:-0}" == "0" ]]; then
@@ -7123,14 +7175,12 @@ safe_gate_project_lane_run() {
   fi
   # Adverse evidence on an exact identity: a receipt it supersedes is revoked by today's own audit, whatever this command's end.
   safe_gate_project_lane_revoke "${lane_audit}" "${report}" "${scratch}"
-  # The versioned differential is kept in safe's data directory, which is
-  # established private first; a failure to keep it is said, not hidden.
-  local reports="${lane_dir}/reports"
-  if cp -- "${report}" "${reports}/$(date -u +%Y%m%dT%H%M%SZ)-$$.json" 2>/dev/null; then
-    :
-  else
-    safe_gate_err "safe: project lane: the decision report could not be kept in safe's data directory"
-  fi
+  # The decision exists: what the command's report document (written once, at the end) rests on is noted here, and the decision
+  # report itself stays in the scratch, where the gate decides from it (ticket 1639).
+  SAFE_GATE_LANE_FACT_VERB="${verb}"
+  SAFE_GATE_LANE_FACT_DRYRUN="${dry_run}"
+  SAFE_GATE_LANE_FACT_LOCKONLY="${lock_only}"
+  SAFE_GATE_LANE_FACT_DATA="${data_root}"
   if ! safe_gate_project_lane_report "${verb}" "${report}" "${evidence}" "${proj}/package-lock.json"; then
     safe_gate_project_lane_refuse 102 "${verb}" "the decision report cannot be rendered (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?

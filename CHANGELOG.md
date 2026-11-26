@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2). One document per command, written once at the end,
+  for every end the lane controls at or after the decision (a pass, a refusal, a declined prompt, a failed installation, a dry run), by
+  `safe-core project-report write` (new; `check` is for the tests): schema 1, built from typed readings of the run's pieces, every string
+  from a closed list or a grammar (what is outside is counted, never kept), no location, no free text, `ci` as counts and the lockfile's
+  digest. `<data>/project-lane/reports/<key>/<time>-<pid>-<random>.json`, `key` the digest of the project's physical path and no member;
+  directories 0700 opened without following a link, the file 0600 synced and renamed in place; the last 50 per project kept, oldest first,
+  own files only, never through a link; past 1 MiB the document is not written and one line says so; a failure is one line and changes no
+  status. The old copy of the decision report into `reports/` is gone (the decision report stays in the scratch, where the gate decides
+  from it). A killed command leaves none. Lane lint R13: one writer, one caller (`|| true`, after the scan), and no reader of the reports
+  directory in the gate.
 - Project lane (behind `install.project_lane`): the whole-project scan becomes a report (ticket 1639, rule 5 of the differential
   ruling). After a verified publication (lockfile-only included), once the project's lock is released, the lane runs the scan of the
   project under one deadline that reaches its children and prints at most three lines: the ecosystems with a critical finding (npm

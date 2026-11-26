@@ -43,10 +43,6 @@ type ScanSummary struct {
 // ErrNoVerdict: the document is not one that carries a verdict.
 var ErrNoVerdict = errors.New("the scan result carries no verdict")
 
-type ecosystemCounts struct {
-	Critical *json.Number `json:"critical"`
-}
-
 // ReadScanSummary reads a scan result document.
 func ReadScanSummary(raw []byte) (ScanSummary, error) {
 	summary := ScanSummary{SchemaVersion: 1, Critical: map[string]int{}, CoverageFailures: []string{}}
