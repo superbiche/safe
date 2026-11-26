@@ -615,6 +615,10 @@ write("the-runner-makes-the-reports-directory", src[:fo.end()] + '  safe_gate_la
 sd = find(r'(safe_gate_project_lane_scan_digest\(\) \{\n)')
 write("a-reader-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  ls -- "${SAFE_DATA_DIR}/project-lane/reports" >/dev/null 2>&1\n' + src[sd.end():])
 write("a-copy-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  cp -r -- "${SAFE_DATA_DIR}/project-lane/reports" "${TMPDIR}" 2>/dev/null\n' + src[sd.end():])
+sg = find(r'(safe_gate_scan_project\(\) \{\n)')
+write("a-second-scan-call-in-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[sg.end():])
+write("a-writer-call-in-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_report_write 0 || true\n' + src[sg.end():])
+write("the-finishing-path-started-from-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_finish 0 normal\n' + src[sg.end():])
 write("a-second-invocation-inside-the-writer", src[:wr.end()] + '  "${core}" "${args[@]}" >/dev/null 2>&1\n' + src[wr.end():])
 write("a-second-writer-function-names-the-core-command", src[:sd.end()] + '  printf "%s" project-report\n' + src[sd.end():])
 fn_ = find(r'  safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n  fi\n  safe_gate_project_lane_cleanup\n')
@@ -639,7 +643,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 70 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 73 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

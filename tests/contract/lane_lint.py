@@ -359,6 +359,15 @@ def main(path):
     for n, fn, t, b in lane:
         if command_at(b, FINISH) and not FN.match(t) and fn not in FINISH_CALLERS:
             problems.append(f"{n}:{fn}:R12: the finishing path is started outside the entry and the signal handler")
+    # R12/R13, over the whole file (the shared helpers included, not only the lane's own functions): the scan and the writer are called
+    # only from the finishing path, the finishing path only from its callers
+    for n, fn, t in logical:
+        b = strip(t)
+        if b.lstrip().startswith("#") or FN.match(t) or fn.startswith(("safe_gate_project_lane_", "safe_gate_lane_")):
+            continue
+        for name, owner in ((SCAN_ENTRY, FINISH), (REPORT_WRITER, FINISH), (FINISH, "a lane function")):
+            if command_at(b, name):
+                problems.append(f"{n}:{fn}:R12: {name} is called from a shared helper of the gate, outside the finishing path")
     # R13, over the whole file: the reports directory is named nowhere in the gate, and the writer is started once, by one line
     started = [(n, fn) for n, fn, t in logical if "project-report" in re.sub(r"#.*$", "", t) and not t.lstrip().startswith("#")]
     if len(started) != 1 or any(fn != REPORT_WRITER for n, fn in started):
