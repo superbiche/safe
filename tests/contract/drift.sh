@@ -587,6 +587,18 @@ pj = find(r'    safe_gate_lane_npm_in "\$\{proj\}" --package-lock-only --ignore-
 write("projection-without-ignore-scripts", src[:pj.start()] + '    safe_gate_lane_npm_in "${proj}" --package-lock-only ' + src[pj.end():])
 bd = find(r'-- "\$\{SAFE_GATE_LANE_NPM\[@\]\}" "\$\{frozen_args\[@\]\}"\)')
 write("binder-given-something-else", src[:bd.start()] + '-- "${SAFE_GATE_LANE_NPM[@]}" "${proj_args[@]}")' + src[bd.end():])
+# R12 (ticket 1639): the scan after the lane is a report: it returns 0 and never exits, it is called once from the entry as `|| true`,
+# after the lock is released and before the scratch is freed, and the facts it rests on have owners
+sc = find(r'(safe_gate_project_lane_scan_report\(\) \{\n)')
+write("the-scan-exits", src[:sc.end()] + '  exit 3\n' + src[sc.end():])
+write("the-scan-returns-a-status", src[:sc.end()] + '  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" ]] || return 1\n' + src[sc.end():])
+sh = find(r'    safe_gate_project_lane_scan_report \|\| true\n')
+write("the-scan-status-is-not-swallowed", src[:sh.start()] + '    safe_gate_project_lane_scan_report\n' + src[sh.end():])
+write("the-scan-is-called-outside-the-entry", src[:fz.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[fz.end():])
+ul = find(r'  safe_gate_project_lane_unlock\n  if \(\( rc == 0 \)\)')
+write("the-scan-before-the-lock-is-released", src[:ul.start()] + '  safe_gate_project_lane_scan_report || true\n' + src[ul.start():])
+pf = find(r'    SAFE_GATE_LANE_FACT_PUBLISHED=tree\n')
+write("the-published-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_PUBLISHED=tree\n' + src[fz.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
 def under_timeout(name, plain):
@@ -606,7 +618,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 50 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 56 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

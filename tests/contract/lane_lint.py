@@ -25,6 +25,9 @@ Rules
       a --package-lock-only projection, ci): `npm run`, `npm exec` and the like run code whatever --ignore-scripts says. The words
       that run scripts are written in one function, the text of the report (safe_gate_project_lane_scripts_lines), which is one jq
       program (`jq -rs`) from its first line to its last, holding exactly one jq: it names no variable, function or substitution of the shell.
+  R12 the scan after the lane is a report (ticket 1639): its report function returns 0 and never exits, it is called once, from the
+      lane's entry, as `|| true`, after the lock is released and before the scratch is freed; the facts it rests on (what was
+      published, which project) have owners.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -59,7 +62,17 @@ STATE = {
     "SAFE_GATE_LANE_REFUSAL_KIND": {"*": {"safe_gate_project_lane_refuse", "safe_gate_project_lane_refuse_kind"}},
     "SAFE_GATE_LANE_PHASE": {"routing": {"safe_gate_project_lane_in_subshell"}, "judging": {"safe_gate_project_lane_run"}},
     "SAFE_GATE_LANE_CONFIG_NEVER": {"0": {"safe_gate_project_lane_in_subshell"}, "1": {"safe_gate_project_lane_config_seen"}},
+    # R12: what the scan after the lane rests on (what the lane published, which project) is written by the runner, and cleared at the entry
+    "SAFE_GATE_LANE_FACT_PUBLISHED": {"": {"safe_gate_project_lane_in_subshell"}, "tree": {"safe_gate_project_lane_run"},
+                                      "lockfile": {"safe_gate_project_lane_run"}},
+    "SAFE_GATE_LANE_FACT_PROJECT": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
 }
+# R12: the scan after the lane is a report: it ends the lane's own business never (its function returns 0 and nothing else, never exits),
+# it is called once, from the entry, as `|| true`, after the lock is released and before the scratch is freed
+SCAN_ENTRY = "safe_gate_project_lane_scan_report"
+SCAN_FUNCTIONS = {"safe_gate_project_lane_scan_report", "safe_gate_project_lane_scan_lines", "safe_gate_project_lane_scan_digest",
+                  "safe_gate_project_lane_scan_deadline"}
+ENTRY = "safe_gate_project_lane_in_subshell"
 # R7
 HANDLER = ("safe_gate_project_lane_query", "safe_gate_project_lane_ask", "safe_gate_project_lane_answer")
 HANDLER_CALLERS = {"safe_gate_project_lane_query", "safe_gate_project_lane_one_shot_question", "safe_gate_project_lane_grant",
@@ -277,6 +290,17 @@ def main(path):
                 problems.append(f"{number}:{fn}:R11: the report's text function is not one jq program (it names something of the shell)")
             before = text
             continue
+        # R12: the scan is a report
+        if command_at(bare, SCAN_ENTRY) and not FN.match(text):
+            if fn != ENTRY:
+                problems.append(f"{number}:{fn}:R12: the scan is called outside the lane's entry")
+            elif not re.search(r"(?:^|[;&|({]|\bthen\b)\s*" + SCAN_ENTRY + r"\s*\|\|\s*true\s*$", bare.strip()):
+                problems.append(f"{number}:{fn}:R12: the scan is not called as `|| true`: its status would become the command's")
+        if fn in SCAN_FUNCTIONS and not FN.match(text):
+            if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*exit(?![A-Za-z0-9_])", bare):
+                problems.append(f"{number}:{fn}:R12: the scan exits: it may only return")
+            if fn in {"safe_gate_project_lane_scan_report"} and re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*return\s+(?!0\s*(?:$|[;&|)}]))\S", bare + " "):
+                problems.append(f"{number}:{fn}:R12: the scan's report returns a status other than 0")
         if SCRIPT_WORDS.search(bare):
             problems.append(f"{number}:{fn}:R11: a word that runs or enables lifecycle scripts is a command word or an option of the lane")
         if command_at(bare, "npm") or command_at(bare, "npx") or re.search(r"(?<![A-Za-z0-9_\-])(?:command|exec|env)\s+np[mx](?![A-Za-z0-9_\-])", bare):
@@ -301,6 +325,11 @@ def main(path):
     jq_words = sum(len(re.findall(r"(?<![A-Za-z0-9_\-])jq(?![A-Za-z0-9_\-])", t)) for n, fn, t, b in lane if fn == SCRIPT_TEXT and not FN.match(t))
     if jq_words != 1:
         problems.append(f"0:{SCRIPT_TEXT}:R11: the report's text function holds {jq_words} jq words, not exactly one")
+    # R12: order at the entry: unlock, then the scan, then the scratch is freed
+    entry_calls = [(n, w) for n, fn, t, b in lane if fn == ENTRY and not FN.match(t)
+                   for w in ("safe_gate_project_lane_unlock", SCAN_ENTRY, "safe_gate_project_lane_cleanup") if command_at(b, w)]
+    if [w for n, w in entry_calls] != ["safe_gate_project_lane_unlock", SCAN_ENTRY, "safe_gate_project_lane_cleanup"]:
+        problems.append(f"0:{ENTRY}:R12: the entry does not release the lock, scan and free the scratch exactly once each, in that order")
     if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
         problems.append("0::R9: the runner does not read the standing decision exactly once")
     # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them

@@ -115,7 +115,8 @@ project are judged on what they introduce over an established baseline (the comm
 lockfile, or the one safe stored after its own last command) and installed
 exactly as judged (a staged, verified tree published by `safe-core project-bind`).
 `npm ci` introduces nothing: its lockfile is read whole for malice and installed the
-same way; see [configuration](configuration.md).
+same way; see [configuration](configuration.md). The lane asks nothing of the project scan at install time: after a
+verified publication it runs the scan and prints its findings as a report that never changes the command's status.
 
 ## Release Binaries
 

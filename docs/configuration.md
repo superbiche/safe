@@ -631,6 +631,15 @@ pass and warnings under `environment.release_follow`.
   each file, no staged tree, no tree exchange, no install command) and installs
   nothing. Each decision report is kept under
   `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
+  **The project scan is a report** (ticket 1639): the lane asks nothing of a scan at install time. After a verified publication
+  (a lockfile-only one included; not after a refusal, a dry run or a hand-over to today's gate, which runs its own) and after the
+  project's lock is released, the lane runs the scan of the project (`safe audit repo-audit . --deps-only`, the auditor beside the
+  gate, never one an environment variable names) under one deadline that reaches the scanner's children, and prints at most three
+  lines after the command: the ecosystems with a critical finding, npm included, with their count, and the findings the scan could not
+  attribute to an ecosystem of its known set (`detail: safe audit repo-audit .`); the scanners whose coverage failed; or, when the scan
+  did not complete, one line with a fixed reason (it failed, left no readable result, ran past its bound). Nothing the scanner
+  wrote is printed. **The scan never changes the command's exit status**, whatever it finds or however it fails: a finding is a line,
+  not a refusal.
   **The baseline** is what the differential is taken against, and what decides which
   advisories are "already present" and never gate. It is the lockfile committed at the
   head of the project's git work tree, or one safe itself judged clear and recorded (below);

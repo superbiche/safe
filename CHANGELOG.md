@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): the whole-project scan becomes a report (ticket 1639, rule 5 of the differential
+  ruling). After a verified publication (lockfile-only included), once the project's lock is released, the lane runs the scan of the
+  project under one deadline that reaches its children and prints at most three lines: the ecosystems with a critical finding (npm
+  included, with the count) and the findings it could not attribute to an ecosystem of its known set, the scanners whose coverage
+  failed, or one fixed reason when it did not complete. Nothing it wrote is printed, a scanner an environment variable names is never
+  run, and **the scan never changes the command's exit status**. It is not run after a refusal, a dry run or a hand-over to today's
+  gate. `safe-core project-scan-summary` (new) reads the scan's result document. `ci` no longer says "N packages added" (it has no
+  differential): it says how many entries of the lockfile it installs as they stand; a publish time that cannot be read is one line.
+  The lane lint (R12) holds the scan to returning 0, to one call from the entry as `|| true` after the unlock and before the scratch is
+  freed, and gives the facts it rests on their owners.
 - Project lane (behind `install.project_lane`): the lane runs no lifecycle script and says which ones it did not run (ticket 1638). A
   separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs, so none runs. After a
   verified publication one section says, from the judged lockfile and the published tree only (`safe-core project-scripts`, new), what

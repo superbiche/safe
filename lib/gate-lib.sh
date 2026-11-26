@@ -5568,13 +5568,19 @@ safe_gate_err_lines_clean() {
 # The report lines, on stderr, after the decision. Fails when it cannot render.
 safe_gate_project_lane_report() {
   local verb="$1" report="$2" evidence="$3" lockfile="$4" lines=""
-  lines="$(jq -r --arg verb "${verb}" '
+  # `ci` has no differential: it installs the lockfile's entries as they stand, and its line says that instead of a zero difference
+  local entries=0
+  if [[ "${verb}" == ci ]]; then
+    entries="$(jq -r '.graph.occurrences | length' "${scratch}/target-graph.json" 2>/dev/null)" && [[ "${entries}" =~ ^[0-9]+$ ]] || return 1
+  fi
+  lines="$(jq -r --arg verb "${verb}" --argjson entries "${entries}" '
     def rank: {"critical": 4, "high": 3, "moderate": 2, "low": 1};
     def highest: (map(rank[.] // 0) | max) as $r
       | if $r == null then "none" elif $r == 0 then "unknown" else (["", "low", "moderate", "high", "critical"][$r]) end;
     ([.advisories.introduced[] | select(.class == "below_high")] | length) as $below
     | ([.advisories.introduced[] | select(.class != "below_high")] | length) as $gating
-    | "safe: project lane: npm \($verb): \(.difference.added | length) packages added, \(.difference.changed | length) changed, \(.difference.removed | length) removed",
+    | (if $verb == "ci" then "safe: project lane: npm ci: installs \($entries) entries of the lockfile as they stand; ci has no differential"
+       else "safe: project lane: npm \($verb): \(.difference.added | length) packages added, \(.difference.changed | length) changed, \(.difference.removed | length) removed" end),
       "safe: project lane: advisories: \(.advisories.fixed | length) fixed, \(.advisories.already_present | length) already present (highest: \([.advisories.already_present[].severity] | highest))\(if ([.advisories.already_present[] | select(.exposure_changed)] | length) > 0 then ", exposure changed on \([.advisories.already_present[] | select(.exposure_changed)] | length)" else "" end), \($below) introduced below high\(if $gating > 0 then ", \($gating) introduced at high or above" else "" end)"
   ' "${report}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   printf '%s\n' "${lines}" >&2
@@ -5583,15 +5589,15 @@ safe_gate_project_lane_report() {
     | "safe: project lane: evidence: \($ok) of \(.identities | length) identities read completely; blocklist checked by name (\(.blocklist | length) hits)"
   ' "${evidence}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   printf '%s\n' "${lines}" >&2
-  # the cooldown: what was judged and what a named security fix waived (a publish time that cannot be read is missing
-  # evidence, not a line here)
+  # the cooldown: what was judged and what a named security fix waived, and, when there are any, how many publish times could not
+  # be read (they are missing evidence: the decision stops on them, or the operator confirmed the command without them)
   lines="$(jq -r '
     .cooldown as $c
     | if $c.days == 0 then "safe: project lane: cooldown: off (install.cooldown_days is 0)"
       else "safe: project lane: cooldown: \($c.checked) introduced version(s) judged against the \($c.days)-day window (npm'"'"'s release-age filter is set to the same window on the projection)"
         + (if ($c.waived | length) > 0 then "; waived as the security fix it names: " + ([$c.waived[] | "\(.name)@\(.version) (fixes \(.remediates | join(", ")))"] | join(", ")) else "" end)
       end,
-      empty
+      (if ($c.missing | length) > 0 then "safe: project lane: publish times: \($c.missing | length) could not be read, so the cooldown was not judged for them" else empty end)
   ' "${report}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   safe_gate_err_lines_clean "${lines}"
   # Socket: the named roots' results (read from the cache or by one call), nothing for the rest of the graph
@@ -5736,6 +5742,101 @@ safe_gate_project_lane_scripts_report() {
   return 0
 }
 
+# The whole-project scan, as a report (ticket 1639; rule 5 of the differential ruling: "The whole-project scan becomes a report,
+# printed after the command and published for asynchronous follow-up; it no longer asks anything at install time"). It runs only after
+# a verified publication (a lockfile-only one included), after the project lock is released, bounded in time, and it reads the scan's
+# RESULT DOCUMENT, never its output (safe-core project-scan-summary). It decides nothing, asks nothing and never changes the command's
+# status: every way it can end is a line of at most three, or a code in the document. The scanner is the auditor beside the dispatcher,
+# never one an environment variable names. $1 nothing; reads SAFE_GATE_LANE_SCRATCH, SAFE_GATE_LANE_CORE, SAFE_GATE_LANE_FACT_PROJECT.
+safe_gate_project_lane_scan_deadline() {
+  if safe_gate_timeout_value_ok "${SAFE_INSTALL_TIMEOUT_SECONDS:-}"; then
+    printf '%s' "${SAFE_INSTALL_TIMEOUT_SECONDS}"
+  else
+    printf '60'
+  fi
+}
+
+# The lockfile's digest as the scan reads it ("absent" when there is none): taken before the scan and after, so that a lockfile that
+# changed under it is said.
+safe_gate_project_lane_scan_digest() {
+  local file="$1/package-lock.json" sum=""
+  [[ -f "${file}" && ! -L "${file}" ]] || { printf 'absent'; return 0; }
+  sum="$(sha256sum -- "${file}" 2>/dev/null | cut -d' ' -f1)"
+  [[ "${sum}" =~ ^[0-9a-f]{64}$ ]] && printf 'sha256:%s' "${sum}" || printf 'unreadable'
+}
+
+# The scan's lines, from its summary document on stdin: at most three, built from tokens held to a grammar (the ecosystems of the
+# scan's known set, scanner names that read as names, counts); one token outside it fails the render and the caller says the summary was
+# not readable. Nothing the scan wrote as free text is in it.
+safe_gate_project_lane_scan_lines() {
+  jq -rs '
+    def bad($why): error("scan-report: " + $why);
+    def eco: ["composer", "go", "npm", "python", "rust"];
+    def reasons: {"no_audit": "the scanner beside safe is not installed", "no_timeout": "there is no timeout utility to bound it", "timeout": "it ran past its bound",
+                  "failed": "it failed", "no_result": "it left no readable result"};
+    def count: type == "number" and . >= 0 and . == floor;
+    def sname: type == "string" and test("\\A[a-z][a-z0-9._-]{0,31}\\z");
+    (if length == 1 then .[0] else bad("no document or more than one document") end)
+    | if (type != "object") or (.status | IN("completed", "not_completed") | not) or (.lockfile_stable | type != "boolean") then bad("the document is not the summary") else . end
+    | (if .status == "not_completed" then (if (.reason | type == "string") and (reasons[.reason] != null) then . else bad("a token outside its grammar") end)
+       else (if (.summary | type == "object") and (.summary.critical_total | count) and (.summary.unattributed | count) and (.summary.coverage_other | count)
+                and (.summary.critical | type == "object") and ([.summary.critical | to_entries[] | (.key | IN(eco[])) and (.value | count)] | all)
+                and (.summary.coverage_failures | type == "array") and ([.summary.coverage_failures[] | sname] | all)
+             then . else bad("a token outside its grammar") end) end)
+    | (if .lockfile_stable then "" else "; the lockfile changed while the scan ran" end) as $changed
+    | (if .status == "not_completed" then
+         "safe: project lane: project scan: did not complete (" + reasons[.reason] + "); the project'"'"'s other ecosystems were not reported" + $changed
+       else
+         ((.summary.critical | to_entries | sort_by(.key) | map(.key + " " + (.value | tostring))) as $by
+          | (if .summary.critical_total > 0 then
+               "safe: project lane: project scan: critical findings: " + (($by + (if .summary.unattributed > 0 then [(.summary.unattributed | tostring) + " not attributed to an ecosystem"] else [] end)) | join(", ")) + "; detail: safe audit repo-audit ." + $changed
+             else empty end)),
+         (if ((.summary.coverage_failures | length) + .summary.coverage_other) > 0 then
+            "safe: project lane: project scan: scanner coverage failure: " + (.summary.coverage_failures | join(", ")) + (if .summary.coverage_other > 0 then (if (.summary.coverage_failures | length) > 0 then " and " else "" end) + (.summary.coverage_other | tostring) + " other" else "" end) + "; that coverage is missing - safe doctor"
+          else empty end)
+       end)'
+}
+
+# Runs after the lane has ended and its lock is released: the scan, then its lines. Never fails: the caller's status is what it was.
+safe_gate_project_lane_scan_report() {
+  local dir="${SAFE_GATE_LANE_SCRATCH:-}" core="${SAFE_GATE_LANE_CORE:-}" project="${SAFE_GATE_LANE_FACT_PROJECT:-}" audit="${SAFE_DIR:-}/safe-audit"
+  local result="" reason="" rc=0 before="" after="" summary="null" stable=true lines="" line=""
+  [[ -n "${dir}" && -d "${dir}" && -n "${project}" && -d "${project}" && -x "${core}" ]] || return 0
+  result="${dir}/scan-result.json"
+  before="$(safe_gate_project_lane_scan_digest "${project}")"
+  if [[ ! -x "${audit}" ]]; then
+    reason=no_audit
+  elif ! command -v timeout >/dev/null 2>&1; then
+    reason=no_timeout
+  else
+    ( cd -- "${project}" && exec timeout --kill-after=5s "$(safe_gate_project_lane_scan_deadline)s" "${audit}" repo-audit . --deps-only --allow-missing-tools --result-out "${result}" ) </dev/null >/dev/null 2>&1 || rc=$?
+    case "${rc}" in
+      0) ;;
+      124|137) reason=timeout ;;
+      *) reason=failed ;;
+    esac
+  fi
+  if [[ -z "${reason}" ]]; then
+    summary="$("${core}" project-scan-summary --result "${result}" 2>/dev/null)" && [[ -n "${summary}" ]] || { reason=no_result; summary="null"; }
+  fi
+  after="$(safe_gate_project_lane_scan_digest "${project}")"
+  [[ "${before}" == "${after}" ]] || stable=false
+  if [[ -z "${reason}" ]]; then
+    jq -nc --argjson summary "${summary}" --arg digest "${before}" --argjson stable "${stable}" '{status: "completed", reason: "", summary: $summary, lockfile_sha256: $digest, lockfile_stable: $stable}' >"${dir}/scan.json" 2>/dev/null || reason=no_result
+  fi
+  if [[ -n "${reason}" ]]; then
+    jq -nc --arg reason "${reason}" --arg digest "${before}" --argjson stable "${stable}" '{status: "not_completed", reason: $reason, summary: null, lockfile_sha256: $digest, lockfile_stable: $stable}' >"${dir}/scan.json" 2>/dev/null || return 0
+  fi
+  if lines="$(safe_gate_project_lane_scan_lines <"${dir}/scan.json" 2>/dev/null)"; then
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] || safe_gate_err "${line}"
+    done <<<"${lines}"
+  else
+    safe_gate_err "safe: project lane: project scan: its summary could not be read; the project's other ecosystems were not reported"
+  fi
+  return 0
+}
+
 # The stake and the way out of the first class left, for the final line.
 # Prints "<stake>|<todo>".
 safe_gate_project_lane_outcome_text() {
@@ -5791,12 +5892,19 @@ safe_gate_project_lane_outcome_text() {
   ' "$1" 2>/dev/null
 }
 
-safe_gate_project_lane_cleanup() {
-  [[ -z "${SAFE_GATE_LANE_SCRATCH:-}" ]] || rm -rf -- "${SAFE_GATE_LANE_SCRATCH}" 2>/dev/null
+# The project's lock is released (the scratch outlives it: the scan and the document are made from it).
+safe_gate_project_lane_unlock() {
   # Only a descriptor this process opened: a validated number.
   if [[ "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]]; then
     { eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"; } 2>/dev/null
   fi
+  unset SAFE_GATE_LANE_LOCKFD
+  return 0
+}
+
+safe_gate_project_lane_cleanup() {
+  [[ -z "${SAFE_GATE_LANE_SCRATCH:-}" ]] || rm -rf -- "${SAFE_GATE_LANE_SCRATCH}" 2>/dev/null
+  safe_gate_project_lane_unlock
   unset SAFE_GATE_LANE_SCRATCH SAFE_GATE_LANE_LOCKFD SAFE_GATE_LANE_NPM SAFE_GATE_LANE_ENV SAFE_GATE_LANE_NODE \
     SAFE_GATE_LANE_NPM_DIR SAFE_GATE_LANE_GIT SAFE_GATE_LANE_REASON SAFE_GATE_LANE_CORE SAFE_GATE_LANE_BIND_PID \
     SAFE_GATE_LANE_SEL SAFE_GATE_LANE_ADMIT_BASELINE SAFE_GATE_LANE_ADMIT_SNAPSHOT SAFE_GATE_LANE_NOGIT SAFE_GATE_LANE_NPM_LAUNCHER SAFE_GATE_LANE_SIGNAL SAFE_GATE_LANE_DEFER SAFE_GATE_LANE_CAP_VERSION SAFE_GATE_LANE_PROMPT_PID
@@ -5920,6 +6028,8 @@ safe_gate_project_lane_in_subshell() {
   SAFE_GATE_LANE_PROMPT_PID=""
   SAFE_GATE_LANE_PHASE=routing
   SAFE_GATE_LANE_CONFIG_NEVER=0
+  SAFE_GATE_LANE_FACT_PUBLISHED=
+  SAFE_GATE_LANE_FACT_PROJECT=
   SAFE_GATE_LANE_ARGS=("$@")
   SAFE_GATE_LANE_REFUSAL_CODE=""
   SAFE_GATE_LANE_REFUSAL_MARK=0
@@ -5930,7 +6040,11 @@ safe_gate_project_lane_in_subshell() {
   trap 'safe_gate_lane_signal TERM 143' TERM
   trap 'safe_gate_lane_signal HUP 129' HUP
   safe_gate_project_lane_run "$@" || rc=$?
-  # the lane has ended: its lock and scratch are freed BEFORE anything is printed or asked
+  # the lane has ended: its lock is released BEFORE anything is scanned, printed or asked, and its scratch is freed after the scan
+  safe_gate_project_lane_unlock
+  if (( rc == 0 )) && [[ "${SAFE_GATE_LANE_PASS:-0}" == "0" ]] && [[ "${SAFE_GATE_LANE_FACT_PUBLISHED:-}" == tree || "${SAFE_GATE_LANE_FACT_PUBLISHED:-}" == lockfile ]]; then
+    safe_gate_project_lane_scan_report || true
+  fi
   safe_gate_project_lane_cleanup
   if (( rc != 0 )) && [[ "${SAFE_GATE_LANE_PASS:-0}" == "0" ]]; then
     safe_gate_project_lane_conclude "$@" || rc=$?
@@ -6126,6 +6240,8 @@ safe_gate_project_lane_run() {
       return $?
     fi
   fi
+  # the project's physical path, for what is made of the command at its end (the scan; ticket 1639)
+  [[ -z "${project_dir}" ]] || SAFE_GATE_LANE_FACT_PROJECT="${project_dir}"
   if (( ! plain_global )) && safe_gate_project_lane_pin_route "${verb}" "$@"; then
     safe_gate_project_lane_oneshot "${verb}" "the operator put this project on the one-shot route (safe run one-shot-project list)"
     return $?
@@ -7211,11 +7327,13 @@ safe_gate_project_lane_run() {
   if (( rc == 0 && lock_only )); then
     safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
     safe_gate_project_lane_scripts_report "${verb}" lockfile "${proj}/package-lock.json" "$(safe_gate_project_lane_previous_tree)" 0
+    SAFE_GATE_LANE_FACT_PUBLISHED=lockfile
   elif (( rc == 0 )); then
     # a bare install and ci are the commands for which npm runs the project's own scripts (an install that names packages does not)
     local want_root=0
     if [[ "${verb}" == ci ]] || { [[ "${verb}" == install ]] && (( ${#specs[@]} == 0 )); }; then want_root=1; fi
     safe_gate_project_lane_scripts_report "${verb}" tree "${proj}/package-lock.json" "${previous_tree}" "${want_root}"
+    SAFE_GATE_LANE_FACT_PUBLISHED=tree
   fi
   SAFE_GATE_LANE_DEFER=0
   return "${rc}"

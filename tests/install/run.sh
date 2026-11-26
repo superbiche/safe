@@ -677,7 +677,14 @@ fi
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 
 if [[ "${1:-}" == "repo-audit" ]]; then
+  # is the project's lock held while the scan runs? (the lane releases it before the scan: ticket 1639)
+  if flock -n "${PWD}" true 2>/dev/null; then printf 'SCANLOCK\tfree\n' >> "${SAFE_INSTALL_COMMAND_LOG}"; else printf 'SCANLOCK\theld\n' >> "${SAFE_INSTALL_COMMAND_LOG}"; fi
+  # a scan that outlives its bound, with a child that would write after it
+  [[ -z "${SAFE_AUDIT_SCAN_GRANDCHILD:-}" ]] || ( sleep "${SAFE_AUDIT_SCAN_SLEEP:-6}"; : > "${SAFE_AUDIT_SCAN_GRANDCHILD}" ) >/dev/null 2>&1 &
+  [[ -z "${SAFE_AUDIT_SCAN_SLEEP:-}" ]] || sleep "${SAFE_AUDIT_SCAN_SLEEP}"
   [[ -n "${SAFE_AUDIT_SCAN_OUTPUT:-}" ]] && printf '%s\n' "${SAFE_AUDIT_SCAN_OUTPUT}"
+  # a scan that finds the lockfile changed under it (an edit by someone else while it ran)
+  [[ -z "${SAFE_AUDIT_SCAN_TOUCH_LOCKFILE:-}" ]] || printf ' ' >> "${PWD}/package-lock.json"
   # The gate decides from the result document, not from this exit code: a scan
   # that finds a critical advisory still exits 0.
   result_out=""
@@ -1164,6 +1171,10 @@ run_zsh() {
     SAFE_AUDIT_SCAN_OUTPUT="${SAFE_AUDIT_SCAN_OUTPUT:-}" \
     SAFE_AUDIT_SCAN_STATUS="${SAFE_AUDIT_SCAN_STATUS:-}" \
     SAFE_AUDIT_SCAN_CRITICAL="${SAFE_AUDIT_SCAN_CRITICAL:-}" \
+    SAFE_AUDIT_SCAN_BY_ECOSYSTEM="${SAFE_AUDIT_SCAN_BY_ECOSYSTEM:-}" \
+    SAFE_AUDIT_SCAN_SLEEP="${SAFE_AUDIT_SCAN_SLEEP:-}" \
+    SAFE_AUDIT_SCAN_TOUCH_LOCKFILE="${SAFE_AUDIT_SCAN_TOUCH_LOCKFILE:-}" \
+    SAFE_AUDIT_SCAN_GRANDCHILD="${SAFE_AUDIT_SCAN_GRANDCHILD:-}" \
     SAFE_AUDIT_SCAN_VERDICT="${SAFE_AUDIT_SCAN_VERDICT:-}" \
     SAFE_AUDIT_SCAN_TOOL_STATUS="${SAFE_AUDIT_SCAN_TOOL_STATUS:-}" \
     SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}" \
@@ -1329,6 +1340,20 @@ assert_no_per_root_audit() {
     fail "${label}"
     return 1
   fi
+}
+
+# The only scan a lane command runs is the report's, after the last npm run: none before it (the lane asks nothing of a scan at
+# install time, and today's gating scan is not on this route).
+assert_lane_scan_only_after_npm() {
+  local label="$1" last_npm first_scan
+  last_npm="$(grep -nE $'^(REAL|PROJECTION)\t' "${LOG_FILE}" | tail -n 1 | cut -d: -f1)"
+  first_scan="$(grep -n $'^AUDIT\trepo-audit\t' "${LOG_FILE}" | head -n 1 | cut -d: -f1)"
+  if [[ -n "${first_scan}" && -n "${last_npm}" && "${first_scan}" -lt "${last_npm}" ]]; then
+    printf 'a scan ran before the last npm run (log lines %s, %s)\n' "${first_scan}" "${last_npm}" >&2
+    fail "${label}"
+    return 1
+  fi
+  return 0
 }
 
 assert_log_not_contains_fragment() {
@@ -8837,6 +8862,196 @@ case_project_lane_scripts_are_off_in_the_frozen_install_and_no_script_runner_is_
   pass "$FUNCNAME"
 }
 
+# ---- ticket 1639: the reports -------------------------------------------------------------------------------------------------------
+# The whole-project scan, as a report: after a verified publication only, after the project lock is released, bounded, from the scan's
+# result document, and never a change of the command's status.
+SCAN_LINE='safe: project lane: project scan:'
+scan_prepare() { # <name>
+  lane_prepare "$1" kept@1.0.0
+  SCAN_LOCK="$(lane_lock kept@1.0.0 clean@2.0.0)"
+}
+scan_run() { # runs the named install with the lane; the environment decides what the scan does
+  NPM_LOCK_MUTATION_JSON="${SCAN_LOCK}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+}
+scan_lines() { grep -c "^${SCAN_LINE}" "${ERR_FILE}" || true; }
+
+case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-findings"
+  # the control: a clean scan prints nothing and the status is the command's
+  : > "${LOG_FILE}"
+  scan_run
+  assert_status 0 "$FUNCNAME: clean" || return
+  [[ "$(scan_lines)" == 0 ]] || { fail "$FUNCNAME: a clean scan printed a line"; return; }
+  [[ "$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: the scan did not run exactly once: $(grep -c repo-audit "${LOG_FILE}")"; return; }
+  # critical findings: npm included, the others named, what the scan could not attribute counted
+  lane_reset_project; : > "${LOG_FILE}"
+  SAFE_AUDIT_SCAN_CRITICAL=4 SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":2},"python":{"critical":1},"mystery":{"critical":1}}' scan_run
+  assert_status 0 "$FUNCNAME: critical" || return
+  assert_err_contains_fragment "${SCAN_LINE} critical findings: npm 2, python 1, 1 not attributed to an ecosystem; detail: safe audit repo-audit ." "$FUNCNAME" || return
+  # a breakdown that does not add up: the whole total is not attributed
+  lane_reset_project
+  SAFE_AUDIT_SCAN_CRITICAL=3 SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":1}}' scan_run
+  assert_err_contains_fragment "${SCAN_LINE} critical findings: 3 not attributed to an ecosystem; detail" "$FUNCNAME: no sum" || return
+  # a coverage failure is printed, with the scanners' names that read as names (and a count of the rest)
+  lane_reset_project
+  SAFE_AUDIT_SCAN_TOOL_STATUS='{"syft":{"status":"error","note":"a note with a token ghp_secret"},"bad name\u001b[31m":{"status":"error"}}' SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS='[{"scanner":"pip-audit","status":"error"}]' scan_run
+  assert_status 0 "$FUNCNAME: coverage" || return
+  assert_err_contains_fragment "${SCAN_LINE} scanner coverage failure: pip-audit, syft and 1 other; that coverage is missing - safe doctor" "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'ghp_secret' "$FUNCNAME: a note of the scan reached the terminal" || return
+  [[ "$(scan_lines)" -le 3 ]] || { fail "$FUNCNAME: more than three lines"; return; }
+  pass "$FUNCNAME"
+}
+
+# Every way the scan can go wrong leaves the command's status as it is without the scan (0 here), and says why in one line of a fixed form.
+case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local fault label want name value got started count=0
+  local refusal='safe: BLOCKED install — critical findings; ask the operator'
+  for fault in \
+      'failed|it failed|SAFE_AUDIT_SCAN_STATUS|1' \
+      'failed, with a refusal-looking line|it failed|SAFE_AUDIT_SCAN_STATUS|100' \
+      'exit 102|it failed|SAFE_AUDIT_SCAN_STATUS|102' \
+      'no result|it left no readable result|SAFE_AUDIT_SCAN_NO_RESULT|1' \
+      'an unreadable result|it left no readable result|SAFE_AUDIT_SCAN_MALFORMED_RESULT|1' \
+      'past its bound|it ran past its bound|SAFE_AUDIT_SCAN_SLEEP|40' \
+      'a critical finding and an exit 0|NOLINE|SAFE_AUDIT_SCAN_CRITICAL|1' \
+      'a refusal-looking line with a clean result|NOLINE|SAFE_AUDIT_SCAN_OUTPUT|@R'; do
+    IFS='|' read -r label want name value <<<"${fault}"
+    [[ "${value}" == @R ]] && value="${refusal}"
+    count=$((count + 1))
+    scan_prepare "lane-scan-fault-${count}"
+    started=${SECONDS}
+    export "${name}=${value}"
+    case "${label}" in
+      'failed, with a refusal-looking line') export SAFE_AUDIT_SCAN_OUTPUT="${refusal}" ;;
+      'past its bound') export SAFE_INSTALL_TIMEOUT_SECONDS=2 ;;
+      'a critical finding and an exit 0') export SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":1}}' ;;
+    esac
+    scan_run
+    got="${STATUS}"
+    unset "${name}" SAFE_AUDIT_SCAN_OUTPUT SAFE_INSTALL_TIMEOUT_SECONDS SAFE_AUDIT_SCAN_BY_ECOSYSTEM
+    (( got == 0 )) || { fail "$FUNCNAME: ${label}: the status is ${got}, not the command's own 0"; return; }
+    (( SECONDS - started < 45 )) || { fail "$FUNCNAME: ${label}: the scan was not bounded (${SECONDS} s)"; return; }
+    assert_err_not_contains_fragment 'BLOCKED install' "$FUNCNAME: ${label}: a line of the scan reached the terminal as if it were the gate's" || return
+    if [[ "${want}" == NOLINE ]]; then
+      [[ "$(scan_lines)" -le 1 ]] || { fail "$FUNCNAME: ${label}: lines"; return; }
+    else
+      assert_err_contains_fragment "${SCAN_LINE} did not complete (${want}); the project's other ecosystems were not reported" "$FUNCNAME: ${label}" || return
+    fi
+  done
+  pass "$FUNCNAME"
+}
+
+# The lockfile the scan read is the one the lane published: when it changed while the scan ran, the line says so.
+case_project_lane_scan_says_when_the_lockfile_changed_while_it_ran() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-changed"
+  SAFE_AUDIT_SCAN_TOUCH_LOCKFILE=1 SAFE_AUDIT_SCAN_CRITICAL=1 SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":1}}' scan_run
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment "${SCAN_LINE} critical findings: npm 1; detail: safe audit repo-audit .; the lockfile changed while the scan ran" "$FUNCNAME" || return
+  scan_prepare "lane-scan-unchanged"
+  SAFE_AUDIT_SCAN_CRITICAL=1 SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":1}}' scan_run
+  assert_err_not_contains_fragment 'the lockfile changed while the scan ran' "$FUNCNAME: unchanged" || return
+  pass "$FUNCNAME"
+}
+
+# A scan that outlives its bound leaves nothing running: the bound reaches the scanner's children.
+case_project_lane_scan_bound_reaches_the_scanners_children() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-children"
+  local marker="${CASE_DIR}/grandchild-ran"
+  SAFE_INSTALL_TIMEOUT_SECONDS=2 SAFE_AUDIT_SCAN_SLEEP=5 SAFE_AUDIT_SCAN_GRANDCHILD="${marker}" scan_run
+  assert_status 0 "$FUNCNAME" || return
+  # the scan did start and was stopped at its bound (a case where no scan ran would find no child either)
+  [[ "$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: the scan did not run"; return; }
+  assert_err_contains_fragment "${SCAN_LINE} did not complete (it ran past its bound)" "$FUNCNAME" || return
+  sleep 8
+  [[ ! -e "${marker}" ]] || { fail "$FUNCNAME: a child of the scan outlived its bound"; return; }
+  pass "$FUNCNAME"
+}
+
+# The scanner is the one beside the dispatcher: an environment that names another program does not run it.
+case_project_lane_scan_ignores_a_scanner_the_environment_names() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-env"
+  local marker="${CASE_DIR}/hostile-ran"
+  printf '#!/bin/sh\n: > "%s"\nexit 0\n' "${marker}" > "${CASE_DIR}/hostile-audit"
+  chmod +x "${CASE_DIR}/hostile-audit"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_BIN="${CASE_DIR}/hostile-audit" SAFE_GATE_AUDIT_BIN="${CASE_DIR}/hostile-audit" scan_run
+  assert_status 0 "$FUNCNAME" || return
+  [[ ! -e "${marker}" ]] || { fail "$FUNCNAME: a program named by the environment was run"; return; }
+  [[ "$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: the scanner beside the dispatcher did not run once"; return; }
+  pass "$FUNCNAME"
+}
+
+# No scan after a refusal, a dry run, or a hand-over to today's gate; one after a lockfile-only publication; none before the lock is gone.
+case_project_lane_scan_runs_after_a_publication_only_and_after_the_lock_is_released() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-when"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" scan_run
+  assert_status 104 "$FUNCNAME: refusal" || return
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit\t' "$FUNCNAME: after a refusal" || return
+  assert_err_not_contains_fragment "${SCAN_LINE}" "$FUNCNAME: after a refusal" || return
+  scan_prepare "lane-scan-dry"; : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="${SCAN_LOCK}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0 --dry-run'
+  assert_status 0 "$FUNCNAME: dry run" || return
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit\t' "$FUNCNAME: after a dry run" || return
+  scan_prepare "lane-scan-lockonly"; : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="${SCAN_LOCK}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0 --package-lock-only'
+  assert_status 0 "$FUNCNAME: lockfile only" || return
+  [[ "$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: no scan after a lockfile-only publication"; return; }
+  assert_log_contains $'SCANLOCK\tfree' "$FUNCNAME: the lock was released before the scan" || return
+  assert_log_not_contains_fragment $'SCANLOCK\theld' "$FUNCNAME: the lock was held during the scan" || return
+  # a hand-over to today's gate: the lane starts no scan of its own (today's gate runs the scan it always ran: the same number as with the switch off)
+  lane_prepare "lane-scan-handover" kept@1.0.0
+  jq -c '.dependencies.odd = "git+https://example.invalid/odd.git"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new" && mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  local on_count off_count
+  on_count="$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")"
+  printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  off_count="$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")"
+  [[ "${on_count}" == "${off_count}" ]] || { fail "$FUNCNAME: a hand-over scanned ${on_count} times, the same command with the switch off ${off_count}"; return; }
+  pass "$FUNCNAME"
+}
+
+# `ci` says what it does, and no longer a zero differential; publish times that could not be read are one line.
+case_project_lane_ci_line_says_it_has_no_differential_and_unreadable_publish_times_are_a_line() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-ci-line" kept@1.0.0 a@1.0.0 b@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 a@1.0.0 b@1.0.0)" lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: project lane: npm ci: installs 3 entries of the lockfile as they stand; ci has no differential' "$FUNCNAME" || return
+  assert_err_not_contains_fragment '0 packages added' "$FUNCNAME: a zero differential for ci" || return
+  lane_prepare "lane-publish-times" kept@1.0.0
+  SAFE_CORE_TAMPER=releases-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: unreadable publish times" || return
+  assert_err_contains_fragment 'safe: project lane: publish times: 1 could not be read, so the cooldown was not judged for them' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# The scan's functions, on their own: no scanner beside safe; a summary outside the grammar.
+case_project_lane_scan_report_without_a_scanner_and_with_a_hostile_summary_says_so() {
+  prepare_case "lane-scan-unit"
+  local sdir="${CASE_DIR}/safedir" got
+  mkdir -p "${sdir}" "${CASE_DIR}/scratch" "${CASE_DIR}/project"
+  printf '{"name":"p"}\n' > "${CASE_DIR}/project/package-lock.json"
+  printf '#!/bin/sh\nprintf "{}\\n"\n' > "${sdir}/safe-core"; chmod +x "${sdir}/safe-core"
+  got="$(env GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" SDIR="${sdir}" D="${CASE_DIR}" PATH=/usr/bin:/bin bash -c 'source "${GATE_LIB}"; SAFE_DIR="${SDIR}"; SAFE_GATE_LANE_SCRATCH="${D}/scratch"; SAFE_GATE_LANE_CORE="${SDIR}/safe-core"; SAFE_GATE_LANE_FACT_PROJECT="${D}/project"; safe_gate_project_lane_scan_report; echo "status=$?"' 2>&1)"
+  [[ "${got}" == *"${SCAN_LINE} did not complete (the scanner beside safe is not installed); the project's other ecosystems were not reported"* && "${got}" == *status=0 ]] || { printf '%s\n' "${got}" >&2; fail "$FUNCNAME: no scanner"; return; }
+  # a summary whose names are outside the grammar renders as the one line
+  got="$(printf '%s' '{"status":"completed","reason":"","summary":{"critical_total":1,"critical":{"npm\u001b":1},"unattributed":0,"coverage_failures":[],"coverage_other":0},"lockfile_sha256":"x","lockfile_stable":true}' \
+    | env GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" PATH=/usr/bin:/bin bash -c 'source "${GATE_LIB}"; safe_gate_project_lane_scan_lines' 2>&1; true)"
+  [[ -z "${got}" ]] || [[ "${got}" == *'scan-report'* ]] || { printf '%s\n' "${got}" >&2; fail "$FUNCNAME: the render did not fail"; return; }
+  pass "$FUNCNAME"
+}
+
 case_project_lane_clean_add_in_a_project_with_findings_passes() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-clean-add" kept@1.0.0 vuln@1.0.0:install
@@ -8858,7 +9073,7 @@ case_project_lane_clean_add_in_a_project_with_findings_passes() {
   jq -e '.version == "2.0.0"' "${WORK_DIR}/node_modules/clean/package.json" >/dev/null || { fail "$FUNCNAME: tree"; return; }
   # The files keep their mode.
   [[ "$(stat -c %a "${WORK_DIR}/package.json")" == "644" && "$(stat -c %a "${WORK_DIR}/package-lock.json")" == "644" ]] || { fail "$FUNCNAME: file modes changed"; return; }
-  assert_log_not_contains_fragment 'repo-audit' "$FUNCNAME" || return
+  assert_lane_scan_only_after_npm "$FUNCNAME" || return
   assert_no_per_root_audit "$FUNCNAME" || return
   assert_lane_no_leftover "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -12507,7 +12722,7 @@ case_project_lane_ci_in_a_fresh_clone_passes_on_the_advisories_its_lockfile_carr
   assert_err_contains_fragment 'baseline: committed' "$FUNCNAME" || return
   assert_err_contains_fragment '2 advisories already present (critical 1, high 1)' "$FUNCNAME" || return
   assert_err_contains_fragment 'advisories: 0 fixed, 2 already present (highest: critical)' "$FUNCNAME" || return
-  assert_err_contains_fragment '0 packages added, 0 changed, 0 removed' "$FUNCNAME" || return
+  assert_err_contains_fragment 'installs 3 entries of the lockfile as they stand' "$FUNCNAME" || return
   # no projection: the plan is the lockfile on disk, checked by npm's own frozen check
   assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
   grep -q $'^CICHECK\t' "${LOG_FILE}" || { fail "$FUNCNAME: no frozen check"; return; }
@@ -12576,7 +12791,7 @@ case_project_lane_ci_with_a_lockfile_that_is_not_the_baseline_is_judged_against_
   lane_run 'npm ci'
   assert_status 0 "$FUNCNAME: clean edit" || return
   assert_err_contains_fragment 'npm ci: 2 entries of the lockfile checked for malice' "$FUNCNAME" || return
-  assert_err_contains_fragment '1 packages added, 0 changed, 0 removed' "$FUNCNAME" || return
+  assert_err_contains_fragment 'installs 2 entries of the lockfile as they stand' "$FUNCNAME" || return
   [[ "$(lane_stored_digest)" == "$(lane_digest_of "${WORK_DIR}/package-lock.json")" ]] || { fail "$FUNCNAME: the judged lockfile was not recorded"; return; }
   # a recorded lockfile is the baseline of itself: the next ci introduces nothing, whatever it carries
   : > "${LOG_FILE}"
@@ -12703,7 +12918,7 @@ case_project_lane_dedupe_and_prune_are_judged_and_bound_like_install() {
     # nothing the old path does: no per-artifact audit, no scan of a scratch project, no delegated verb
     assert_log_not_contains_fragment $'REAL\tnpm\t'"${verb}" "$FUNCNAME: ${verb}" || return
     assert_no_per_root_audit "$FUNCNAME: ${verb}" || return
-    assert_log_not_contains_fragment 'repo-audit' "$FUNCNAME: ${verb}" || return
+    assert_lane_scan_only_after_npm "$FUNCNAME: ${verb}" || return
     grep -qP '^REAL\tnpm\tci\t--ignore-scripts\t--no-audit\t--no-fund\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${verb}: no frozen ci"; return; }
     [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: ${verb}: lockfile is not the judged one"; return; }
     [[ -f "${WORK_DIR}/node_modules/dup/package.json" && ! -e "${WORK_DIR}/node_modules/kept/node_modules" ]] || { fail "$FUNCNAME: ${verb}: the tree is not the judged plan"; return; }
@@ -12823,7 +13038,7 @@ case_project_lane_routing_the_old_differential_path_is_reachable_only_with_the_s
     assert_status 0 "$FUNCNAME: ${verb} on" || return
     ! compgen -G "${TMPDIR:-/tmp}/safe-gate-lockdiff.*" >/dev/null || printf '# %s: scratch of another run\n' "$FUNCNAME"
     assert_no_per_root_audit "$FUNCNAME: ${verb} on" || return
-    assert_log_not_contains_fragment 'repo-audit' "$FUNCNAME: ${verb} on" || return
+    assert_lane_scan_only_after_npm "$FUNCNAME: ${verb} on" || return
     # the same command with the switch off enters the old path: it audits the introduced set (nothing here) and
     # requires the tree it would otherwise refuse without
     printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
@@ -17408,6 +17623,14 @@ main() {
     case_project_lane_switch_off_keeps_todays_gate \
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
+    case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
+    case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
+    case_project_lane_scan_says_when_the_lockfile_changed_while_it_ran \
+    case_project_lane_scan_bound_reaches_the_scanners_children \
+    case_project_lane_scan_ignores_a_scanner_the_environment_names \
+    case_project_lane_scan_runs_after_a_publication_only_and_after_the_lock_is_released \
+    case_project_lane_ci_line_says_it_has_no_differential_and_unreadable_publish_times_are_a_line \
+    case_project_lane_scan_report_without_a_scanner_and_with_a_hostile_summary_says_so \
     case_project_lane_clean_add_in_a_project_with_findings_passes \
     case_project_lane_scripts_report_names_what_a_named_install_introduced \
     case_project_lane_scripts_report_names_the_projects_own_scripts_for_a_bare_install_and_ci \
