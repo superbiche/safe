@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a
+  `ci` entry count that cannot be read gives the line without its number. The facts that allow the document are set as soon as the decision
+  is validated (a signal during the revocation step leaves a document); the command's status is settled when the document's writing starts
+  and the process ends with the status the document holds, a later signal changing neither; a signal on a dry run after the decision is
+  `interrupted`; a signal during the scan stops the scan and every process of it at once (the scan is recorded as not completed because it
+  was interrupted); the deferral that protects the binder ends when the binder returns, so a signal during the scripts reading is not lost.
+  The Socket scoring answer is recorded as given (a `n` was recorded as accepted). The document: a bundled member's row names the artifact
+  that supplies its bytes, a waiver and a wait keep the advisories they remediate, the dropped artifacts are counted, a piece that could not
+  be read is named (`pieces_unread`) and its count is null, not zero, a binder piece lost after a publication still gives a document, a
+  cooldown reading that was not made is `skipped`, not judged and not missing (line and document). A scan result with no coverage section is
+  unreadable coverage. A writer never removes its own file. The lane lint holds the finishing path to no early end before the document and to
+  one start per caller.
 - Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2; round two of the review). One document per
   command, written once by ONE path every end goes through (unlock, scan, document, scratch; a handled signal included, with the write
   bounded to two seconds and no scan), for every end at or after the decision, by `safe-core project-report write` (new; `check` is for

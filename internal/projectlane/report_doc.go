@@ -46,7 +46,8 @@ var (
 	introReasons = map[string]bool{IntroducedNew: true, IntroducedOrigin: true, IntroducedIntegrity: true, IntroducedBoth: true, IntroducedCovering: true}
 	fixPolicies  = map[string]bool{SecurityFixExempt: true, SecurityFixEnforce: true, "": true}
 	scriptEvents = map[string]bool{"preinstall": true, "install": true, "postinstall": true, "prepublish": true, "preprepare": true, "prepare": true, "postprepare": true}
-	scanReasons  = map[string]bool{"": true, "no_audit": true, "no_timeout": true, "timeout": true, "failed": true, "no_result": true}
+	scanReasons  = map[string]bool{"": true, "no_audit": true, "no_timeout": true, "timeout": true, "failed": true, "no_result": true, "interrupted": true}
+	pieceNames   = map[string]bool{"graph": true, "judged": true, "binder": true, "scripts": true, "scan": true}
 	// the ends that read as a pass of the command, and the ones that need a status other than 0
 	passEnds = map[string]bool{"published": true, "published_lockfile": true, "dry_run": true}
 )
@@ -101,6 +102,9 @@ type ReportDocument struct {
 	Binder        *ReportBinder   `json:"binder"`
 	Scripts       *ReportScripts  `json:"scripts"`
 	Scan          *ReportScan     `json:"scan"`
+	// PiecesUnread names the pieces of the run the document should have been built from and could not read (graph, judged, binder, scripts,
+	// scan): a member that comes from one of them is then null or "unreadable", never a value that looks like a reading.
+	PiecesUnread []string `json:"pieces_unread"`
 }
 
 // ReportCommand is the command as the lane saw it, from closed values: the arguments of the command are not kept.
@@ -122,7 +126,7 @@ type ReportDecision struct {
 	Baseline        string           `json:"baseline"`
 	Outcome         ReportOutcome    `json:"outcome"`
 	Classes         []ReportClass    `json:"classes"`
-	Entries         int              `json:"entries"`
+	Entries         *int             `json:"entries"`
 	Difference      ReportDifference `json:"difference"`
 	Fixed           []ReportAdvisory `json:"fixed"`
 	AlreadyPresent  []ReportPresent  `json:"already_present"`
@@ -163,6 +167,7 @@ type ReportDifference struct {
 	RemovedCount    int                `json:"removed_count"`
 	ChangedCount    int                `json:"changed_count"`
 	IntroducedCount int                `json:"introduced_count"`
+	DroppedCount    int                `json:"dropped_count"`
 	Added           []ReportNameSet    `json:"added"`
 	Removed         []ReportNameSet    `json:"removed"`
 	Changed         []ReportChange     `json:"changed"`
@@ -189,6 +194,8 @@ type ReportIntroduced struct {
 	Version string `json:"version"`
 	Host    string `json:"host"`
 	Reason  string `json:"reason"`
+	// CoveredBy is name@version of the artifact whose tarball supplies a bundled member's bytes ("" for any other entry).
+	CoveredBy string `json:"covered_by"`
 }
 
 // ReportAdvisory is an advisory of a package.
@@ -246,7 +253,10 @@ type ReportCooldown struct {
 	Waits       []ReportWait   `json:"waits"`
 	Waived      []ReportWaiver `json:"waived"`
 	Missing     int            `json:"missing"`
-	Other       int            `json:"other"`
+	// Skipped counts the introduced versions whose publish time was not asked for, because an established block ended the command first:
+	// they were not judged, and they are not missing evidence.
+	Skipped int `json:"skipped"`
+	Other   int `json:"other"`
 }
 
 // ReportWait is a version inside the cooldown, with the dates.
@@ -258,13 +268,16 @@ type ReportWait struct {
 	Root        bool   `json:"root"`
 	Bounded     bool   `json:"bounded"`
 	Cleared     bool   `json:"cleared"`
+	// Remediates are the advisories the version fixes when it is a named root (the exemption's reason).
+	Remediates []string `json:"remediates"`
 }
 
 // ReportWaiver is a named version whose wait the security-fix exemption waived.
 type ReportWaiver struct {
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	Published string `json:"published"`
+	Name       string   `json:"name"`
+	Version    string   `json:"version"`
+	Published  string   `json:"published"`
+	Remediates []string `json:"remediates"`
 }
 
 // ReportSocket is the Socket judgement of a named root.
@@ -348,6 +361,7 @@ type ReportInputs struct {
 	Scan            []byte
 	Graph           []byte
 	Judged          []byte // the digests of the judged target and of the baseline
+	Expected        []byte // the pieces the run meant to leave besides the decision, graph and digests (bind, scripts, scan), one per line
 }
 
 // ErrNoDecision: the run left no readable decision report: nothing is written, the command ended before it.
@@ -369,19 +383,48 @@ func BuildReportDocument(in ReportInputs) (ReportDocument, error) {
 	if err := json.Unmarshal(in.Report, &report); err != nil || report.SchemaVersion != ReportSchema || !outcomeState[report.Outcome.Status] {
 		return doc, ErrNoDecision
 	}
-	doc.Lockfiles = lockfilesOf(in.Judged)
+	expected := map[string]bool{}
+	for _, name := range strings.Fields(string(in.Expected)) {
+		expected[name] = true
+	}
+	unread := map[string]bool{}
+	var judgedOK bool
+	doc.Lockfiles, judgedOK = lockfilesOf(in.Judged)
+	if !judgedOK {
+		unread["judged"] = true
+	}
 	doc.Decision = decisionOf(report, in.Verb == "ci")
-	doc.Decision.Entries = entriesOf(in.Graph)
+	if n, ok := entriesOf(in.Graph); ok {
+		doc.Decision.Entries = &n
+	} else {
+		unread["graph"] = true
+	}
 	doc.Prompts = promptsOf(in.Prompts)
 	if in.Bind != nil {
 		doc.Binder = binderOf(in.Bind)
+	} else if expected["bind"] {
+		doc.Binder = &ReportBinder{Outcome: "unreadable", Exit: 0}
+	}
+	if doc.Binder != nil && doc.Binder.Outcome == "unreadable" {
+		unread["binder"] = true
 	}
 	if in.Scripts != nil {
 		doc.Scripts = scriptsOf(in.Scripts)
 	}
+	if expected["scripts"] && doc.Scripts == nil {
+		unread["scripts"] = true
+	}
 	if in.Scan != nil {
 		doc.Scan = scanOf(in.Scan)
 	}
+	if expected["scan"] && doc.Scan == nil {
+		unread["scan"] = true
+	}
+	doc.PiecesUnread = []string{}
+	for name := range unread {
+		doc.PiecesUnread = append(doc.PiecesUnread, name)
+	}
+	sort.Strings(doc.PiecesUnread)
 	doc.End = endOf(in, doc)
 	doc.Passed = (doc.End == "published" || doc.End == "published_lockfile") && doc.Status == 0
 	if err := ValidateReportDocument(doc); err != nil {
@@ -390,35 +433,41 @@ func BuildReportDocument(in ReportInputs) (ReportDocument, error) {
 	return doc, nil
 }
 
-func lockfilesOf(raw []byte) ReportLockfiles {
+func lockfilesOf(raw []byte) (ReportLockfiles, bool) {
 	out := ReportLockfiles{TargetSHA256: "unreadable", BaselineSHA256: "unreadable"}
 	var j struct {
 		Target   string `json:"target"`
 		Baseline string `json:"baseline"`
 	}
 	if raw == nil || json.Unmarshal(raw, &j) != nil {
-		return out
+		return out, false
 	}
+	ok := true
 	if digestGrammar.MatchString(j.Target) {
 		out.TargetSHA256 = j.Target
+	} else {
+		ok = false
 	}
 	if digestGrammar.MatchString(j.Baseline) {
 		out.BaselineSHA256 = j.Baseline
+	} else {
+		ok = false
 	}
-	return out
+	return out, ok
 }
 
-// entriesOf is the number of entries of the lockfile the command judged (the target graph), 0 when the graph cannot be read.
-func entriesOf(raw []byte) int {
+// entriesOf is the number of entries of the lockfile the command judged (the target graph); false when the graph cannot be read: a
+// count that is not known is not zero.
+func entriesOf(raw []byte) (int, bool) {
 	var g struct {
 		Graph struct {
-			Occurrences []json.RawMessage `json:"occurrences"`
+			Occurrences *[]json.RawMessage `json:"occurrences"`
 		} `json:"graph"`
 	}
-	if raw == nil || json.Unmarshal(raw, &g) != nil {
-		return 0
+	if raw == nil || json.Unmarshal(raw, &g) != nil || g.Graph.Occurrences == nil {
+		return 0, false
 	}
-	return len(g.Graph.Occurrences)
+	return len(*g.Graph.Occurrences), true
 }
 
 // endOf says how the command ended, from the binder's word, the prompts, the decision and the PUBLIC status. An end that reads as a pass
@@ -438,12 +487,21 @@ func endOf(in ReportInputs, doc ReportDocument) string {
 func rawEndOf(in ReportInputs, doc ReportDocument) string {
 	// a signal ended the command before the binder reported anything usable
 	// (a publication the binder reported and a signal after it, while the scan ran, is an interrupted command too: it ended on the signal)
-	if in.Status > 128 && in.Status < 193 && !in.DryRun && (doc.Binder == nil || doc.Binder.Outcome == "unreadable" || doc.Binder.Outcome == "published") {
+	if in.Status > 128 && in.Status < 193 && (doc.Binder == nil || doc.Binder.Outcome == "unreadable" || doc.Binder.Outcome == "published") {
 		return "interrupted"
 	}
 	if b := doc.Binder; b != nil {
 		switch b.Outcome {
 		case "unreadable":
+			// the binder's piece is lost, but the lane itself established the publication: that is a publication, with the piece named as lost
+			if in.Status == 0 {
+				switch in.Published {
+				case "tree":
+					return "published"
+				case "lockfile":
+					return "published_lockfile"
+				}
+			}
 			return "bind_unreadable"
 		case "published":
 			switch in.Published {
@@ -473,6 +531,18 @@ func rawEndOf(in ReportInputs, doc ReportDocument) string {
 		return "dry_run"
 	}
 	return "stopped"
+}
+
+// idsOK copies a list of advisory identifiers, false when one is outside the grammar.
+func idsOK(in []string) ([]string, bool) {
+	out := []string{}
+	for _, id := range in {
+		if !idGrammar.MatchString(id) {
+			return nil, false
+		}
+		out = append(out, id)
+	}
+	return out, true
 }
 
 func versionsOK(versions []string) bool {
@@ -539,22 +609,22 @@ func decisionOf(r Report, countsOnly bool) ReportDecision {
 	d.Coverage = coverageOf(r.Coverage)
 	if r.Cooldown != nil {
 		c := r.Cooldown
-		d.Cooldown.Days, d.Cooldown.Checked, d.Cooldown.Missing = capped(c.Days), capped(c.Checked), len(c.Missing)
+		d.Cooldown.Days, d.Cooldown.Checked, d.Cooldown.Missing, d.Cooldown.Skipped = capped(c.Days), capped(c.Checked), len(c.Missing), capped(c.Skipped)
 		d.Cooldown.SecurityFix = c.SecurityFix
 		if !fixPolicies[d.Cooldown.SecurityFix] {
 			d.Cooldown.SecurityFix = ""
 		}
 		for _, w := range c.Waits {
-			if goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) && goodStamp(w.Installable) {
+			if ids, ok := idsOK(w.Remediates); ok && goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) && goodStamp(w.Installable) {
 				d.Cooldown.Waits = append(d.Cooldown.Waits, ReportWait{Name: w.Name, Version: w.Version, Published: w.Published, Installable: w.Installable,
-					Root: w.Root, Bounded: w.Bounded, Cleared: w.Cleared})
+					Root: w.Root, Bounded: w.Bounded, Cleared: w.Cleared, Remediates: ids})
 			} else {
 				d.Cooldown.Other++
 			}
 		}
 		for _, w := range c.Waived {
-			if goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) {
-				d.Cooldown.Waived = append(d.Cooldown.Waived, ReportWaiver{Name: w.Name, Version: w.Version, Published: w.Published})
+			if ids, ok := idsOK(w.Remediates); ok && goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) {
+				d.Cooldown.Waived = append(d.Cooldown.Waived, ReportWaiver{Name: w.Name, Version: w.Version, Published: w.Published, Remediates: ids})
 			} else {
 				d.Cooldown.Other++
 			}
@@ -580,7 +650,7 @@ func decisionOf(r Report, countsOnly bool) ReportDecision {
 }
 
 func differenceOf(r Difference, countsOnly bool) ReportDifference {
-	d := ReportDifference{Listed: !countsOnly, AddedCount: len(r.Added), RemovedCount: len(r.Removed), ChangedCount: len(r.Changed), IntroducedCount: len(r.Introduced),
+	d := ReportDifference{Listed: !countsOnly, AddedCount: len(r.Added), RemovedCount: len(r.Removed), ChangedCount: len(r.Changed), IntroducedCount: len(r.Introduced), DroppedCount: len(r.Dropped),
 		Added: []ReportNameSet{}, Removed: []ReportNameSet{}, Changed: []ReportChange{}, Introduced: []ReportIntroduced{}}
 	if countsOnly {
 		return d
@@ -607,8 +677,9 @@ func differenceOf(r Difference, countsOnly bool) ReportDifference {
 		}
 	}
 	for _, i := range r.Introduced {
-		if goodName(i.Name) && goodVersion(i.Version) && introReasons[i.Reason] {
-			d.Introduced = append(d.Introduced, ReportIntroduced{Name: i.Name, Version: i.Version, Host: reportHostOf(i.Origin), Reason: i.Reason})
+		covered := strings.SplitN(i.CoveredBy, "\x00", 2)[0]
+		if goodName(i.Name) && goodVersion(i.Version) && introReasons[i.Reason] && hostPackageOK(covered) {
+			d.Introduced = append(d.Introduced, ReportIntroduced{Name: i.Name, Version: i.Version, Host: reportHostOf(i.Origin), Reason: i.Reason, CoveredBy: covered})
 		} else {
 			d.Other++
 		}
@@ -823,7 +894,10 @@ func ValidateReportDocument(d ReportDocument) error {
 		}
 	}
 	df := dec.Difference
-	for _, n := range []int{dec.Entries, df.AddedCount, df.RemovedCount, df.ChangedCount, df.IntroducedCount, df.Other, dec.AdvisoriesOther, dec.MaliceOther, dec.Coverage.Gaps,
+	if dec.Entries != nil && *dec.Entries < 0 {
+		return bad("the entries")
+	}
+	for _, n := range []int{df.DroppedCount, dec.Cooldown.Skipped, df.AddedCount, df.RemovedCount, df.ChangedCount, df.IntroducedCount, df.Other, dec.AdvisoriesOther, dec.MaliceOther, dec.Coverage.Gaps,
 		dec.Coverage.Other, dec.Cooldown.Days, dec.Cooldown.Checked, dec.Cooldown.Other, dec.Cooldown.Missing, dec.SocketOther, dec.AdverseOther} {
 		if n < 0 {
 			return bad("a count")
@@ -838,7 +912,7 @@ func ValidateReportDocument(d ReportDocument) error {
 		}
 	}
 	for _, i := range df.Introduced {
-		if !goodName(i.Name) || !goodVersion(i.Version) || !introReasons[i.Reason] || (i.Host != "" && !hostGrammar.MatchString(i.Host)) {
+		if !goodName(i.Name) || !goodVersion(i.Version) || !introReasons[i.Reason] || (i.Host != "" && !hostGrammar.MatchString(i.Host)) || !hostPackageOK(i.CoveredBy) {
 			return bad("an introduced artifact")
 		}
 	}
@@ -884,13 +958,18 @@ func ValidateReportDocument(d ReportDocument) error {
 		return bad("the cooldown's policy")
 	}
 	for _, w := range dec.Cooldown.Waits {
-		if !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) || !goodStamp(w.Installable) {
+		if _, ok := idsOK(w.Remediates); !ok || !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) || !goodStamp(w.Installable) {
 			return bad("a cooldown wait")
 		}
 	}
 	for _, w := range dec.Cooldown.Waived {
-		if !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) {
+		if _, ok := idsOK(w.Remediates); !ok || !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) {
 			return bad("a cooldown waiver")
+		}
+	}
+	for _, name := range d.PiecesUnread {
+		if !pieceNames[name] {
+			return bad("a piece name")
 		}
 	}
 	for _, s := range dec.Socket {

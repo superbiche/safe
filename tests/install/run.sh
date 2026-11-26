@@ -679,16 +679,18 @@ fi
 if [[ "${1:-}" == "repo-audit" ]]; then
   # is the project's lock held while the scan runs? (the lane releases it before the scan: ticket 1639)
   if flock -n "${PWD}" true 2>/dev/null; then printf 'SCANLOCK\tfree\n' >> "${SAFE_INSTALL_COMMAND_LOG}"; else printf 'SCANLOCK\theld\n' >> "${SAFE_INSTALL_COMMAND_LOG}"; fi
+  # a signal to the lane while the scan runs, at its start (the lane's pid is noted by lane_instrument; a name of a signal, or 1 for TERM), and the
+  # scan's own processes, noted so that a case can see that none is left
+  [[ -z "${SAFE_AUDIT_SCAN_PIDFILE:-}" ]] || printf '%s\n' "$$" >> "${SAFE_AUDIT_SCAN_PIDFILE}"
+  [[ -z "${SAFE_AUDIT_SCAN_SIGNAL_LANE:-}" ]] || kill -"${SAFE_AUDIT_SCAN_SIGNAL_LANE/#1/TERM}" "$(cat "${HOME}/lane.pid")"
   # a scan that outlives its bound, with a child that would write after it
   [[ -z "${SAFE_AUDIT_SCAN_GRANDCHILD:-}" ]] || ( sleep "${SAFE_AUDIT_SCAN_SLEEP:-6}"; : > "${SAFE_AUDIT_SCAN_GRANDCHILD}" ) >/dev/null 2>&1 &
-  [[ -z "${SAFE_AUDIT_SCAN_SLEEP:-}" ]] || sleep "${SAFE_AUDIT_SCAN_SLEEP}"
+  [[ -z "${SAFE_AUDIT_SCAN_SLEEP:-}" ]] || { sleep "${SAFE_AUDIT_SCAN_SLEEP}" & [[ -z "${SAFE_AUDIT_SCAN_PIDFILE:-}" ]] || printf '%s\n' "$!" >> "${SAFE_AUDIT_SCAN_PIDFILE}"; wait; }
   [[ -n "${SAFE_AUDIT_SCAN_OUTPUT:-}" ]] && printf '%s\n' "${SAFE_AUDIT_SCAN_OUTPUT}"
   # a scan that finds the lockfile changed under it (an edit by someone else while it ran)
   [[ -z "${SAFE_AUDIT_SCAN_TOUCH_LOCKFILE:-}" ]] || printf ' ' >> "${PWD}/package-lock.json"
   # an edit that is gone again when the scan ends (what the scan read at its start is not what was published)
   [[ -z "${SAFE_AUDIT_SCAN_UNDO_EDIT:-}" ]] || truncate -s -1 "${PWD}/package-lock.json"
-  # a TERM to the lane while the scan runs (the lane shell is the scan's grandparent: the auditor runs under timeout, which the lane started)
-  [[ -z "${SAFE_AUDIT_SCAN_SIGNAL_LANE:-}" ]] || kill -TERM "$(ps -o ppid= -p "${PPID}" | tr -d ' ')"
   # The gate decides from the result document, not from this exit code: a scan
   # that finds a critical advisory still exits 0.
   result_out=""
@@ -734,6 +736,8 @@ if [[ "${1:-}" == "repo-audit" ]]; then
   "ecosystem_audits": ${stub_eco_audits}
 }
 JSON
+    # a result that carries no coverage section at all
+    [[ -z "${SAFE_AUDIT_SCAN_NO_COVERAGE:-}" ]] || { jq 'del(.tool_status, .ecosystem_audits)' "${result_out}" > "${result_out}.edit" && mv "${result_out}.edit" "${result_out}"; }
   fi
   exit "${SAFE_AUDIT_SCAN_STATUS:-0}"
 fi
@@ -1180,6 +1184,8 @@ run_zsh() {
     SAFE_AUDIT_SCAN_TOUCH_LOCKFILE="${SAFE_AUDIT_SCAN_TOUCH_LOCKFILE:-}" \
     SAFE_AUDIT_SCAN_UNDO_EDIT="${SAFE_AUDIT_SCAN_UNDO_EDIT:-}" \
     SAFE_AUDIT_SCAN_SIGNAL_LANE="${SAFE_AUDIT_SCAN_SIGNAL_LANE:-}" \
+    SAFE_AUDIT_SCAN_PIDFILE="${SAFE_AUDIT_SCAN_PIDFILE:-}" \
+    SAFE_AUDIT_SCAN_NO_COVERAGE="${SAFE_AUDIT_SCAN_NO_COVERAGE:-}" \
     SAFE_AUDIT_SCAN_GRANDCHILD="${SAFE_AUDIT_SCAN_GRANDCHILD:-}" \
     SAFE_AUDIT_SCAN_VERDICT="${SAFE_AUDIT_SCAN_VERDICT:-}" \
     SAFE_AUDIT_SCAN_TOOL_STATUS="${SAFE_AUDIT_SCAN_TOOL_STATUS:-}" \
@@ -8883,6 +8889,16 @@ case_project_lane_scripts_are_off_in_the_frozen_install_and_no_script_runner_is_
 # The whole-project scan, as a report: after a verified publication only, after the project lock is released, bounded, from the scan's
 # result document, and never a change of the command's status.
 SCAN_LINE='safe: project lane: project scan:'
+# A case that signals the lane from a stub needs the lane's own pid: this copy of the gate's library notes it (one line, after the scratch is
+# made). The anchor is asserted, so that a change of the library cannot make a case signal nothing.
+lane_instrument() {
+  local lib="${CASE_DIR}/lib"
+  [[ -L "${lib}" ]] || { fail "lane_instrument: the case's library is not the link it was"; return 1; }
+  rm -f -- "${lib}" && cp -a -- "${ROOT_DIR}/lib" "${lib}" || return 1
+  [[ "$(grep -c '^  SAFE_GATE_LANE_SCRATCH="${scratch}"$' "${lib}/gate-lib.sh")" == 1 ]] || { fail "lane_instrument: the anchor is not there once"; return 1; }
+  sed -i 's|^  SAFE_GATE_LANE_SCRATCH="${scratch}"$|&\n  printf "%s\\n" "${BASHPID}" > "${HOME}/lane.pid"|' "${lib}/gate-lib.sh"
+  grep -q 'lane.pid' "${lib}/gate-lib.sh" || { fail "lane_instrument: not instrumented"; return 1; }
+}
 scan_prepare() { # <name>
   lane_prepare "$1" kept@1.0.0
   SCAN_LOCK="$(lane_lock kept@1.0.0 clean@2.0.0)"
@@ -9162,9 +9178,10 @@ case_project_lane_report_an_interruption_is_its_own_end_and_a_command_before_the
   [[ "$(report_count)" == 0 ]] || { fail "$FUNCNAME: a document came out of a writer that was cut"; return; }
   # a TERM while the scan runs: the command ends with the signal, after the document is written
   scan_prepare "lane-report-signal-in-scan"
-  SAFE_AUDIT_SCAN_SIGNAL_LANE=1 scan_run
+  lane_instrument || return
+  SAFE_AUDIT_SCAN_SIGNAL_LANE=TERM scan_run
   assert_status 143 "$FUNCNAME: a signal in the scan" || return
-  [[ "$(report_count)" == 1 && "$(report_jq '[.end, .status, .binder.outcome, .passed, .scan.status] | join(" ")')" == "interrupted 143 published false completed" ]] || { fail "$FUNCNAME: a signal in the scan: $(jq -c '[.end,.status]' "$(report_files | head -1)" 2>/dev/null)"; return; }
+  [[ "$(report_count)" == 1 && "$(report_jq '[.end, .status, .binder.outcome, .passed, .scan.status, .scan.reason] | join(" ")')" == "interrupted 143 published false not_completed interrupted" ]] || { fail "$FUNCNAME: a signal in the scan: $(jq -c '[.end,.status]' "$(report_files | head -1)" 2>/dev/null)"; return; }
   assert_lane_no_leftover "$FUNCNAME: a signal in the scan" || return
   # a TERM before any decision exists: no document
   scan_prepare "lane-report-signal-early"
@@ -9347,6 +9364,205 @@ case_project_lane_report_a_document_that_cannot_be_written_is_one_line_and_chang
   scan_run
   assert_status 0 "$FUNCNAME: killed writer" || return
   [[ "$(grep -c 'safe: project lane: the report could not be written' "${ERR_FILE}")" == 1 ]] || { fail "$FUNCNAME: killed writer"; return; }
+  pass "$FUNCNAME"
+}
+
+# ---- ticket 1639, third pass ---------------------------------------------------------------------------------------------------
+
+# A. nothing this ticket added can refuse a command: a count that cannot be read gives the line without its number
+case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-ci-count-fails"
+  mkdir -p "${CASE_DIR}/render-tools"
+  cat > "${CASE_DIR}/render-tools/jq" <<'JQ'
+#!/bin/bash
+if [[ $1 == -r && $2 == '.graph.occurrences | length' && $3 == */target-graph.json ]]; then
+  echo "failed read" >> "${HOME}/render-fault"; exit 4
+fi
+exec /usr/bin/jq "$@"
+JQ
+  chmod +x "${CASE_DIR}/render-tools/jq"
+  SAFE_TEST_PATH_MID="${CASE_DIR}/render-tools" lane_run 'npm ci'
+  [[ -e "${HOME_DIR}/render-fault" ]] || { fail "$FUNCNAME: the failing read was never made"; return; }
+  assert_status 0 "$FUNCNAME" || return
+  [[ -d "${WORK_DIR}/node_modules" ]] || { fail "$FUNCNAME: no tree"; return; }
+  assert_err_contains_fragment "safe: project lane: npm ci: ci installs the ones npm selects from the lockfile's entries; ci has no differential" "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'cannot be rendered' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# B, D. a signal at every point: the process ends with the status the document holds, and from the validated decision on there is one document
+case_project_lane_report_a_signal_at_every_point_ends_with_the_status_the_document_holds() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local phase sig code want_end doc_status docs
+  local -A codes=([INT]=130 [TERM]=143 [HUP]=129)
+  local -a sigs=(INT TERM HUP)
+  # a command started in the background ignores SIGINT from its start and cannot trap it: INT is then not tried (it is, in a foreground run)
+  if (( 0x$(awk '/^SigIgn/{print $2}' /proc/$$/status) & 2 )); then
+    printf '# %s: SIGINT is ignored in this run (a background job): INT is not tried here\n' "$FUNCNAME"
+    sigs=(TERM HUP)
+  fi
+  for phase in decision revoke baseline dry scripts deferred scan writer; do
+    for sig in "${sigs[@]}"; do
+      code="${codes[${sig}]}"
+      scan_prepare "lane-sig-${phase}-${sig}"
+      lane_instrument || return
+      case "${phase}" in
+        decision) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-graph ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-core" ;;
+        revoke|dry) sed -i '2i\if [[ $1 == lane-revoke ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-audit" ;;
+        baseline) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-baseline \&\& "$2" == record ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-core" ;;
+        scripts) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-scripts ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-core" ;;
+        deferred) sed -i '2i\if [[ $1 == package-audit \&\& " $* " == *" --op install "* \&\& " $* " != *" --evidence-only "* ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-audit" ;;
+        writer) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-report ]]; then kill -'"${sig}"' "$(cat "$HOME/lane.pid")"; sleep 1; fi' "${BIN_DIR}/safe-core" ;;
+      esac
+      case "${phase}" in
+        dry) SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" NPM_LOCK_MUTATION_JSON="${SCAN_LOCK}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0 --dry-run' ;;
+        scan) SAFE_AUDIT_SCAN_SIGNAL_LANE="${sig}" SAFE_AUDIT_SCAN_SLEEP=3 scan_run ;;
+        revoke) SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" scan_run ;;
+        *) scan_run ;;
+      esac
+      docs="$(report_count)"
+      if [[ "${phase}" == decision ]]; then
+        [[ "${STATUS}" == "${code}" && "${docs}" == 0 ]] || { fail "$FUNCNAME: ${phase}/${sig}: status ${STATUS}, ${docs} documents (no decision yet: none)"; return; }
+        continue
+      fi
+      [[ "${docs}" == 1 ]] || { fail "$FUNCNAME: ${phase}/${sig}: ${docs} documents"; return; }
+      case "${phase}" in
+        writer) want_end=published; doc_status=0 ;;
+        *) want_end=interrupted; doc_status="${code}" ;;
+      esac
+      [[ "${STATUS}" == "${doc_status}" ]] || { fail "$FUNCNAME: ${phase}/${sig}: the process ended ${STATUS}, the document says ${doc_status}"; return; }
+      [[ "$(report_jq '[.end, .status] | join(" ")')" == "${want_end} ${doc_status}" ]] || { fail "$FUNCNAME: ${phase}/${sig}: $(jq -c '[.end,.status,.passed]' "$(report_one)")"; return; }
+      case "${phase}" in
+        revoke|baseline|dry) [[ "$(report_jq '[.binder, .scan, .passed] | join(" ")')" == "  false" ]] || { fail "$FUNCNAME: ${phase}/${sig}: a binder or a scan in the document"; return; } ;;
+        scripts|deferred) [[ "$(report_jq '[.binder.outcome, .scan, .passed] | join(" ")')" == "published  false" ]] || { fail "$FUNCNAME: ${phase}/${sig}: $(jq -c '[.binder,.scan]' "$(report_one)")"; return; }
+          [[ "$(grep -c $'^AUDIT\trepo-audit\t' "${LOG_FILE}")" == 0 ]] || { fail "$FUNCNAME: ${phase}/${sig}: a scan ran after a signal"; return; } ;;
+        scan) [[ "$(report_jq '[.scan.status, .scan.reason, .binder.outcome] | join(" ")')" == "not_completed interrupted published" ]] || { fail "$FUNCNAME: scan/${sig}: $(jq -c .scan "$(report_one)")"; return; } ;;
+        writer) [[ "$(report_jq '.passed')" == true ]] || { fail "$FUNCNAME: writer/${sig}: not a pass"; return; } ;;
+      esac
+      assert_lane_no_leftover "$FUNCNAME: ${phase}/${sig}" || return
+      [[ ! "$(find "$(report_dir)" -name '.staged-*' | head -1)" ]] || { fail "$FUNCNAME: ${phase}/${sig}: a staged file is left"; return; }
+    done
+  done
+  pass "$FUNCNAME"
+}
+
+# C. a signal during the scan stops it: the command is over at once, nothing of the scan is left running, the document says why
+case_project_lane_scan_a_signal_stops_the_scan_and_ends_the_command_at_once() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-signalled"
+  lane_instrument || return
+  local pids="${CASE_DIR}/scan-pids" began=${SECONDS} pid live=0
+  SAFE_AUDIT_SCAN_SIGNAL_LANE=TERM SAFE_AUDIT_SCAN_SLEEP=25 SAFE_AUDIT_SCAN_GRANDCHILD="${CASE_DIR}/grandchild-ran" SAFE_AUDIT_SCAN_PIDFILE="${pids}" scan_run
+  assert_status 143 "$FUNCNAME" || return
+  (( SECONDS - began < 15 )) || { fail "$FUNCNAME: the command waited $(( SECONDS - began )) s for a scan it was told to stop"; return; }
+  [[ -s "${pids}" ]] || { fail "$FUNCNAME: the scan never started"; return; }
+  while read -r pid; do kill -0 "${pid}" 2>/dev/null && live=$((live + 1)); done < "${pids}"
+  (( live == 0 )) || { fail "$FUNCNAME: ${live} process(es) of the scan are still running"; return; }
+  [[ "$(report_jq '[.end, .status, .scan.status, .scan.reason, .passed] | join(" ")')" == "interrupted 143 not_completed interrupted false" ]] || { fail "$FUNCNAME: $(jq -c '[.end,.status,.scan]' "$(report_one)")"; return; }
+  assert_err_contains_fragment "${SCAN_LINE} did not complete (it was interrupted); the project's other ecosystems were not reported" "$FUNCNAME" || return
+  sleep 4
+  [[ ! -e "${CASE_DIR}/grandchild-ran" ]] || { fail "$FUNCNAME: a child of the scan outlived the signal"; return; }
+  assert_lane_no_leftover "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# E. the document records the answer the operator gave, wherever the command goes on after a no
+case_project_lane_report_the_socket_answer_is_the_one_the_operator_gave() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local answer
+  for answer in n Y; do
+    lane_prepare "lane-report-socket-${answer}" kept@1.0.0
+    lane_safe_run_stub
+    LANE_PTY=1 LANE_PTY_ANSWERS="${answer}"$'\n' SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"consent_required"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 0 "$FUNCNAME: ${answer}" || return
+    if [[ "${answer}" == n ]]; then
+      assert_err_contains_fragment 'Socket check declined for this install' "$FUNCNAME" || return
+      [[ "$(report_jq '(.prompts | map(.class + ":" + .ended) | join(","))')" == "socket_root:declined" ]] || { fail "$FUNCNAME: a declined Socket check is recorded as $(report_jq '.prompts')"; return; }
+    else
+      [[ "$(report_jq '(.prompts | map(.class + ":" + .ended) | join(","))')" == "socket_root:accepted" ]] || { fail "$FUNCNAME: an accepted Socket check is recorded as $(report_jq '.prompts')"; return; }
+    fi
+  done
+  pass "$FUNCNAME"
+}
+
+# F. two hosts bundle one member: two rows, each naming what supplies its bytes
+case_project_lane_report_two_bundled_members_of_two_hosts_are_two_rows() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local tag ver lock baseline target
+  for tag in before after; do
+    ver=1.0.0; [[ "${tag}" == before ]] || ver=2.0.0
+    lock="$(lane_lock kept@1.0.0 "alpha@${ver}" "beta@${ver}" | jq -c 'reduce ["alpha","beta"][] as $h (.; .packages["node_modules/"+$h+"/node_modules/member"]={"version":"1.0.0","inBundle":true})')"
+    if [[ "${tag}" == before ]]; then baseline="${lock}"; else target="${lock}"; fi
+  done
+  lane_prepare "lane-report-dual-bundle" kept@1.0.0
+  printf '%s\n' "${baseline}" > "${WORK_DIR}/package-lock.json"; lane_commit
+  NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm update --package-lock-only'
+  assert_status 0 "$FUNCNAME" || return
+  [[ "$(report_jq '[.decision.difference.introduced[] | select(.name == "member") | .covered_by] | sort | join(",")')" == "alpha@2.0.0,beta@2.0.0" ]] \
+    || { fail "$FUNCNAME: $(report_jq '[.decision.difference.introduced[] | select(.name == "member")]')"; return; }
+  [[ "$(report_jq '.decision.difference.dropped_count')" -ge 0 ]] || { fail "$FUNCNAME: no dropped count"; return; }
+  pass "$FUNCNAME"
+}
+
+# G. a piece that could not be read is named, and a count that is not known is not zero
+case_project_lane_report_a_piece_that_could_not_be_read_is_named_not_counted_as_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local piece
+  for piece in graph scripts bind; do
+    scan_prepare "lane-report-lost-${piece}"
+    case "${piece}" in
+      graph) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-report ]]; then prev=""; for a in "$@"; do [[ "$prev" == --scratch ]] \&\& rm -f -- "$a/target-graph.json"; prev="$a"; done; fi' "${BIN_DIR}/safe-core"
+        lane_run 'npm ci' ;;
+      scripts) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-scripts ]]; then prev=""; for a in "$@"; do [[ "$prev" == --lock ]] \&\& mkdir -p -- "$(dirname "$(dirname "$a")")/scripts.json"; prev="$a"; done; fi' "${BIN_DIR}/safe-core"
+        NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0:install)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0 --package-lock-only' ;;
+      bind) sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-report ]]; then prev=""; for a in "$@"; do [[ "$prev" == --scratch ]] \&\& rm -f -- "$a/bind.json"; prev="$a"; done; fi' "${BIN_DIR}/safe-core"
+        scan_run ;;
+    esac
+    assert_status 0 "$FUNCNAME: ${piece}" || return
+    case "${piece}" in
+      graph) [[ "$(report_jq '[.decision.entries, .pieces_unread[0]] | map(tostring) | join(" ")')" == "null graph" ]] || { fail "$FUNCNAME: graph: $(report_jq '[.decision.entries, .pieces_unread]')"; return; } ;;
+      scripts) [[ "$(report_jq '[.scripts, .pieces_unread[0]] | map(tostring) | join(" ")')" == "null scripts" ]] || { fail "$FUNCNAME: scripts: $(report_jq '[.scripts, .pieces_unread]')"; return; }
+        assert_err_contains_fragment 'clean@2.0.0' "$FUNCNAME: the terminal still names the package" || return ;;
+      bind) [[ "$(report_jq '[.end, .passed, .binder.outcome, .pieces_unread[0]] | join(" ")')" == "published true unreadable binder" ]] || { fail "$FUNCNAME: bind: $(jq -c '[.end,.passed,.binder,.pieces_unread]' "$(report_one)")"; return; }
+        [[ "$(grep -c 'safe: project lane: the report could not be written' "${ERR_FILE}")" == 0 ]] || { fail "$FUNCNAME: bind: a document that was written is said not to be"; return; } ;;
+    esac
+  done
+  # nothing is lost when nothing was meant to be there: a refusal has no binder, no scripts, no scan, and names no piece
+  scan_prepare "lane-report-nothing-lost"
+  SAFE_AUDIT_EVIDENCE_HITS="{\"dirty@3.0.0\":${LANE_HIT_CRITICAL}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 dirty@3.0.0)" lane_run 'npm install dirty@3.0.0'
+  [[ "$(report_jq '[(.pieces_unread | length), .decision.entries] | map(tostring) | join(" ")')" == "0 2" ]] || { fail "$FUNCNAME: a refusal names pieces: $(report_jq '[.pieces_unread, .decision.entries]')"; return; }
+  pass "$FUNCNAME"
+}
+
+# H. a scan result with no coverage section is unreadable coverage
+case_project_lane_scan_a_result_without_coverage_is_unreadable_coverage() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-scan-no-coverage"
+  SAFE_AUDIT_SCAN_NO_COVERAGE=1 scan_run
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment "${SCAN_LINE} scanner coverage could not be read; that coverage is unknown" "$FUNCNAME" || return
+  [[ "$(report_jq '[.scan.status, .scan.summary.coverage_unreadable] | join(" ")')" == "completed true" ]] || { fail "$FUNCNAME: $(report_jq .scan)"; return; }
+  pass "$FUNCNAME"
+}
+
+# I. a cooldown reading that was not made is not described as judged
+case_project_lane_the_cooldown_line_and_document_say_a_skipped_reading_was_not_made() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-cooldown-skipped"
+  SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" scan_run
+  assert_status 104 "$FUNCNAME" || return
+  [[ "$(grep -c '^RELEASES_REQUEST' "${LOG_FILE}")" == 0 ]] || { fail "$FUNCNAME: the release reader was asked"; return; }
+  assert_err_contains_fragment 'cooldown: not judged for 1 introduced version(s): an established block ended the command before their publish times were read' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'judged against the' "$FUNCNAME: a reading that was not made is said judged" || return
+  [[ "$(report_jq '[.decision.cooldown.skipped, .decision.cooldown.checked, .decision.cooldown.missing, ([.decision.coverage.causes[] | select(.cause == "publish_time")] | length)] | join(" ")')" == "1 0 0 0" ]] \
+    || { fail "$FUNCNAME: $(report_jq .decision.cooldown)"; return; }
+  # a reading that FAILED is still missing evidence and still said
+  lane_prepare "lane-cooldown-failed" kept@1.0.0
+  SAFE_CORE_TAMPER=releases-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: failed reading" || return
+  assert_err_contains_fragment 'publish times: 1 could not be read' "$FUNCNAME: failed reading" || return
+  [[ "$(report_jq '[.decision.cooldown.skipped, .decision.cooldown.missing] | join(" ")')" == "0 1" ]] || { fail "$FUNCNAME: failed reading: $(report_jq .decision.cooldown)"; return; }
   pass "$FUNCNAME"
 }
 
@@ -18094,6 +18310,14 @@ main() {
     case_project_lane_update_that_fixes_a_critical_passes \
     case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
     case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
+    case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \
+    case_project_lane_report_a_signal_at_every_point_ends_with_the_status_the_document_holds \
+    case_project_lane_scan_a_signal_stops_the_scan_and_ends_the_command_at_once \
+    case_project_lane_report_the_socket_answer_is_the_one_the_operator_gave \
+    case_project_lane_report_two_bundled_members_of_two_hosts_are_two_rows \
+    case_project_lane_report_a_piece_that_could_not_be_read_is_named_not_counted_as_nothing \
+    case_project_lane_scan_a_result_without_coverage_is_unreadable_coverage \
+    case_project_lane_the_cooldown_line_and_document_say_a_skipped_reading_was_not_made \
     case_project_lane_report_a_pass_writes_one_private_document_that_checks \
     case_project_lane_report_storage_in_a_bad_state_gates_nothing \
     case_project_lane_report_keeps_the_scripts_by_identity_from_one_reading \

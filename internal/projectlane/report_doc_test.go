@@ -13,7 +13,7 @@ var reportTime = time.Date(2026, 11, 26, 4, 15, 0, 0, time.UTC)
 const judgedPiece = `{"target":"sha256:` + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `","baseline":"sha256:` + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" + `"}`
 
 func baseInputs(report string) ReportInputs {
-	return ReportInputs{Now: reportTime, SafeVersion: "1.2.3", Verb: "install", Status: 0, Published: "tree", Report: []byte(report), Judged: []byte(judgedPiece),
+	return ReportInputs{Now: reportTime, SafeVersion: "1.2.3", Verb: "install", Status: 0, Published: "tree", Report: []byte(report), Judged: []byte(judgedPiece), Graph: []byte(`{"graph":{"occurrences":[{},{}]}}`),
 		Bind: []byte(`{"schema_version":1,"outcome":"published","exit":0}`)}
 }
 

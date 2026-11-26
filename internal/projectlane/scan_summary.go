@@ -109,6 +109,13 @@ func ReadScanSummary(raw []byte) (ScanSummary, error) {
 		}
 		return word, true
 	}
+	// the producer writes both sections on every result: one that is absent is coverage nobody can read, not an empty one
+	if _, present := members["tool_status"]; !present {
+		summary.CoverageUnreadable = true
+	}
+	if _, present := members["ecosystem_audits"]; !present {
+		summary.CoverageUnreadable = true
+	}
 	if raw, present := members["tool_status"]; present {
 		var tools map[string]json.RawMessage
 		if json.Unmarshal(raw, &tools) != nil || tools == nil {

@@ -23,12 +23,12 @@ func TestScanSummaryReadsTheVerdictAndTheProducersStatusAndKeepsNoFreeText(t *te
 // The producer's own rule (bin/safe-audit): a scanner whose status is not "ok" is a gap, whatever its note says; a note is never read.
 func TestScanSummaryNeverReadsANoteAndTakesEveryNonOkStatusAsAGap(t *testing.T) {
 	for _, status := range []string{"partial", "skipped", "unavailable", "error"} {
-		got, err := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":{"syft":{"status":"` + status + `","note":"all fine, nothing to see"}}}`))
+		got, err := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"ecosystem_audits":[],"tool_status":{"syft":{"status":"` + status + `","note":"all fine, nothing to see"}}}`))
 		if err != nil || len(got.CoverageGaps) != 1 || got.CoverageGaps[0].Status != status || got.CoverageUnreadable {
 			t.Fatalf("%s: %+v %v", status, got, err)
 		}
 	}
-	got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":{"syft":{"status":"ok","note":"it failed with an error"}}}`))
+	got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"ecosystem_audits":[],"tool_status":{"syft":{"status":"ok","note":"it failed with an error"}}}`))
 	if len(got.CoverageGaps) != 0 || got.CoverageOther != 0 || got.CoverageUnreadable {
 		t.Fatalf("a note was read: %+v", got)
 	}
@@ -50,9 +50,18 @@ func TestScanSummaryCoverageThatCannotBeReadIsUnreadableNotZero(t *testing.T) {
 			t.Errorf("%s: %+v %v", name, got, err)
 		}
 	}
-	got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0}}`))
-	if got.CoverageUnreadable {
-		t.Errorf("an absent coverage section is the producer's empty one: %+v", got)
+	// a result with no coverage section is coverage nobody can read (the producer writes both on every result)
+	for name, doc := range map[string]string{
+		"neither section":     `{"audit_totals":{"critical":0}}`,
+		"no tool status":      `{"audit_totals":{"critical":0},"ecosystem_audits":[]}`,
+		"no ecosystem audits": `{"audit_totals":{"critical":0},"tool_status":{}}`,
+	} {
+		if got, _ := ReadScanSummary([]byte(doc)); !got.CoverageUnreadable {
+			t.Errorf("%s read as complete coverage: %+v", name, got)
+		}
+	}
+	if got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":{},"ecosystem_audits":[]}`)); got.CoverageUnreadable || len(got.CoverageGaps) != 0 {
+		t.Errorf("two empty sections are no gap: %+v", got)
 	}
 }
 

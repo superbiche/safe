@@ -104,7 +104,7 @@ func projectReport(args []string, stdout, stderr io.Writer) int {
 	}
 	in := projectlane.ReportInputs{Now: time.Now().UTC(), SafeVersion: values["--version"], Verb: values["--verb"], DryRun: flags["--dry-run"],
 		PackageLockOnly: flags["--lock-only"], Status: status, Published: published, Report: piece("report.json"), Bind: piece("bind.json"),
-		Prompts: piece("prompt-log.tsv"), Scripts: piece("scripts.json"), Scan: piece("scan.json"), Graph: piece("target-graph.json"), Judged: piece("judged.json")}
+		Prompts: piece("prompt-log.tsv"), Scripts: piece("scripts.json"), Scan: piece("scan.json"), Graph: piece("target-graph.json"), Judged: piece("judged.json"), Expected: piece("expected")}
 	if in.Report == nil {
 		return fail("failed")
 	}

@@ -127,7 +127,7 @@ func (s ReportStore) Write(project string, content []byte, now time.Time) (strin
 	}
 	// the document is in place: a directory sync that fails now does not make it "not written"
 	_ = dirSync(dir)
-	if err := pruneReports(dir); err != nil {
+	if err := pruneReports(dir, name); err != nil {
 		return ReportPruneFailed, nil
 	}
 	return ReportWritten, nil
@@ -154,8 +154,8 @@ func afterNewest(dir *dirHandle, now time.Time) time.Time {
 	return now
 }
 
-// pruneReports removes the oldest reports past the bound: regular files of the pattern only.
-func pruneReports(dir *dirHandle) error {
+// pruneReports removes the oldest reports past the bound, never the one named own: regular files of the pattern only.
+func pruneReports(dir *dirHandle, own string) error {
 	names, err := dir.names()
 	if err != nil {
 		return err
@@ -173,8 +173,18 @@ func pruneReports(dir *dirHandle) error {
 	}
 	sort.Strings(mine)
 	var failed error
-	for i := 0; i < len(mine)-ReportsKept; i++ {
-		if err := dir.remove(mine[i]); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// the oldest past the bound go, and never the document this writer has just put in place (another writer, stamped later, may have
+	// finished first: the overlap must not cost a writer its own file)
+	excess := len(mine) - ReportsKept
+	for _, name := range mine {
+		if excess <= 0 {
+			break
+		}
+		if name == own {
+			continue
+		}
+		excess--
+		if err := dir.remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 			failed = err
 		}
 	}

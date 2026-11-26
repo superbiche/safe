@@ -77,6 +77,11 @@ STATE = {
     "SAFE_GATE_LANE_FACT_DATA": {"*": {"safe_gate_project_lane_run", "safe_gate_project_lane_in_subshell"}},
     "SAFE_GATE_LANE_FINISHING": {"0": {"safe_gate_project_lane_in_subshell"}, "1": {"safe_gate_project_lane_finish"}},
     "SAFE_GATE_LANE_FINISH_SIGNAL": {"": {"safe_gate_project_lane_in_subshell", "safe_gate_lane_signal"}},
+    # R12: the command's status is settled once, by the finishing path, before the document's writing; the scan's process and the last
+    # signal's status have owners
+    "SAFE_GATE_LANE_SETTLED": {"0": {"safe_gate_project_lane_in_subshell"}, "1": {"safe_gate_project_lane_finish"}},
+    "SAFE_GATE_LANE_SIGNAL_STATUS": {"": {"safe_gate_project_lane_in_subshell", "safe_gate_lane_signal"}},
+    "SAFE_GATE_LANE_SCAN_PID": {"": {"safe_gate_project_lane_in_subshell", "safe_gate_project_lane_scan_report"}},
 }
 # R13: the report document has ONE writer (the core's `project-report write`, started by the one function below, called once from the
 # entry as `|| true` after the scan and before the scratch is freed, and returning 0 only); the lane's reports directory is named where it
@@ -356,6 +361,20 @@ def main(path):
                     for w in ("safe_gate_project_lane_unlock", SCAN_ENTRY, REPORT_WRITER, "safe_gate_project_lane_cleanup") if command_at(b, w)]
     if [w for n, w in finish_calls] != ["safe_gate_project_lane_unlock", SCAN_ENTRY, REPORT_WRITER, "safe_gate_project_lane_cleanup"]:
         problems.append(f"0:{FINISH}:R12: the finishing path does not release the lock, scan, write the report and free the scratch exactly once each, in that order")
+    # nothing in the finishing path ends it before the writer (an early return would skip the document), and the path is started exactly once
+    # by each of its callers
+    seen_writer = False
+    for n, fn, t, b in lane:
+        if fn != FINISH or FN.match(t):
+            continue
+        if command_at(b, REPORT_WRITER):
+            seen_writer = True
+        if not seen_writer and (returns(b) or re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*exit(?![A-Za-z0-9_])", b)):
+            problems.append(f"{n}:{fn}:R12: the finishing path can end before the document is written")
+    for caller in FINISH_CALLERS:
+        starts = [n for n, fn, t, b in lane if fn == caller and not FN.match(t) and command_at(b, FINISH)]
+        if len(starts) != 1:
+            problems.append(f"0:{caller}:R12: the finishing path is started {len(starts)} times, not exactly once")
     for n, fn, t, b in lane:
         if command_at(b, FINISH) and not FN.match(t) and fn not in FINISH_CALLERS:
             problems.append(f"{n}:{fn}:R12: the finishing path is started outside the entry and the signal handler")

@@ -595,9 +595,9 @@ write("the-scan-returns-a-status", src[:sc.end()] + '  [[ -n "${SAFE_GATE_LANE_S
 sh = find(r'    safe_gate_project_lane_scan_report \|\| true\n')
 write("the-scan-status-is-not-swallowed", src[:sh.start()] + '    safe_gate_project_lane_scan_report\n' + src[sh.end():])
 write("the-scan-is-called-outside-the-finishing-path", src[:fz.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[fz.end():])
-fl = find(r'(safe_gate_project_lane_finish\(\) \{\n  local [^\n]*\n  SAFE_GATE_LANE_FINISHING=1\n)  safe_gate_project_lane_unlock\n')
+fl = find(r'(safe_gate_project_lane_finish\(\) \{\n  local [^\n]*\n  SAFE_GATE_LANE_FINISHING=1\n[^\n]*\n[^\n]*\n)  safe_gate_project_lane_unlock\n')
 write("the-scan-before-the-lock-is-released", src[:fl.end(1)] + '  safe_gate_project_lane_scan_report || true\n' + src[fl.end(1):])
-pf = find(r'    SAFE_GATE_LANE_FACT_PUBLISHED=tree\n')
+pf = find(r'SAFE_GATE_LANE_FACT_PUBLISHED=tree; fi\n')
 write("the-published-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_PUBLISHED=tree\n' + src[fz.end():])
 write("the-finishing-path-started-outside-its-callers", src[:fz.end()] + '  safe_gate_project_lane_finish 0 normal\n' + src[fz.end():])
 fs = find(r'  SAFE_GATE_LANE_FINISHING=1\n')
@@ -619,10 +619,16 @@ sg = find(r'(safe_gate_scan_project\(\) \{\n)')
 write("a-second-scan-call-in-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[sg.end():])
 write("a-writer-call-in-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_report_write 0 || true\n' + src[sg.end():])
 write("the-finishing-path-started-from-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_finish 0 normal\n' + src[sg.end():])
+fu = find(r'(safe_gate_project_lane_finish\(\) \{\n  local [^\n]*\n  SAFE_GATE_LANE_FINISHING=1\n)')
+write("the-finishing-path-returns-before-the-document", src[:fu.end(1)] + '  [[ "${rc}" == 0 ]] && return 0\n' + src[fu.end(1):])
+fc = find(r'  safe_gate_project_lane_finish "\$\{rc\}" normal\n')
+write("the-finishing-path-started-twice-by-the-entry", src[:fc.end()] + '  safe_gate_project_lane_finish "${rc}" normal\n' + src[fc.end():])
+write("the-settled-flag-raised-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_SETTLED=1\n' + src[fz.end():])
+write("the-scan-process-set-outside-its-owners", src[:fz.end()] + '  SAFE_GATE_LANE_SCAN_PID=1\n' + src[fz.end():])
 write("a-second-invocation-inside-the-writer", src[:wr.end()] + '  "${core}" "${args[@]}" >/dev/null 2>&1\n' + src[wr.end():])
 write("a-second-writer-function-names-the-core-command", src[:sd.end()] + '  printf "%s" project-report\n' + src[sd.end():])
-fn_ = find(r'  safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n  fi\n  safe_gate_project_lane_cleanup\n')
-write("the-report-is-written-after-the-scratch-is-freed", src[:fn_.start()] + '  fi\n  safe_gate_project_lane_cleanup\n  safe_gate_project_lane_report_write "${public}" "${bound}" || true\n' + src[fn_.end():])
+fn_ = find(r'    safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n  fi\n  SAFE_GATE_LANE_SETTLED=1\n  safe_gate_project_lane_cleanup\n')
+write("the-report-is-written-after-the-scratch-is-freed", src[:fn_.start()] + '  fi\n  SAFE_GATE_LANE_SETTLED=1\n  safe_gate_project_lane_cleanup\n  safe_gate_project_lane_report_write "${public}" "${bound}" || true\n' + src[fn_.end():])
 write("the-finish-signal-written-outside-its-owners", src[:fz.end()] + '  SAFE_GATE_LANE_FINISH_SIGNAL=143\n' + src[fz.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
@@ -643,7 +649,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 73 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 77 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

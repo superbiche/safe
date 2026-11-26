@@ -262,7 +262,7 @@ func TestReportStorePruningLeavesWhatAnotherUserOwns(t *testing.T) {
 	saved := oneShotEUID
 	oneShotEUID = func() int { return saved() + 1 }
 	// seen as another user's, every file is out of the count and out of the pruning
-	if err := pruneReports(held); err != nil {
+	if err := pruneReports(held, ""); err != nil {
 		t.Fatal(err)
 	}
 	oneShotEUID = saved
@@ -270,10 +270,42 @@ func TestReportStorePruningLeavesWhatAnotherUserOwns(t *testing.T) {
 		t.Fatalf("%d reports after: a file another user owns was pruned", after)
 	}
 	// and seen as the user's own, the five oldest go
-	if err := pruneReports(held); err != nil {
+	if err := pruneReports(held, ""); err != nil {
 		t.Fatal(err)
 	}
 	if after := len(projectReports(t, data, "/work/p")); after != ReportsKept {
 		t.Fatalf("%d reports after pruning the user's own files", after)
+	}
+}
+
+// A writer never removes its own file: one that staged early and renamed late, after fifty others finished, keeps its document.
+func TestReportStoreAWriterNeverRemovesItsOwnFile(t *testing.T) {
+	_, data := reportData(t)
+	key, _ := ReportKey("/work/p")
+	dir := filepath.Join(data, "project-lane", "reports", key)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	own := "20260101T000000.000000Z-1-00000000.json" // the oldest name: stamped before the fifty that finished first
+	for i := 0; i <= ReportsKept; i++ {
+		name := fmt.Sprintf("20260101T000000.%06dZ-1-0000%04x.json", i, i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, err := openDirPath(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := pruneReports(held, own); err != nil {
+		t.Fatal(err)
+	}
+	names := projectReports(t, data, "/work/p")
+	if len(names) != ReportsKept || names[0] != own {
+		t.Fatalf("%d kept, first %s: the writer's own document was removed", len(names), names[0])
+	}
+	if names[1] != "20260101T000000.000002Z-1-00000002.json" {
+		t.Fatalf("the oldest other was not the one removed: %s", names[1])
 	}
 }
