@@ -575,6 +575,7 @@ write("a-frozen-command-that-is-not-ci", src[:fc.start()] + '  frozen_args=(inst
 tx = find(r"(safe_gate_project_lane_scripts_lines\(\) \{\n)  jq -rs '\n")
 write("the-report-text-names-the-shell", src[:tx.end(1)] + '  safe_gate_lane_clean x\n' + src[tx.end(1):])
 te = find(r"( +else empty end\)'\n)\}\n")
+write("the-report-text-does-not-slurp", src[:tx.start()] + src[tx.start():tx.end(0)].replace("jq -rs", "jq -r") + src[tx.end(0):])
 write("a-second-jq-in-the-report-text", src[:tx.end(0)] + '    def note: "a second jq";\n' + src[tx.end(0):])
 write("a-command-after-the-report-text", src[:te.end(1)] + '  true\n' + src[te.end(1):])
 write("an-npm-started-outside-the-lane-owners", src[:fz.end()] + '  "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NPM[@]}" --ignore-scripts ci || return 1\n' + src[fz.end():])

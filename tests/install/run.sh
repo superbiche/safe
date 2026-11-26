@@ -8717,9 +8717,10 @@ case_project_lane_scripts_report_lists_a_bundled_member_its_entry_does_not_decla
   printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
   lane_commit
   # the host has no script of its own; the member has a postinstall and its entry does not declare it
-  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_EXTRA='{"node_modules/host/node_modules/member":{"scripts":{"postinstall":"y"}}}' lane_run 'npm ci'
+  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_FILES='node_modules/host/node_modules/member:binding.gyp' NPM_CI_PKG_EXTRA='{"node_modules/host/node_modules/member":{"scripts":{"postinstall":"y"}}}' lane_run 'npm ci'
   assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment "1 introduced package(s) have install-time scripts or a binding.gyp on disk: member@1.0.0 (postinstall; bundled in host@1.0.0; not declared by its lockfile entry)" "$FUNCNAME" || return
+  # (the attributes: events; binding.gyp; the host; the lockfile fact, in that order)
+  assert_err_contains_fragment "1 introduced package(s) have install-time scripts or a binding.gyp on disk: member@1.0.0 (postinstall; binding.gyp; bundled in host@1.0.0; not declared by its lockfile entry)" "$FUNCNAME" || return
   assert_err_contains_fragment "to run them: npm rebuild ./node_modules/host; npm decides what it runs" "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
