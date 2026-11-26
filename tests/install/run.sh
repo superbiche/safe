@@ -17412,7 +17412,7 @@ main() {
     case_project_lane_scripts_report_names_what_a_named_install_introduced \
     case_project_lane_scripts_report_names_the_projects_own_scripts_for_a_bare_install_and_ci \
     case_project_lane_scripts_report_ci_names_every_package_and_a_bundled_member_through_its_host \
-    case_project_lane_scripts_report_names_apart_what_the_lockfile_entry_does_not_declare \
+    case_project_lane_scripts_report_lists_what_is_on_disk_whatever_the_lockfile_and_gypfile_say \
     case_project_lane_scripts_report_is_read_against_the_previous_tree \
     case_project_lane_scripts_report_says_nothing_when_nothing_has_scripts \
     case_project_lane_scripts_report_is_bounded \
