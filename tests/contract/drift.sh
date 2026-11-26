@@ -489,11 +489,12 @@ case_lane_structure_lint_is_clean() {
 case_lane_structure_lint_rejects_the_known_mutations() {
   local dir="${TEST_ROOT}/lane-lint" bad="" name
   mkdir -p "${dir}"
-  python3 -I - "${ROOT}/lib/gate-lib.sh" "${dir}" <<'PY'
+  python3 -I - "${ROOT}/lib/gate-lib.sh" "${dir}" <<'PY' || { fail "$FUNCNAME (the fixtures could not be written)"; return; }
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 out = sys.argv[2]
 def write(name, text):
+    assert text != src, name
     open(f"{out}/{name}.sh", "w", encoding="utf-8").write(text)
 def find(pattern):
     m = re.search(pattern, src)
@@ -558,6 +559,34 @@ write("a-question-asked-outside-its-owner", src[:c9.end()] + '  safe_gate_projec
 write("two-prefix-questions-on-one-line", src[:a.start()] + '  safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1; safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1\n' + src[a.end():])
 write("pin-lookup-called-outside-the-bounded-route", src[:c9.end()] + '  safe_gate_project_lane_pin_lookup x || return 1\n' + src[c9.end():])
 write("pin-bounded-called-outside-the-route", src[:c9.end()] + '  safe_gate_project_lane_pin_bounded x || return 1\n' + src[c9.end():])
+# R11 (ticket 1638): the lane runs no lifecycle script
+fz = find(r'(safe_gate_project_lane_cleanup\(\) \{\n)')
+# each fixture breaks ONE rule: a script word inside an owner of npm that carries the flag; npm started outside the owners with the flag
+# and no script word; the flag missing inside an owner; the binder given another command
+fo = find(r'(safe_gate_project_lane_frozen_check\(\) \{\n)')
+# (the report function is where a helpful rebuild would be written: it is held like every other function of the lane, and the words
+# that run scripts live in its text function only)
+sr = find(r'(  local -a args=\(project-scripts --lock "\$\{lockfile\}" --limit 25\)\n)')
+write("a-rebuild-in-the-lane", src[:sr.end()] + '  node-gyp rebuild >/dev/null 2>&1\n' + src[sr.end():])
+write("a-bare-npm-in-the-lane", src[:sr.end()] + '  npm ci --ignore-scripts >/dev/null 2>&1\n' + src[sr.end():])
+write("an-npm-run-started-by-an-owner", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" run prepare --ignore-scripts || return 1\n' + src[fo.end():])
+fc = find(r'  frozen_args=\(ci --ignore-scripts ')
+write("a-frozen-command-that-is-not-ci", src[:fc.start()] + '  frozen_args=(install --ignore-scripts ' + src[fc.end():])
+tx = find(r"(safe_gate_project_lane_scripts_lines\(\) \{\n)  jq -rs '\n")
+write("the-report-text-names-the-shell", src[:tx.end(1)] + '  safe_gate_lane_clean x\n' + src[tx.end(1):])
+te = find(r"( +else empty end\)'\n)\}\n")
+write("the-report-text-does-not-slurp", src[:tx.start()] + src[tx.start():tx.end(0)].replace("jq -rs", "jq -r") + src[tx.end(0):])
+write("a-second-jq-in-the-report-text", src[:tx.end(0)] + '    def note: "a second jq";\n' + src[tx.end(0):])
+write("a-command-after-the-report-text", src[:te.end(1)] + '  true\n' + src[te.end(1):])
+write("an-npm-started-outside-the-lane-owners", src[:fz.end()] + '  "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NPM[@]}" --ignore-scripts ci || return 1\n' + src[fz.end():])
+write("an-npm-without-the-flag-in-an-owner", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" ci || return 1\n' + src[fo.end():])
+write("scripts-enabled-by-an-option", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" ci --ignore-scripts --dangerously-allow-all-scripts || return 1\n' + src[fo.end():])
+fr = find(r'  frozen_args=\(ci --ignore-scripts ')
+write("frozen-install-without-ignore-scripts", src[:fr.start()] + '  frozen_args=(ci ' + src[fr.end():])
+pj = find(r'    safe_gate_lane_npm_in "\$\{proj\}" --package-lock-only --ignore-scripts ')
+write("projection-without-ignore-scripts", src[:pj.start()] + '    safe_gate_lane_npm_in "${proj}" --package-lock-only ' + src[pj.end():])
+bd = find(r'-- "\$\{SAFE_GATE_LANE_NPM\[@\]\}" "\$\{frozen_args\[@\]\}"\)')
+write("binder-given-something-else", src[:bd.start()] + '-- "${SAFE_GATE_LANE_NPM[@]}" "${proj_args[@]}")' + src[bd.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
 def under_timeout(name, plain):
@@ -567,23 +596,17 @@ under_timeout("the-question-under-timeout", '    "${launch[@]}" "--cache=${scrat
 under_timeout("the-data-question-under-timeout", '  "${core}" one-shot-store check </dev/null')
 under_timeout("the-verification-under-timeout", '  "${core}" one-shot-store verify "${prefix_answer}"')
 PY
-  for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
-      question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
-      mark-raised-outside-its-owner mark-from-a-variable mark-by-arithmetic start-up-flag-cleared start-up-flag-unset \
-      phase-declared-local question-through-the-outcome-handler reserved-status-as-a-literal phase-set-back-to-routing \
-      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop \
-      pin-question-asked-outside-the-route pin-data-question-asked-outside-the-route pin-route-called-outside-the-runner \
-      the-store-named-outside-the-two-questions pin-route-read-twice pin-route-never-read \
-      pin-route-moved-below-the-spelled-global-guards a-refusal-before-the-pin-lookup prefix-question-asked-twice-in-its-owner \
-      root-question-never-asked a-question-asked-outside-its-owner \
-      two-prefix-questions-on-one-line an-unsupported-refusal-before-the-pin-lookup \
-      pin-lookup-called-outside-the-bounded-route pin-bounded-called-outside-the-route \
-      the-question-under-timeout the-data-question-under-timeout the-verification-under-timeout; do
-    [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
-    if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
-      bad="${bad} ${name}"
+  # every fixture the program above wrote is checked: a fixture cannot be written and left out of a list
+  local file count=0
+  for file in "${dir}"/*.sh; do
+    [[ -f "${file}" ]] || continue
+    count=$((count + 1))
+    name="${file##*/}"
+    if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${file}" >/dev/null; then
+      bad="${bad} ${name%.sh}"
     fi
   done
+  (( count >= 50 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): the lane runs no lifecycle script and says which ones it did not run (ticket 1638). A
+  separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs, so none runs. After a
+  verified publication one section says, from the judged lockfile and the published tree only (`safe-core project-scripts`, new), what
+  is on disk and nothing about what npm would do with it: the packages the command put into the tree whose own files hold a
+  `preinstall`, `install` or `postinstall` script or a `binding.gyp` file (a bundled member with its outermost host, introduced when
+  that host is; "not declared by its lockfile entry" as a fact next to the package), the packages it could not read apart, one
+  `npm rebuild` with the path of every listed package, and the one clause every measure agrees on (npm decides what it runs and can
+  skip a script a lockfile entry does not declare); for a bare `install` and `ci` the project's own install-time scripts as one `npm
+  run <event> --ignore-scripts` per defined event (measured to run the named event alone) and the project's own `binding.gyp` as a
+  fact. The lines are held to a grammar token by token, anchored on the whole string, fail as a whole when one token is outside it, the
+  document must be exactly one of this schema version, and they are printed as they are (the diagnostic cleaner turned `basic`, `token`,
+  `bearer` followed by a path into `***`); an unreadable or oversized previous record, a reader that fails or prints nothing is said,
+  with what failed. A dry run says what the lockfile declares, not what the command would introduce. A command that introduces
+  nothing with scripts says nothing; at most 25 packages per list are listed. Live suites: `tests/live/project_lane_no_scripts.sh` (a
+  local registry of marker fixtures, the lane's projection and binder, npm 11.20.0 and 12.2.1, every npm status checked, with the
+  measures the report rests on) and scenario K of `tests/live/project_lane_binding.sh` (husky@4.3.8 through the real gate: the report,
+  and no git hook written; no test runs a registry package's lifecycle scripts). The lane lint (R11) refuses an npm of the lane without
+  `--ignore-scripts`, a bare `npm`, and script words outside the report's text function, which is held to being one jq program with one
+  jq. The tree reader opens a manifest without blocking on a FIFO.
 - Project lane, standing decision: the route's one deadline reaches a question in flight. No step of the route runs
   under `timeout`, which puts its command in a process group of its own: an npm started late would have outlived the
   deadline that stops the route's group, and written in a scratch directory already removed.

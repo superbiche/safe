@@ -3546,7 +3546,7 @@ safe_gate_npm_lockdiff_preflight() {
 #      anything but "clear" refuses (104/100/102)
 #   6. project-bind: staging, frozen install, strict verification, publication;
 #      its outcome decides the exit; what it reports reaches the operator
-# No prompt, install record or script in this pass (tickets 1637, 1638).
+# No script runs in this lane (ticket 1638): after step 6 it says which install-time scripts the command left unrun.
 
 # One configuration key under install: the switch is on only when the file is
 # exactly one JSON document that sets install.project_lane to the boolean true.
@@ -5567,7 +5567,7 @@ safe_gate_err_lines_clean() {
 
 # The report lines, on stderr, after the decision. Fails when it cannot render.
 safe_gate_project_lane_report() {
-  local verb="$1" report="$2" evidence="$3" lockfile="$4" lines="" scripts=""
+  local verb="$1" report="$2" evidence="$3" lockfile="$4" lines=""
   lines="$(jq -r --arg verb "${verb}" '
     def rank: {"critical": 4, "high": 3, "moderate": 2, "low": 1};
     def highest: (map(rank[.] // 0) | max) as $r
@@ -5603,14 +5603,136 @@ safe_gate_project_lane_report() {
       + (if .socket.cache_gap != "" then "; the cache could not be read" else "" end)
   ' "${report}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   safe_gate_err_lines_clean "${lines}"
-  scripts="$(jq -r '
-    [ .packages | to_entries[]
-      | select(.key | test("node_modules/")) | select(.value.hasInstallScript == true)
-      | ((.value.name // (.key | sub("^.*node_modules/"; ""))) + "@" + .value.version) ]
-    | unique | join(", ")' "${lockfile}" 2>/dev/null)" || return 1
-  if [[ -n "${scripts}" ]]; then
-    safe_gate_err "safe: project lane: install scripts are declared by $(safe_gate_lane_clean "${scripts}"); scripts do not run on this lane yet (the tree is installed with scripts off)"
+  return 0
+}
+
+# The previous tree's own record (npm's hidden lockfile), kept in the scratch before the binder replaces the tree: what the command
+# introduced into the tree is read against it. Prints the file's path; "unreadable" when there is a record that cannot be kept (a link,
+# a size past the bound, a read that does not end in time); nothing when there is none, or for `ci`, which builds a whole new tree (no
+# record means every package is introduced: the one mechanism). The copy is bounded in time and in size.
+safe_gate_project_lane_previous_tree() {
+  local hidden="${project_dir}/node_modules/.package-lock.json" kept="${scratch}/previous-tree-lock.json"
+  [[ "${verb}" != ci ]] || return 0
+  [[ -e "${hidden}" || -L "${hidden}" ]] || return 0
+  if [[ -f "${hidden}" && ! -L "${hidden}" && ! -L "${project_dir}/node_modules" ]] && command -v timeout >/dev/null 2>&1 \
+      && timeout --kill-after=1s 10s head -c 67108865 -- "${hidden}" >"${kept}" 2>/dev/null; then
+    printf '%s' "${kept}"
+  else
+    printf 'unreadable'
   fi
+}
+
+# The scripts section's lines, from the core's document on stdin. This function is one jq program and starts nothing else (it holds
+# exactly one jq): it is the only place of the lane where the words that run scripts (npm rebuild, npm run) are written, as text for
+# the operator (lane lint, R11). It says what is on disk and nothing about what npm would do with it, except the one clause every
+# measure agrees on. It takes exactly one document (none, or two, fails the render) and holds every token it prints to its grammar,
+# anchored on the whole string (a final newline would split a printed command): a package name, a version, an install path of
+# node_modules/<name> steps, an event of a closed list, a host as name@version; every flag is a boolean. One token outside its grammar
+# fails the whole render, and nothing of the document is printed. The lines are the operator's to paste into a shell, so they are
+# printed as they are (no cleaner): they hold validated tokens and the program's own words only.
+safe_gate_project_lane_scripts_lines() {
+  jq -rs '
+    def bad($why): error("scripts-report: " + $why);
+    def nmch: "[A-Za-z0-9~][A-Za-z0-9._~-]*";
+    def nm: "(@" + nmch + "/)?" + nmch;
+    def ver: "([0-9A-Za-z][0-9A-Za-z.+_-]{0,63}|\\?)";
+    def okpath: type == "string" and test("\\Anode_modules/" + nm + "(/node_modules/" + nm + ")*\\z");
+    def pkgev: ["preinstall", "install", "postinstall"];
+    def rootev: ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"];
+    def checkpkg:
+      if (type == "object"
+          and (.path | okpath) and (.rebuild_path | okpath)
+          and (.name | type == "string" and test("\\A" + nm + "\\z"))
+          and (.version | type == "string" and test("\\A" + ver + "\\z"))
+          and ((.host // "") | type == "string" and (. == "" or test("\\A" + nm + "@" + ver + "\\z")))
+          and (.gyp | type == "boolean") and (.declared | type == "boolean")
+          and (.events | type == "array" and all(.[]; type == "string" and (. as $e | pkgev | index($e) != null))))
+      then . else bad("a token outside its grammar") end;
+    def checkgroup($total): if (type == "array") and ($total | type == "number") and ($total >= length) then map(checkpkg) else bad("the document is not the report") end;
+    def checkroot:
+      if (type == "object") and (.gyp | type == "boolean")
+         and (.events | type == "array" and all(.[]; type == "string" and (. as $e | rootev | index($e) != null)))
+      then . else bad("a token outside its grammar") end;
+    (if length == 1 then .[0] else bad("no document or more than one document") end)
+    | if (type != "object") or .schema_version != 3 or ((.source // "") | IN("tree", "lockfile") | not) or ((.previous // "") | IN("read", "none", "unreadable") | not)
+      then bad("the document is not the report of this version") else . end
+    | . as $d | .packages = ($d.packages | checkgroup($d.total)) | .unread = ($d.unread | checkgroup($d.unread_total))
+    | (if .root != null then (.root |= checkroot) else . end)
+    | def lbl: .name + "@" + .version;
+      def host: if (.host // "") != "" then "bundled in " + .host else empty end;
+      def attrs: [(if (.events | length) > 0 then (.events | join(", ")) else empty end), (if .gyp then "binding.gyp" else empty end), host,
+                  (if .declared | not then "not declared by its lockfile entry" else empty end)] | join("; ");
+      def more($t; $n): if $t > $n then ", and " + (($t - $n) | tostring) + " more not listed" else "" end;
+      def items: .packages | map(lbl + (attrs | if . == "" then "" else " (" + . + ")" end)) | join(", ");
+      def paths: .packages | map(.rebuild_path) | unique | map("./" + .) | join(" ");
+      def truncated: .total > (.packages | length);
+      def runs: .root.events | map("npm run " + . + " --ignore-scripts") | join("; ");
+      def found: (.total + .unread_total) > 0;
+      (if .total > 0 and .source == "tree" then
+         "safe: project lane: install scripts did not run (the lane installs with scripts off): " + (.total | tostring) + " introduced package(s) have install-time scripts or a binding.gyp on disk: " + items + more(.total; (.packages | length))
+       elif .total > 0 then
+         "safe: project lane: scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for " + (.total | tostring) + " package(s)"
+         + (if .previous == "read" then " that are new or changed against the installed tree'"'"'s record" else "" end) + ": " + items + more(.total; (.packages | length))
+       else empty end),
+      (if .unread_total > 0 then
+         "safe: project lane: scripts: " + (.unread_total | tostring) + " introduced package(s) could not be read, so nothing is said about their scripts and no command is given for them: " + (.unread | map(lbl) | join(", ")) + more(.unread_total; (.unread | length))
+       else empty end),
+      (if .source == "tree" and .total > 0 then
+         "safe: project lane: scripts: to run them: npm rebuild " + paths + (if truncated then " (the listed packages; npm rebuild with no argument rebuilds every package of the tree, those already present included)" else "" end)
+         + "; npm decides what it runs: its own script policy applies, and it can skip a script that a lockfile entry does not declare"
+       else empty end),
+      (if .previous == "unreadable" and found then
+         "safe: project lane: scripts: the previous tree'"'"'s record could not be read, so every package of the tree is counted as introduced"
+       else empty end),
+      (if .root != null and (.root.events | length) > 0 then
+         "safe: project lane: this project'"'"'s own install-time scripts did not run either (" + (.root.events | join(", ")) + "); to run them: " + runs
+         + "; an explicitly named script runs whatever npm'"'"'s script policy says and its pre- and post- scripts do not (measured on npm 11.20.0 and 12.2.1, also with ignore-scripts=true in the user configuration)"
+       else empty end),
+      (if .root != null and .root.gyp then
+         "safe: project lane: this project has a binding.gyp file, which the lane did not build"
+       else empty end)'
+}
+
+# The scripts section (ticket 1638). The lane runs no lifecycle script; after a verified publication it says which install-time
+# scripts the command left unrun, from data only: the judged lockfile and the published tree (safe-core project-scripts), never npm's
+# messages and never a question to npm, and it does not say what npm's policy would decide. $1 the verb, $2 tree or lockfile (the
+# source: no tree was published for --dry-run and --package-lock-only), $3 the lockfile, $4 the previous tree's record, "unreadable" or
+# "", $5 1 when the project's own scripts are asked for (a bare install and ci: the commands for which npm runs them). Reads the run's
+# locals (safe_core, project_dir, proj, scratch). Nothing is printed for a command that introduced nothing with scripts. A report that
+# cannot be read says so and says what failed (the reader's status, no document, a document of another version, a token outside its
+# grammar): it is never an empty section.
+safe_gate_project_lane_scripts_report() {
+  local verb="$1" source="$2" lockfile="$3" previous="$4" want_root="$5" doc="" rc=0 lines="" why="" line=""
+  local -a args=(project-scripts --lock "${lockfile}" --limit 25)
+  [[ "${source}" != tree ]] || args+=(--tree "${project_dir}/node_modules")
+  case "${previous}" in
+    "") ;;
+    unreadable) args+=(--previous-unreadable) ;;
+    *) args+=(--previous "${previous}") ;;
+  esac
+  (( ! want_root )) || args+=(--manifest "${proj}/package.json" --project "${project_dir}")
+  if command -v timeout >/dev/null 2>&1; then
+    doc="$(timeout --kill-after=2s 60s "${safe_core}" "${args[@]}" </dev/null 2>/dev/null)" || rc=$?
+  else
+    rc=127
+  fi
+  if (( rc == 127 )); then
+    why="no timeout utility to bound the reader"
+  elif (( rc != 0 )); then
+    why="the reader exited ${rc}"
+  elif [[ -z "${doc//[[:space:]]/}" ]]; then
+    why="the reader printed no document"
+  elif ! lines="$(safe_gate_project_lane_scripts_lines <<<"${doc}" 2>"${scratch}/scripts-lines.err")"; then
+    why="$(sed -n 's/^jq: error.*scripts-report: \([a-z ]*\).*$/\1/p' "${scratch}/scripts-lines.err" 2>/dev/null | head -n 1)"
+    [[ -n "${why}" ]] || why="the document could not be formatted"
+  fi
+  if [[ -n "${why}" ]]; then
+    safe_gate_err "safe: project lane: install scripts did not run (the lane installs with scripts off); the report of which packages have them could not be read: ${why}"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] || safe_gate_err "${line}"
+  done <<<"${lines}"
   return 0
 }
 
@@ -6980,6 +7102,7 @@ safe_gate_project_lane_run() {
   fi
   if (( dry_run )); then
     safe_gate_err "safe: project lane: --dry-run: nothing was written to the project"
+    safe_gate_project_lane_scripts_report "${verb}" lockfile "${proj}/package-lock.json" "$(safe_gate_project_lane_previous_tree)" 0
     return 0
   fi
 
@@ -7015,6 +7138,8 @@ safe_gate_project_lane_run() {
   else
     live_args+=(--live ".npmrc=absent")
   fi
+  local previous_tree=""
+  (( lock_only )) || previous_tree="$(safe_gate_project_lane_previous_tree)"
   local -a bind_cmd=("${safe_core}" project-bind --project "${project_dir}" --lock-fd "${SAFE_GATE_LANE_LOCKFD}" --state-dir "${state_dir}"
     --publish "package.json=${proj}/package.json" --publish "package-lock.json=${proj}/package-lock.json")
   if (( lock_only )); then
@@ -7085,6 +7210,12 @@ safe_gate_project_lane_run() {
   fi
   if (( rc == 0 && lock_only )); then
     safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
+    safe_gate_project_lane_scripts_report "${verb}" lockfile "${proj}/package-lock.json" "$(safe_gate_project_lane_previous_tree)" 0
+  elif (( rc == 0 )); then
+    # a bare install and ci are the commands for which npm runs the project's own scripts (an install that names packages does not)
+    local want_root=0
+    if [[ "${verb}" == ci ]] || { [[ "${verb}" == install ]] && (( ${#specs[@]} == 0 )); }; then want_root=1; fi
+    safe_gate_project_lane_scripts_report "${verb}" tree "${proj}/package-lock.json" "${previous_tree}" "${want_root}"
   fi
   SAFE_GATE_LANE_DEFER=0
   return "${rc}"

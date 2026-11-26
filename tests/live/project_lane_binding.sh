@@ -734,6 +734,42 @@ else
   fail "the exit-99 launcher control: gate exit ${status}, launcher ran: $([[ -f "${WORK}/launcher99.ran" ]] && echo yes || echo no), assertions said: ${problems:-nothing}"
 fi
 
+# --- scenario K: the scripts report on a real tree, through the real gate (ticket 1638) -----------------------------------------
+# husky@4.3.8 (published 2021-01-15, far older than the cooldown window, so its graph is judged as of T1 like the others): a registry
+# package that declares an `install` script (`node husky install`, which writes git hooks into the project's repository) and a
+# `postinstall`. The lane runs neither; the section names the package, the script events and the command that runs them, and the
+# project's repository holds no husky hook.
+# There is NO control that runs the package's scripts, and there must never be one: this suite does not execute a registry package's
+# lifecycle scripts (that would be an unaudited install running a stranger's code, outside the gate and against the operator's script
+# policy). That scripts DO run when they are on, and that the absence of their effect can therefore fail, is held with safe's own
+# loopback fixtures in tests/live/project_lane_no_scripts.sh; here the absence of hooks is asserted on what the package declares.
+new_project "${WORK}/k" || { fail "scenario K project"; exit 1; }
+# the project defines install-time scripts of its own (the lane never runs them; for an install that names a package it does not name them)
+( cd "${WORK}/k" && jq -c '.scripts = {preinstall: "echo own-preinstall", postinstall: "echo own-postinstall"}' package.json > package.json.new && mv package.json.new package.json \
+    && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m scripts ) || { fail "scenario K: the project's own scripts are written"; exit 1; }
+hooks_written() { # <repository>: the number of git hooks husky wrote
+  local hook count=0
+  for hook in "$1"/.git/hooks/*; do [[ -f "${hook}" ]] && grep -q husky "${hook}" 2>/dev/null && count=$((count + 1)); done
+  printf '%s' "${count}"
+}
+gate_in "${WORK}/k" "${WORK}/k" install husky@4.3.8
+status=$?
+sed 's/^/# K gate: /' "${WORK}/k.err" | tail -n 5
+if (( status == 0 )) && [[ -d "${WORK}/k/node_modules/husky" ]] \
+    && grep -q 'install scripts did not run (the lane installs with scripts off): 1 introduced package(s) have install-time scripts or a binding.gyp on disk: husky@4.3.8 (install, postinstall)' "${WORK}/k.err" \
+    && grep -q "scripts: to run them: npm rebuild ./node_modules/husky; npm decides what it runs: its own script policy applies, and it can skip a script that a lockfile entry does not declare" "${WORK}/k.err" \
+    && ! grep -q "this project's own install-time scripts" "${WORK}/k.err"; then
+  pass "K1: a lane install of husky@4.3.8 through the real gate names the package, its events and the command that runs them (and not the project's own scripts, which the project defines: the install names a package)"
+else
+  fail "K1: exit ${status}; $(tail -n 4 "${WORK}/k.err")"
+fi
+if (( status == 0 )) && jq -e '.scripts.install == "node husky install"' "${WORK}/k/node_modules/husky/package.json" >/dev/null 2>&1 \
+    && [[ -d "${WORK}/k/.git/hooks" || -d "${WORK}/k/.git" ]] && [[ "$(hooks_written "${WORK}/k")" == 0 ]]; then
+  pass "K2: the installed husky declares the install script that writes git hooks, and the project's repository holds none (no control runs a registry package's scripts; the loopback suite holds that scripts run when they are on)"
+else
+  fail "K2: husky hooks in the repository: $(hooks_written "${WORK}/k"); or the installed package no longer declares the script this scenario reads"
+fi
+
 # --- scenario J: the cooldown, on the real npm (ticket 1635) ---------------------------------------
 # The window is WINDOW days (the cutoff is T1). npm's release-age filter is on every command line of the lane, so a bare
 # install resolves nothing younger than the window and the report lists nothing young; a version the caller names exactly
