@@ -5,18 +5,54 @@ import (
 	"testing"
 )
 
-func TestScanSummaryReadsTheVerdictAndKeepsNoFreeText(t *testing.T) {
+func TestScanSummaryReadsTheVerdictAndTheProducersStatusAndKeepsNoFreeText(t *testing.T) {
 	doc := `{"audit_totals":{"critical":8,"high":46,"by_ecosystem":{"npm":{"critical":5},"python":{"critical":2},"mystery":{"critical":1},"go":{"critical":0}}},
-	 "tool_status":{"grype":{"status":"ok"},"syft":{"status":"error","note":"leaked token abc"},"osv-scanner":{"status":"degraded","note":"it FAILED"},"x y":{"status":"error"}},
+	 "tool_status":{"grype":{"status":"ok"},"syft":{"status":"skipped","note":"leaked token abc"},"osv-scanner":{"status":"partial","note":"it could not read"},"x y":{"status":"error"},"odd":{"status":"degraded"},"quiet":{}},
 	 "ecosystem_audits":[{"scanner":"npm-audit","status":"error"},{"scanner":"pip-audit","status":"ok"},{"scanner":"Bad Name!","status":"error"},{"status":"error"}]}`
 	got, err := ReadScanSummary([]byte(doc))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := ScanSummary{SchemaVersion: 1, CriticalTotal: 8, Critical: map[string]int{"npm": 5, "python": 2}, Unattributed: 1,
-		CoverageFailures: []string{"npm-audit", "osv-scanner", "syft", "unknown"}, CoverageOther: 2}
+		CoverageGaps: []ScanGap{{"npm-audit", "error"}, {"osv-scanner", "partial"}, {"syft", "skipped"}}, CoverageOther: 4}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("%+v\nwant %+v", got, want)
+	}
+}
+
+// The producer's own rule (bin/safe-audit): a scanner whose status is not "ok" is a gap, whatever its note says; a note is never read.
+func TestScanSummaryNeverReadsANoteAndTakesEveryNonOkStatusAsAGap(t *testing.T) {
+	for _, status := range []string{"partial", "skipped", "unavailable", "error"} {
+		got, err := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":{"syft":{"status":"` + status + `","note":"all fine, nothing to see"}}}`))
+		if err != nil || len(got.CoverageGaps) != 1 || got.CoverageGaps[0].Status != status || got.CoverageUnreadable {
+			t.Fatalf("%s: %+v %v", status, got, err)
+		}
+	}
+	got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":{"syft":{"status":"ok","note":"it failed with an error"}}}`))
+	if len(got.CoverageGaps) != 0 || got.CoverageOther != 0 || got.CoverageUnreadable {
+		t.Fatalf("a note was read: %+v", got)
+	}
+}
+
+// A coverage section that is there and cannot be read is not zero gaps.
+func TestScanSummaryCoverageThatCannotBeReadIsUnreadableNotZero(t *testing.T) {
+	for name, doc := range map[string]string{
+		"a list for the tools":      `{"audit_totals":{"critical":0},"tool_status":[1]}`,
+		"a string":                  `{"audit_totals":{"critical":0},"tool_status":"ok"}`,
+		"null":                      `{"audit_totals":{"critical":0},"tool_status":null}`,
+		"a tool that is a string":   `{"audit_totals":{"critical":0},"tool_status":{"syft":"error"}}`,
+		"a status that is a number": `{"audit_totals":{"critical":0},"tool_status":{"syft":{"status":3}}}`,
+		"audits that are an object": `{"audit_totals":{"critical":0},"ecosystem_audits":{"a":1}}`,
+		"an audit that is a number": `{"audit_totals":{"critical":0},"ecosystem_audits":[1]}`,
+	} {
+		got, err := ReadScanSummary([]byte(doc))
+		if err != nil || !got.CoverageUnreadable {
+			t.Errorf("%s: %+v %v", name, got, err)
+		}
+	}
+	got, _ := ReadScanSummary([]byte(`{"audit_totals":{"critical":0}}`))
+	if got.CoverageUnreadable {
+		t.Errorf("an absent coverage section is the producer's empty one: %+v", got)
 	}
 }
 
@@ -57,7 +93,7 @@ func TestScanSummaryBoundsTheFailureNames(t *testing.T) {
 	}
 	status += `}`
 	got, err := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"tool_status":` + status + `}`))
-	if err != nil || len(got.CoverageFailures) != maxScanFailures || got.CoverageOther != 10 {
-		t.Fatalf("%d %d %v", len(got.CoverageFailures), got.CoverageOther, err)
+	if err != nil || len(got.CoverageGaps) != maxScanFailures || got.CoverageOther != 10 {
+		t.Fatalf("%d %d %v", len(got.CoverageGaps), got.CoverageOther, err)
 	}
 }

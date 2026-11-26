@@ -2,26 +2,32 @@
 
 ## Unreleased
 
-- Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2). One document per command, written once at the end,
-  for every end the lane controls at or after the decision (a pass, a refusal, a declined prompt, a failed installation, a dry run), by
-  `safe-core project-report write` (new; `check` is for the tests): schema 1, built from typed readings of the run's pieces, every string
-  from a closed list or a grammar (what is outside is counted, never kept), no location, no free text, `ci` as counts and the lockfile's
-  digest. `<data>/project-lane/reports/<key>/<time>-<pid>-<random>.json`, `key` the digest of the project's physical path and no member;
-  directories 0700 opened without following a link, the file 0600 synced and renamed in place; the last 50 per project kept, oldest first,
-  own files only, never through a link; past 1 MiB the document is not written and one line says so; a failure is one line and changes no
-  status. The old copy of the decision report into `reports/` is gone (the decision report stays in the scratch, where the gate decides
-  from it). A killed command leaves none. Lane lint R13: one writer, one caller (`|| true`, after the scan), and no reader of the reports
-  directory in the gate.
+- Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2; round two of the review). One document per
+  command, written once by ONE path every end goes through (unlock, scan, document, scratch; a handled signal included, with the write
+  bounded to two seconds and no scan), for every end at or after the decision, by `safe-core project-report write` (new; `check` is for
+  the tests). Schema 1: typed values only, every string from a closed list or a grammar (what is outside is counted, never kept), no
+  location, no free text. It names what was judged: the digests of the judged target and of the baseline (taken while the lane held
+  them), the differential's identities (counts only for `ci`), each decision class, the cooldown's waits and waivers with their dates,
+  the Socket outcome of each named root (a block is a block), the missing evidence per cause, the scripts of ONE reading, the answers
+  by class. Its status is the command's public status; an end that reads as a pass exists only with status 0 (a dry run that ends in a
+  refusal is `refused`). The gate no longer makes or names the reports directory: an unusable one gates nothing (a clean install still
+  exits 0 with one line, a refusal keeps its status and last line); the writer establishes its directories (0700, no link under the data
+  root) and writes `<data>/project-lane/reports/<key>/<time to the microsecond>-<pid>-<random>.json`, 0600, synced and renamed; names sort
+  in the order of the writes, the last 50 per project are kept (own files only, never through a link); past 8 MiB the document is not
+  written and one line says so; every failure to write (a missing writer, an unreadable decision piece included) is one line and
+  changes no status. Lane lint R12/R13 now hold the whole file: the reports directory is named nowhere in the gate, the writer is started
+  once, the scan and the writer are called only from the finishing path.
 - Project lane (behind `install.project_lane`): the whole-project scan becomes a report (ticket 1639, rule 5 of the differential
   ruling). After a verified publication (lockfile-only included), once the project's lock is released, the lane runs the scan of the
   project under one deadline that reaches its children and prints at most three lines: the ecosystems with a critical finding (npm
-  included, with the count) and the findings it could not attribute to an ecosystem of its known set, the scanners whose coverage
-  failed, or one fixed reason when it did not complete. Nothing it wrote is printed, a scanner an environment variable names is never
-  run, and **the scan never changes the command's exit status**. It is not run after a refusal, a dry run or a hand-over to today's
-  gate. `safe-core project-scan-summary` (new) reads the scan's result document. `ci` no longer says "N packages added" (it has no
-  differential): it says how many entries of the lockfile it installs as they stand; a publish time that cannot be read is one line.
-  The lane lint (R12) holds the scan to returning 0, to one call from the entry as `|| true` after the unlock and before the scratch is
-  freed, and gives the facts it rests on their owners.
+  included, with the count) and the findings it could not attribute to an ecosystem of its known set; the scanners that gave less than
+  their whole coverage by the producer's own rule (a status that is not `ok`: `partial`, `skipped`, `unavailable`, `error`; no note is
+  read; coverage that cannot be read is said as unreadable, never as zero gaps); a line when the lockfile the scan read is not the one
+  this command published; or one fixed reason when it did not complete. Nothing it wrote is printed, a scanner an environment variable
+  names is never run, and **the scan never changes the command's exit status**. It is not run after a refusal, a dry run, a signal or a
+  hand-over to today's gate. `safe-core project-scan-summary` (new) reads the scan's result document under a bound. `ci` no longer says
+  "N packages added" (it has no differential): it says the lockfile holds N entries and ci installs the ones npm selects; the
+  publish-times line is printed when a reading failed, not when it was skipped because the command was already stopped.
 - Project lane (behind `install.project_lane`): the lane runs no lifecycle script and says which ones it did not run (ticket 1638). A
   separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs, so none runs. After a
   verified publication one section says, from the judged lockfile and the published tree only (`safe-core project-scripts`, new), what

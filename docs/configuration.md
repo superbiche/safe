@@ -630,42 +630,61 @@ pass and warnings under `environment.release_follow`.
   files-only mode: the same checks on the live inputs, the same atomic exchange of
   each file, no staged tree, no tree exchange, no install command) and installs
   nothing. Spec: Safe Lanes slice 1.
-  **The report document** (ticket 1639): one document per command, written once, at the very end (after the scan, before the scratch is
-  removed), for every end the lane controls at or after the decision: a pass (a lockfile-only one included), a refusal, a declined
-  prompt, an answer that could not be read, a failed installation, a dry run, an interruption it could end. A command killed outright
-  (SIGKILL, a power cut) leaves none, and so does a command that ended before its decision (a refusal by a guard, a hand-over to today's
-  gate). `safe-core project-report write` is its one writer: it builds the document from the pieces the run left (the decision report, the
-  binder's result, the answers, the scripts, the scan's summary) and from nothing else, and writes it as
-  `<data>/project-lane/reports/<key>/<UTC time>-<pid>-<random>.json`, where `<key>` is the digest of the project's physical path (the key
-  is the directory's name and is no member of any document). The directories are the user's, closed to others (0700), opened one name at a
-  time without following a link; the file is created 0600, synced and renamed into place without replacing anything, so two commands
-  that end in one second keep both documents. The last 50 of a project are kept: the oldest are removed when one is written, only regular
-  files of the report's own name, by name below the held project directory, never through a link, never outside the project's directory;
-  a pruning that fails is one line. A document is never cut short: past 1 MiB (measured: a document of 1000 advisories is 164 KB) it is
-  not written and one line says so. Any failure to write is one line before the lane's own last line, and never changes the status. The
-  gate itself never reads, lists or removes a report (a lane lint rule): they are for the operator, and for the asynchronous follow-up that
-  is not built here.
+  **The report document** (ticket 1639): one document per command, written once, by ONE path every end the lane handles goes through
+  (the lock is released, the scan runs when a publication was verified, the document is written, the scratch is removed). It is written
+  for every end at or after the decision: a pass (a lockfile-only one included), a dry run, a refusal, a declined prompt, an answer that
+  could not be read, a failed installation, and a command ended by INT, TERM or HUP after its decision (no scan, the write bounded to two
+  seconds). It is NOT written for a command that ended before its decision exists (a refusal by a guard or a configuration, a hand-over
+  to today's gate, a signal before the decision), for one killed outright (SIGKILL, a power cut), or when the writer cannot write (one
+  line says so). The gate never creates, names, reads, lists or removes the reports directory (a lane lint rule): an unusable one gates
+  nothing, a clean install still exits 0 with one line and a refusal keeps its status and its last line. `safe-core project-report write`
+  is the one writer: it builds the document from the pieces the run left (the decision report, the binder's result, the prompts, the
+  scripts, the scan's summary, the digests of the judged lockfiles) and from nothing else, establishes its directories itself and writes
+  `<data>/project-lane/reports/<key>/<UTC time to the microsecond>-<pid>-<random>.json`, where `<key>` is the digest of the project's
+  physical path (the key is the directory's name and is no member of any document). The data directory is opened by the path it is given,
+  as the other stores open their root; the no-link chain starts below it: each directory under it is opened one name at a time, never
+  through a link, owned by the user and closed to others (0700). The file is created 0600, synced and renamed into place without
+  replacing anything; the names sort in the order of the writes (a write is stamped after the newest report of the project), so the 51st
+  write removes the oldest. The last 50 of a project are kept: only regular files of the report's own name and owned by the user, by name
+  below the held project directory, never through a link, never outside the project's directory; a pruning that fails is one line. A
+  document is never cut short: past 8 MiB (measured: a command that introduces 1000 packages, each with an advisory, a cooldown wait and
+  scripts, is 607 KB) it is not written and one line says so. Every failure to write, a missing writer or an unreadable decision piece
+  included, is one line before the lane's own last line and never changes the status.
   Members (schema 1): `schema_version`, `written_at` (UTC), `safe_version`, `command` (`verb`, `dry_run`, `package_lock_only`; the
   arguments are not kept), `end` (one of `published`, `published_lockfile`, `dry_run`, `refused`, `declined`, `unread_answer`,
   `stopped`, `bind_refused`, `install_failed`, `verification_failed`, `inputs_changed`, `interrupted`, `publication_failed`,
-  `install_unsettled`, `bind_unreadable`), `status` (the lane's exit status), `passed` (true only for a publication with status 0),
-  `lockfile_sha256` (the lockfile on disk at the end), `decision` (the baseline, the outcome, `entries` and the counts of the difference
-  and never the list of entries, the advisories fixed, already present with whether the exposure changed and the count by severity, and
-  introduced, the malice facts, the cooldown, the Socket judgement of the named roots, the artifacts the evidence is on with their
-  host, and the counts of what was left out), `prompts` (how many were asked, how they ended, the answers recorded), `binder`, `scripts`
-  (the packages with install-time scripts by identity and closed event; no path), `scan` (the summary and the digest of the lockfile it
-  read, not its full result: `safe audit repo-audit .` shows the detail). Every string is a member of a closed list or has passed a
-  grammar; what does not is counted in an `*_other` member and never kept. No text of npm, of the scanner, of a registry or of the
-  environment is in it, and a source is shown as its host alone, never as a location.
+  `install_unsettled`, `bind_unreadable`), `status` (the command's PUBLIC status, the reserved statuses already normalised; an end that
+  reads as a pass, `published`, `published_lockfile` or `dry_run`, exists only with status 0, and every other end only with a status
+  that is not 0: a dry run that ends in a refusal is `refused`), `passed` (true only for a publication with status 0), `lockfiles` (the
+  digests of the judged target and of the baseline, taken from the pieces the decision was made from while the lane held them),
+  `decision` (the baseline source, the outcome, each class of the decision table and what it came to, `entries`, the differential as
+  identities — added, removed and changed with their versions, and what was introduced with name, version and the host its bytes come
+  from — or counts only for `ci`, the advisories fixed, already present with whether the exposure changed and the count by severity,
+  and introduced, the malice facts, the missing evidence per cause with a count and the first identities, the cooldown with each wait
+  and waiver and their dates, the Socket outcome of each named root, the artifacts the evidence is on, and the counts of what a grammar
+  left out), `prompts` (one entry per class the operator was asked about, the typed malice override and the missing-evidence
+  confirmation included, and how it ended: accepted, declined or unread), `binder`, `scripts` (one reading, the whole list: the packages
+  with install-time scripts by identity and closed event; no path), `scan` (the summary, whether the lockfile it read is the one this
+  command published, and not its full result: `safe audit repo-audit .` shows the detail). Every string is a member of a closed list or
+  has passed a grammar (an identity the lane admitted is an identity the document keeps); what does not is counted in an `*_other`
+  member and never kept. No text of npm, of the scanner, of a registry or of the environment is in it, and a source is shown as its host
+  alone, never as a location.
   **The project scan is a report** (ticket 1639): the lane asks nothing of a scan at install time. After a verified publication
-  (a lockfile-only one included; not after a refusal, a dry run or a hand-over to today's gate, which runs its own) and after the
-  project's lock is released, the lane runs the scan of the project (`safe audit repo-audit . --deps-only`, the auditor beside the
-  gate, never one an environment variable names) under one deadline that reaches the scanner's children, and prints at most three
-  lines after the command: the ecosystems with a critical finding, npm included, with their count, and the findings the scan could not
-  attribute to an ecosystem of its known set (`detail: safe audit repo-audit .`); the scanners whose coverage failed; or, when the scan
-  did not complete, one line with a fixed reason (it failed, left no readable result, ran past its bound). Nothing the scanner
-  wrote is printed. **The scan never changes the command's exit status**, whatever it finds or however it fails: a finding is a line,
-  not a refusal.
+  (a lockfile-only one included; not after a refusal, a dry run, a signal or a hand-over to today's gate, which runs its own) and after
+  the project's lock is released, the lane runs the scan of the project (`safe audit repo-audit . --deps-only`, the auditor beside the
+  gate, never one an environment variable names) under one deadline that reaches the scanner's children (the reading of its result and
+  the digests are bounded too), and prints at most three lines after the command: the ecosystems with a critical finding, npm included,
+  with their count, and the findings the scan could not attribute to an ecosystem of its known set (`detail: safe audit repo-audit .`);
+  the scanners that did not give their whole coverage, by the producer's own rule (a scanner whose status is not `ok` is a gap; the status
+  word is `partial`, `skipped`, `unavailable` or `error`, anything else is counted, and no note is read), for example `scanner coverage:
+  osv-scanner partial, syft skipped; that coverage is missing`, or `scanner coverage could not be read; that coverage is unknown` when
+  the section cannot be read (never zero gaps); or, when the scan did not complete, one line with a fixed reason (it failed, left no
+  readable result, ran past its bound). A third line says when the lockfile the scan read, before and after it, is not the one this
+  command published (by the digest taken while the lane held it), also when the scan found nothing. Nothing the scanner wrote is
+  printed. **The scan never changes the command's exit status**, whatever it finds or however it fails: a finding is a line, not a
+  refusal. Its limits: the scan reads the project as it is when it runs, and only the lockfile of the npm project is compared with what
+  was published (the inputs of the other ecosystems are not sampled); its timeout utility and the scanners it finds are looked up through
+  the inherited PATH, as everywhere in the gate.
   **The baseline** is what the differential is taken against, and what decides which
   advisories are "already present" and never gate. It is the lockfile committed at the
   head of the project's git work tree, or one safe itself judged clear and recorded (below);

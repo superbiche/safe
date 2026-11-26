@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -15,10 +13,10 @@ import (
 )
 
 // project-report writes the report document of a lane command (ticket 1639) and checks one. `write` prints ONE closed word on stdout:
-// written, written-prune-failed, too-large, no-decision (the run left no decision report: nothing to write) or failed. Exit 0 for the
-// first two, 3 otherwise (too-large included: nothing was written), 2 for usage. `check` is for the tests: it exits 0 for a document in
+// written, written-prune-failed, too-large or failed (the gate calls it only once a decision exists: a decision piece that cannot be read
+// is a failure to write, never silence). Exit 0 for the first two, 3 otherwise (too-large included: nothing was written), 2 for usage. `check` is for the tests: it exits 0 for a document in
 // its schema and canonical form, 3 otherwise.
-const projectReportUsage = "safe-core: usage: safe-core project-report write --data <dir> --project <abs path> --scratch <dir> --lockfile <file> --verb <verb> --status <n> --version <v> --published <none|tree|lockfile> --asked <n> --ended <none|accepted|declined|unread> [--dry-run] [--lock-only] | safe-core project-report check <file>"
+const projectReportUsage = "safe-core: usage: safe-core project-report write --data <dir> --project <abs path> --scratch <dir> --verb <verb> --status <n> --version <v> --published <none|tree|lockfile> [--dry-run] [--lock-only] | safe-core project-report check <file>"
 
 const reportPieceLimit = 16 << 20
 
@@ -37,25 +35,6 @@ func readPiece(path string) ([]byte, bool) {
 		return nil, false
 	}
 	return raw, true
-}
-
-func lockfileDigest(path string) string {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "absent"
-		}
-		return "unreadable"
-	}
-	if !info.Mode().IsRegular() {
-		return "unreadable"
-	}
-	raw, ok := readPiece(path)
-	if !ok {
-		return "unreadable"
-	}
-	sum := sha256.Sum256(raw)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func projectReport(args []string, stdout, stderr io.Writer) int {
@@ -83,7 +62,7 @@ func projectReport(args []string, stdout, stderr io.Writer) int {
 				return usage()
 			}
 			flags[args[i]] = true
-		case "--data", "--project", "--scratch", "--lockfile", "--verb", "--status", "--version", "--published", "--asked", "--ended":
+		case "--data", "--project", "--scratch", "--verb", "--status", "--version", "--published":
 			if i+1 >= len(args) {
 				return usage()
 			}
@@ -96,14 +75,13 @@ func projectReport(args []string, stdout, stderr io.Writer) int {
 			return usage()
 		}
 	}
-	for _, need := range []string{"--data", "--project", "--scratch", "--lockfile", "--verb", "--status", "--version", "--published", "--asked", "--ended"} {
+	for _, need := range []string{"--data", "--project", "--scratch", "--verb", "--status", "--version", "--published"} {
 		if _, ok := values[need]; !ok {
 			return usage()
 		}
 	}
 	status, errStatus := strconv.Atoi(values["--status"])
-	asked, errAsked := strconv.Atoi(values["--asked"])
-	if errStatus != nil || errAsked != nil || status < 0 || status > 255 || asked < 0 || asked > 1<<20 {
+	if errStatus != nil || status < 0 || status > 255 {
 		return usage()
 	}
 	switch values["--published"] {
@@ -125,11 +103,10 @@ func projectReport(args []string, stdout, stderr io.Writer) int {
 		return raw
 	}
 	in := projectlane.ReportInputs{Now: time.Now().UTC(), SafeVersion: values["--version"], Verb: values["--verb"], DryRun: flags["--dry-run"],
-		PackageLockOnly: flags["--lock-only"], Status: status, Published: published, Asked: asked, Ended: values["--ended"],
-		LockfileDigest: lockfileDigest(values["--lockfile"]), Report: piece("report.json"), Bind: piece("bind.json"), Answered: piece("answered.tsv"),
-		Scripts: piece("scripts.json"), Scan: piece("scan.json"), Graph: piece("target-graph.json")}
+		PackageLockOnly: flags["--lock-only"], Status: status, Published: published, Report: piece("report.json"), Bind: piece("bind.json"),
+		Prompts: piece("prompt-log.tsv"), Scripts: piece("scripts.json"), Scan: piece("scan.json"), Graph: piece("target-graph.json"), Judged: piece("judged.json")}
 	if in.Report == nil {
-		return fail("no-decision")
+		return fail("failed")
 	}
 	// a piece present but unreadable is not an absent one: the binder's file that cannot be read is said by the document
 	if _, err := os.Lstat(filepath.Join(scratch, "bind.json")); err == nil && in.Bind == nil {
@@ -137,9 +114,6 @@ func projectReport(args []string, stdout, stderr io.Writer) int {
 	}
 	doc, err := projectlane.BuildReportDocument(in)
 	if err != nil {
-		if err == projectlane.ErrNoDecision {
-			return fail("no-decision")
-		}
 		return fail("failed")
 	}
 	content, err := projectlane.MarshalReportDocument(doc)

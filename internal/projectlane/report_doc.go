@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,56 +24,83 @@ import (
 // ReportDocumentSchema is the schema of the document.
 const ReportDocumentSchema = 1
 
-// MaxReportBytes is the bound on one document. Past it the document is not written (never cut short). 1 MiB: measured on a
-// document of a 1000-entry install with an advisory on every entry, which is 164 KB (the test that states the measure).
-const MaxReportBytes = 1 << 20
+// MaxReportBytes is the bound on one document. Past it the document is not written (never cut short). 8 MiB: measured on a
+// document of an install that introduces 1000 packages, each with an advisory (the test that states the measure).
+const MaxReportBytes = 8 << 20
 
 // The closed lists.
 var (
 	reportVerbs  = map[string]bool{"install": true, "ci": true, "update": true, "dedupe": true, "prune": true}
 	reportEnds   = map[string]bool{"published": true, "published_lockfile": true, "dry_run": true, "refused": true, "declined": true, "unread_answer": true, "stopped": true, "bind_refused": true, "install_failed": true, "verification_failed": true, "inputs_changed": true, "interrupted": true, "publication_failed": true, "install_unsettled": true, "bind_unreadable": true}
 	bindOutcomes = map[string]int{"published": 0, "refused": 30, "install_failed": 31, "verification_failed": 32, "inputs_changed": 33, "interrupted": 34, "publication_failed": 35, "install_unsettled": 36}
-	reportEnded  = map[string]bool{"none": true, "accepted": true, "declined": true, "unread": true}
+	promptEnded  = map[string]bool{"accepted": true, "declined": true, "unread": true}
 	severities   = map[string]bool{"critical": true, "high": true, "moderate": true, "low": true, "unknown": true}
 	advClasses   = map[string]bool{AdvisoryBlocking: true, AdvisoryAdverse: true, AdvisoryBelowHigh: true}
 	maliceSignal = map[string]bool{"blocklist": true, "malware_record": true, "socket_block": true}
 	baselines    = map[string]bool{baselineGraph: true, baselineEmpty: true, baselineUnreadable: true}
 	outcomeState = map[string]bool{"clear": true, "stopped": true, "unbound": true}
-	outcomeClass = map[string]bool{"": true, ClassMalice: true, ClassBlockingAdvisory: true, ClassAdverseAdvisory: true, ClassMissingEvidence: true, "wait": true, "socket_root": true}
-	socketOut    = map[string]bool{SocketAdverse: true, "rate_limited": true, "consent_required": true, "pending": true, "unavailable": true, "clear": true, "ok": true}
-	answerClass  = map[string]bool{ClassMalice: true, ClassBlockingAdvisory: true, ClassAdverseAdvisory: true, ClassMissingEvidence: true, "wait": true, "socket_root": true}
+	classNames   = map[string]bool{ClassMalice: true, ClassBlockingAdvisory: true, ClassAdverseAdvisory: true, ClassMissingEvidence: true, "wait": true, ClassSocketRoot: true}
+	socketOut    = map[string]bool{SocketClear: true, SocketAdverse: true, SocketUnavailable: true, SocketRateLimited: true, SocketConsentRequired: true, SocketPending: true, SocketBlocked: true}
+	gapCauses    = map[string]bool{GapAdvisoryReading: true, GapPublishTime: true, GapSocketUntied: true, GapSocketCache: true, GapBaselineUnreadable: true}
+	gapSides     = map[string]bool{"baseline": true, "target": true}
+	introReasons = map[string]bool{IntroducedNew: true, IntroducedOrigin: true, IntroducedIntegrity: true, IntroducedBoth: true, IntroducedCovering: true}
+	fixPolicies  = map[string]bool{SecurityFixExempt: true, SecurityFixEnforce: true, "": true}
 	scriptEvents = map[string]bool{"preinstall": true, "install": true, "postinstall": true, "prepublish": true, "preprepare": true, "prepare": true, "postprepare": true}
 	scanReasons  = map[string]bool{"": true, "no_audit": true, "no_timeout": true, "timeout": true, "failed": true, "no_result": true}
+	// the ends that read as a pass of the command, and the ones that need a status other than 0
+	passEnds = map[string]bool{"published": true, "published_lockfile": true, "dry_run": true}
 )
+
+const maxFirstGaps = 5
 
 var (
-	nameGrammar    = regexp.MustCompile(`\A(?:@[A-Za-z0-9~][A-Za-z0-9._~-]{0,213}/)?[A-Za-z0-9~][A-Za-z0-9._~-]{0,213}\z`)
-	versionGrammar = regexp.MustCompile(`\A[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]{1,64})?\z`)
-	idGrammar      = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\z`)
-	digestGrammar  = regexp.MustCompile(`\A(?:sha256:[0-9a-f]{64}|absent|unreadable)\z`)
-	safeVersion    = regexp.MustCompile(`\A[0-9A-Za-z][0-9A-Za-z.+-]{0,31}\z`)
-	timeGrammar    = regexp.MustCompile(`\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z`)
-	hostGrammar    = regexp.MustCompile(`\A[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\z`)
+	idGrammar     = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\z`)
+	digestGrammar = regexp.MustCompile(`\A(?:sha256:[0-9a-f]{64}|none|absent|unreadable)\z`)
+	safeVersion   = regexp.MustCompile(`\A[0-9A-Za-z][0-9A-Za-z.+-]{0,31}\z`)
+	timeGrammar   = regexp.MustCompile(`\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z`)
+	stampGrammar  = regexp.MustCompile(`\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z\z`)
+	hostGrammar   = regexp.MustCompile(`\A[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\z`)
 )
 
-func goodName(s string) bool    { return nameGrammar.MatchString(s) }
-func goodVersion(s string) bool { return versionGrammar.MatchString(s) }
+// The lane's own grammars for what it admits to a project: an identity the lane installed is an identity the report keeps.
+func goodName(s string) bool    { return validPackageName(s) }
+func goodVersion(s string) bool { return validVersion(s) }
+func goodStamp(s string) bool   { return stampGrammar.MatchString(s) }
+
+// reportHostOf is the host of a resolved location, from its parts and nothing else: userinfo, port, path, query and fragment are not kept.
+func reportHostOf(origin string) string {
+	if hostOf(origin) == "" {
+		return ""
+	}
+	if !strings.Contains(origin, "://") {
+		origin = "https://" + origin
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if !hostGrammar.MatchString(host) {
+		return ""
+	}
+	return host
+}
 
 // ReportDocument is the document.
 type ReportDocument struct {
-	SchemaVersion  int            `json:"schema_version"`
-	WrittenAt      string         `json:"written_at"`
-	SafeVersion    string         `json:"safe_version"`
-	Command        ReportCommand  `json:"command"`
-	End            string         `json:"end"`
-	Status         int            `json:"status"`
-	Passed         bool           `json:"passed"`
-	LockfileSHA256 string         `json:"lockfile_sha256"`
-	Decision       ReportDecision `json:"decision"`
-	Prompts        ReportPrompts  `json:"prompts"`
-	Binder         *ReportBinder  `json:"binder"`
-	Scripts        *ReportScripts `json:"scripts"`
-	Scan           *ReportScan    `json:"scan"`
+	SchemaVersion int             `json:"schema_version"`
+	WrittenAt     string          `json:"written_at"`
+	SafeVersion   string          `json:"safe_version"`
+	Command       ReportCommand   `json:"command"`
+	End           string          `json:"end"`
+	Status        int             `json:"status"`
+	Passed        bool            `json:"passed"`
+	Lockfiles     ReportLockfiles `json:"lockfiles"`
+	Decision      ReportDecision  `json:"decision"`
+	Prompts       []ReportPrompt  `json:"prompts"`
+	Binder        *ReportBinder   `json:"binder"`
+	Scripts       *ReportScripts  `json:"scripts"`
+	Scan          *ReportScan     `json:"scan"`
 }
 
 // ReportCommand is the command as the lane saw it, from closed values: the arguments of the command are not kept.
@@ -82,15 +110,20 @@ type ReportCommand struct {
 	PackageLockOnly bool   `json:"package_lock_only"`
 }
 
-// ReportDecision is what the decision found. Counts for the difference (never the list of entries), identities for findings.
+// ReportLockfiles are the digests of the lockfiles the decision was made from, taken while the lane held them: the judged target, and the
+// baseline ("none" when there was none).
+type ReportLockfiles struct {
+	TargetSHA256   string `json:"target_sha256"`
+	BaselineSHA256 string `json:"baseline_sha256"`
+}
+
+// ReportDecision is what the decision found, as typed values.
 type ReportDecision struct {
 	Baseline        string           `json:"baseline"`
 	Outcome         ReportOutcome    `json:"outcome"`
+	Classes         []ReportClass    `json:"classes"`
 	Entries         int              `json:"entries"`
-	Added           int              `json:"added"`
-	Changed         int              `json:"changed"`
-	Removed         int              `json:"removed"`
-	Introduced      int              `json:"introduced"`
+	Difference      ReportDifference `json:"difference"`
 	Fixed           []ReportAdvisory `json:"fixed"`
 	AlreadyPresent  []ReportPresent  `json:"already_present"`
 	PresentBy       map[string]int   `json:"already_present_by_severity"`
@@ -98,7 +131,7 @@ type ReportDecision struct {
 	AdvisoriesOther int              `json:"advisories_other"`
 	Malice          []ReportMalice   `json:"malice"`
 	MaliceOther     int              `json:"malice_other"`
-	CoverageGaps    int              `json:"coverage_gaps"`
+	Coverage        ReportCoverage   `json:"coverage"`
 	Cooldown        ReportCooldown   `json:"cooldown"`
 	Socket          []ReportSocket   `json:"socket"`
 	SocketOther     int              `json:"socket_other"`
@@ -113,6 +146,49 @@ type ReportOutcome struct {
 	Status string `json:"status"`
 	Class  string `json:"class"`
 	Exit   int    `json:"exit"`
+}
+
+// ReportClass is one class of the decision table and what it came to.
+type ReportClass struct {
+	Class       string `json:"class"`
+	Exit        int    `json:"exit"`
+	AtStake     int    `json:"at_stake"`
+	Outstanding int    `json:"outstanding"`
+}
+
+// ReportDifference is what the command changes in the graph: the identities, or for ci (whose entries are the whole lockfile) counts only.
+type ReportDifference struct {
+	Listed          bool               `json:"listed"`
+	AddedCount      int                `json:"added_count"`
+	RemovedCount    int                `json:"removed_count"`
+	ChangedCount    int                `json:"changed_count"`
+	IntroducedCount int                `json:"introduced_count"`
+	Added           []ReportNameSet    `json:"added"`
+	Removed         []ReportNameSet    `json:"removed"`
+	Changed         []ReportChange     `json:"changed"`
+	Introduced      []ReportIntroduced `json:"introduced"`
+	Other           int                `json:"other"`
+}
+
+// ReportNameSet is a package name and the versions it is at.
+type ReportNameSet struct {
+	Name     string   `json:"name"`
+	Versions []string `json:"versions"`
+}
+
+// ReportChange is a package at other versions after the command.
+type ReportChange struct {
+	Name   string   `json:"name"`
+	Before []string `json:"before"`
+	After  []string `json:"after"`
+}
+
+// ReportIntroduced is an artifact the command introduces: its identity and the host its bytes come from, never a location.
+type ReportIntroduced struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Host    string `json:"host"`
+	Reason  string `json:"reason"`
 }
 
 // ReportAdvisory is an advisory of a package.
@@ -141,19 +217,54 @@ type ReportMalice struct {
 	Overridden bool     `json:"overridden"`
 }
 
-// ReportCooldown is the release-age judgement.
-type ReportCooldown struct {
-	Days    int          `json:"days"`
-	Checked int          `json:"checked"`
-	Waits   []ReportWait `json:"waits"`
-	Other   int          `json:"waits_other"`
-	Missing int          `json:"missing"`
+// ReportCoverage is the missing evidence: per cause a count and the first identities.
+type ReportCoverage struct {
+	Gaps   int              `json:"gaps"`
+	Causes []ReportGapCause `json:"causes"`
+	Other  int              `json:"other"`
 }
 
-// ReportWait is a version inside the cooldown.
+// ReportGapCause is one cause of missing evidence.
+type ReportGapCause struct {
+	Cause string           `json:"cause"`
+	Count int              `json:"count"`
+	First []ReportGapFirst `json:"first"`
+}
+
+// ReportGapFirst is an identity (empty for a gap of the whole reading) and the sides the reading is missing on.
+type ReportGapFirst struct {
+	Name    string   `json:"name"`
+	Version string   `json:"version"`
+	Sides   []string `json:"sides"`
+}
+
+// ReportCooldown is the release-age judgement.
+type ReportCooldown struct {
+	Days        int            `json:"days"`
+	SecurityFix string         `json:"security_fix"`
+	Checked     int            `json:"checked"`
+	Waits       []ReportWait   `json:"waits"`
+	Waived      []ReportWaiver `json:"waived"`
+	Missing     int            `json:"missing"`
+	Other       int            `json:"other"`
+}
+
+// ReportWait is a version inside the cooldown, with the dates.
 type ReportWait struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Published   string `json:"published"`
+	Installable string `json:"installable"`
+	Root        bool   `json:"root"`
+	Bounded     bool   `json:"bounded"`
+	Cleared     bool   `json:"cleared"`
+}
+
+// ReportWaiver is a named version whose wait the security-fix exemption waived.
+type ReportWaiver struct {
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Published string `json:"published"`
 }
 
 // ReportSocket is the Socket judgement of a named root.
@@ -161,6 +272,7 @@ type ReportSocket struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	Outcome string `json:"outcome"`
+	Cleared bool   `json:"cleared"`
 }
 
 // ReportAdverse is an exact artifact the decision's evidence is on; the host is where its bytes came from, never a location.
@@ -170,19 +282,10 @@ type ReportAdverse struct {
 	Host    string `json:"host"`
 }
 
-// ReportPrompts is what the lane asked and how it ended.
-type ReportPrompts struct {
-	Asked    int            `json:"asked"`
-	Ended    string         `json:"ended"`
-	Answered []ReportAnswer `json:"answered"`
-	Other    int            `json:"answered_other"`
-}
-
-// ReportAnswer is an answer the operator gave, as the lane recorded it.
-type ReportAnswer struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Class   string `json:"class"`
+// ReportPrompt is one class the operator was asked about, and how it ended.
+type ReportPrompt struct {
+	Class string `json:"class"`
+	Ended string `json:"ended"`
 }
 
 // ReportBinder is what the binder said.
@@ -191,7 +294,7 @@ type ReportBinder struct {
 	Exit    int    `json:"exit"`
 }
 
-// ReportScripts is the scripts the command left unrun: the identities and the closed events, no path.
+// ReportScripts is the scripts the command left unrun: the identities and the closed events, no path. One reading, uncapped.
 type ReportScripts struct {
 	Source      string          `json:"source"`
 	Previous    string          `json:"previous"`
@@ -220,13 +323,13 @@ type ReportRoot struct {
 	Gyp    bool     `json:"gyp"`
 }
 
-// ReportScan is the scan's summary and the digest of the lockfile it read: not its full result.
+// ReportScan is the scan's summary, not its full result, and whether the lockfile it read (before and after) is the one this command
+// published.
 type ReportScan struct {
-	Status         string       `json:"status"`
-	Reason         string       `json:"reason"`
-	Summary        *ScanSummary `json:"summary"`
-	LockfileSHA256 string       `json:"lockfile_sha256"`
-	LockfileStable bool         `json:"lockfile_stable"`
+	Status            string       `json:"status"`
+	Reason            string       `json:"reason"`
+	Summary           *ScanSummary `json:"summary"`
+	LockfilePublished bool         `json:"lockfile_published"`
 }
 
 // ReportInputs are the pieces of a run, as bytes (nil: absent).
@@ -238,18 +341,16 @@ type ReportInputs struct {
 	PackageLockOnly bool
 	Status          int
 	Published       string // "", "tree" or "lockfile": what the lane established after the binder
-	Asked           int
-	Ended           string
-	LockfileDigest  string
 	Report          []byte
 	Bind            []byte
-	Answered        []byte
+	Prompts         []byte // class<TAB>ended per line
 	Scripts         []byte
 	Scan            []byte
 	Graph           []byte
+	Judged          []byte // the digests of the judged target and of the baseline
 }
 
-// ErrNoDecision: the run left no decision report: nothing is written, the command ended before it.
+// ErrNoDecision: the run left no readable decision report: nothing is written, the command ended before it.
 var ErrNoDecision = errors.New("the run left no readable decision report")
 
 func capped(n int) int {
@@ -260,17 +361,18 @@ func capped(n int) int {
 }
 
 // BuildReportDocument builds the document from the pieces. A piece that cannot be read is said in the document (the binder as
-// "bind_unreadable", the scripts and the scan as absent); only the decision report is required.
+// "bind_unreadable", the digests as "unreadable", the scripts and the scan as absent); only the decision report is required.
 func BuildReportDocument(in ReportInputs) (ReportDocument, error) {
 	doc := ReportDocument{SchemaVersion: ReportDocumentSchema, WrittenAt: in.Now.UTC().Format("2006-01-02T15:04:05Z"), SafeVersion: in.SafeVersion,
-		Command: ReportCommand{Verb: in.Verb, DryRun: in.DryRun, PackageLockOnly: in.PackageLockOnly}, Status: in.Status, LockfileSHA256: in.LockfileDigest}
+		Command: ReportCommand{Verb: in.Verb, DryRun: in.DryRun, PackageLockOnly: in.PackageLockOnly}, Status: in.Status, Prompts: []ReportPrompt{}}
 	var report Report
 	if err := json.Unmarshal(in.Report, &report); err != nil || report.SchemaVersion != ReportSchema || !outcomeState[report.Outcome.Status] {
 		return doc, ErrNoDecision
 	}
-	doc.Decision = decisionOf(report)
+	doc.Lockfiles = lockfilesOf(in.Judged)
+	doc.Decision = decisionOf(report, in.Verb == "ci")
 	doc.Decision.Entries = entriesOf(in.Graph)
-	doc.Prompts = promptsOf(in)
+	doc.Prompts = promptsOf(in.Prompts)
 	if in.Bind != nil {
 		doc.Binder = binderOf(in.Bind)
 	}
@@ -288,6 +390,24 @@ func BuildReportDocument(in ReportInputs) (ReportDocument, error) {
 	return doc, nil
 }
 
+func lockfilesOf(raw []byte) ReportLockfiles {
+	out := ReportLockfiles{TargetSHA256: "unreadable", BaselineSHA256: "unreadable"}
+	var j struct {
+		Target   string `json:"target"`
+		Baseline string `json:"baseline"`
+	}
+	if raw == nil || json.Unmarshal(raw, &j) != nil {
+		return out
+	}
+	if digestGrammar.MatchString(j.Target) {
+		out.TargetSHA256 = j.Target
+	}
+	if digestGrammar.MatchString(j.Baseline) {
+		out.BaselineSHA256 = j.Baseline
+	}
+	return out
+}
+
 // entriesOf is the number of entries of the lockfile the command judged (the target graph), 0 when the graph cannot be read.
 func entriesOf(raw []byte) int {
 	var g struct {
@@ -301,16 +421,31 @@ func entriesOf(raw []byte) int {
 	return len(g.Graph.Occurrences)
 }
 
+// endOf says how the command ended, from the binder's word, the prompts, the decision and the PUBLIC status. An end that reads as a pass
+// exists only with status 0.
 func endOf(in ReportInputs, doc ReportDocument) string {
+	end := rawEndOf(in, doc)
+	if passEnds[end] && doc.Status != 0 {
+		// a refusal that came after the decision (a final admission, a late reading) is a refusal, whatever the command asked for
+		if end == "dry_run" || doc.Binder == nil {
+			return "refused"
+		}
+		return "stopped"
+	}
+	return end
+}
+
+func rawEndOf(in ReportInputs, doc ReportDocument) string {
 	// a signal ended the command before the binder reported anything usable
-	if in.Status > 128 && in.Status < 193 && !in.DryRun && (doc.Binder == nil || doc.Binder.Outcome == "unreadable") {
+	// (a publication the binder reported and a signal after it, while the scan ran, is an interrupted command too: it ended on the signal)
+	if in.Status > 128 && in.Status < 193 && !in.DryRun && (doc.Binder == nil || doc.Binder.Outcome == "unreadable" || doc.Binder.Outcome == "published") {
 		return "interrupted"
 	}
-	if doc.Binder != nil {
-		switch {
-		case doc.Binder.Outcome == "unreadable":
+	if b := doc.Binder; b != nil {
+		switch b.Outcome {
+		case "unreadable":
 			return "bind_unreadable"
-		case doc.Binder.Outcome == "published":
+		case "published":
 			switch in.Published {
 			case "tree":
 				return "published"
@@ -318,17 +453,20 @@ func endOf(in ReportInputs, doc ReportDocument) string {
 				return "published_lockfile"
 			}
 			return "bind_unreadable"
-		case doc.Binder.Outcome == "refused":
+		case "refused":
 			return "bind_refused"
-		default:
-			return doc.Binder.Outcome
+		}
+		return b.Outcome
+	}
+	if n := len(doc.Prompts); n > 0 {
+		switch doc.Prompts[n-1].Ended {
+		case "declined":
+			return "declined"
+		case "unread":
+			return "unread_answer"
 		}
 	}
 	switch {
-	case doc.Prompts.Ended == "declined":
-		return "declined"
-	case doc.Prompts.Ended == "unread":
-		return "unread_answer"
 	case doc.Decision.Outcome.Status != "clear":
 		return "refused"
 	case in.DryRun:
@@ -337,25 +475,36 @@ func endOf(in ReportInputs, doc ReportDocument) string {
 	return "stopped"
 }
 
-func decisionOf(r Report) ReportDecision {
+func versionsOK(versions []string) bool {
+	for _, v := range versions {
+		if !goodVersion(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func decisionOf(r Report, countsOnly bool) ReportDecision {
 	d := ReportDecision{Baseline: r.Baseline.Source, Outcome: ReportOutcome{Status: r.Outcome.Status, Class: r.Outcome.Class, Exit: r.Outcome.Exit},
-		Added: len(r.Difference.Added), Changed: len(r.Difference.Changed), Removed: len(r.Difference.Removed), Introduced: len(r.Difference.Introduced),
-		Fixed: []ReportAdvisory{}, AlreadyPresent: []ReportPresent{}, PresentBy: map[string]int{}, IntroducedAdv: []ReportAdvisory{},
-		Malice: []ReportMalice{}, Socket: []ReportSocket{}, Adverse: []ReportAdverse{}, CoverageGaps: len(r.Coverage), Unjudged: r.Unjudged, GapConfirmed: r.GapConfirmed}
-	d.Cooldown.Waits = []ReportWait{}
+		Classes: []ReportClass{}, Fixed: []ReportAdvisory{}, AlreadyPresent: []ReportPresent{}, PresentBy: map[string]int{}, IntroducedAdv: []ReportAdvisory{},
+		Malice: []ReportMalice{}, Socket: []ReportSocket{}, Adverse: []ReportAdverse{}, Unjudged: r.Unjudged, GapConfirmed: r.GapConfirmed}
+	d.Cooldown.Waits, d.Cooldown.Waived = []ReportWait{}, []ReportWaiver{}
+	d.Difference = differenceOf(r.Difference, countsOnly)
 	if !baselines[d.Baseline] {
 		d.Baseline = baselineUnreadable
 	}
-	if !outcomeClass[d.Outcome.Class] {
+	if r.Outcome.Class != "" && !classNames[r.Outcome.Class] {
 		d.Outcome.Class = ""
 	}
-	d.Outcome.Exit = capped(d.Outcome.Exit)
-	if d.Outcome.Exit > 255 {
-		d.Outcome.Exit = 255
+	d.Outcome.Exit = min(capped(d.Outcome.Exit), 255)
+	for _, c := range r.Classes {
+		if classNames[c.Class] {
+			d.Classes = append(d.Classes, ReportClass{Class: c.Class, Exit: min(capped(c.Exit), 255), AtStake: capped(c.AtStake), Outstanding: capped(c.Outstanding)})
+		}
 	}
 	for _, a := range r.Advisories.Fixed {
 		if goodName(a.Name) && idGrammar.MatchString(a.ID) {
-			d.Fixed = append(d.Fixed, ReportAdvisory{Name: a.Name, ID: a.ID, Severity: severityOf(a.Severity), Class: ""})
+			d.Fixed = append(d.Fixed, ReportAdvisory{Name: a.Name, ID: a.ID, Severity: severityOf(a.Severity)})
 		} else {
 			d.AdvisoriesOther++
 		}
@@ -381,28 +530,31 @@ func decisionOf(r Report) ReportDecision {
 		}
 	}
 	for _, m := range r.Malice {
-		versions := []string{}
-		ok := goodName(m.Name) && maliceSignal[m.Signal] && (m.ID == "" || idGrammar.MatchString(m.ID))
-		for _, v := range m.Versions {
-			if !goodVersion(v) {
-				ok = false
-				break
-			}
-			versions = append(versions, v)
-		}
-		if ok {
-			d.Malice = append(d.Malice, ReportMalice{Signal: m.Signal, Name: m.Name, Versions: versions, ID: m.ID, Overridden: m.Overridden})
+		if goodName(m.Name) && maliceSignal[m.Signal] && (m.ID == "" || idGrammar.MatchString(m.ID)) && versionsOK(m.Versions) {
+			d.Malice = append(d.Malice, ReportMalice{Signal: m.Signal, Name: m.Name, Versions: append([]string{}, m.Versions...), ID: m.ID, Overridden: m.Overridden})
 		} else {
 			d.MaliceOther++
 		}
 	}
+	d.Coverage = coverageOf(r.Coverage)
 	if r.Cooldown != nil {
-		d.Cooldown.Days = capped(r.Cooldown.Days)
-		d.Cooldown.Checked = capped(r.Cooldown.Checked)
-		d.Cooldown.Missing = len(r.Cooldown.Missing)
-		for _, w := range r.Cooldown.Waits {
-			if goodName(w.Name) && goodVersion(w.Version) {
-				d.Cooldown.Waits = append(d.Cooldown.Waits, ReportWait{Name: w.Name, Version: w.Version})
+		c := r.Cooldown
+		d.Cooldown.Days, d.Cooldown.Checked, d.Cooldown.Missing = capped(c.Days), capped(c.Checked), len(c.Missing)
+		d.Cooldown.SecurityFix = c.SecurityFix
+		if !fixPolicies[d.Cooldown.SecurityFix] {
+			d.Cooldown.SecurityFix = ""
+		}
+		for _, w := range c.Waits {
+			if goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) && goodStamp(w.Installable) {
+				d.Cooldown.Waits = append(d.Cooldown.Waits, ReportWait{Name: w.Name, Version: w.Version, Published: w.Published, Installable: w.Installable,
+					Root: w.Root, Bounded: w.Bounded, Cleared: w.Cleared})
+			} else {
+				d.Cooldown.Other++
+			}
+		}
+		for _, w := range c.Waived {
+			if goodName(w.Name) && goodVersion(w.Version) && goodStamp(w.Published) {
+				d.Cooldown.Waived = append(d.Cooldown.Waived, ReportWaiver{Name: w.Name, Version: w.Version, Published: w.Published})
 			} else {
 				d.Cooldown.Other++
 			}
@@ -411,7 +563,7 @@ func decisionOf(r Report) ReportDecision {
 	if r.Socket != nil {
 		for _, s := range r.Socket.Roots {
 			if goodName(s.Name) && goodVersion(s.Version) && socketOut[s.Outcome] {
-				d.Socket = append(d.Socket, ReportSocket{Name: s.Name, Version: s.Version, Outcome: s.Outcome})
+				d.Socket = append(d.Socket, ReportSocket{Name: s.Name, Version: s.Version, Outcome: s.Outcome, Cleared: s.Cleared})
 			} else {
 				d.SocketOther++
 			}
@@ -427,6 +579,84 @@ func decisionOf(r Report) ReportDecision {
 	return d
 }
 
+func differenceOf(r Difference, countsOnly bool) ReportDifference {
+	d := ReportDifference{Listed: !countsOnly, AddedCount: len(r.Added), RemovedCount: len(r.Removed), ChangedCount: len(r.Changed), IntroducedCount: len(r.Introduced),
+		Added: []ReportNameSet{}, Removed: []ReportNameSet{}, Changed: []ReportChange{}, Introduced: []ReportIntroduced{}}
+	if countsOnly {
+		return d
+	}
+	for _, n := range r.Added {
+		if goodName(n.Name) && versionsOK(n.Versions) {
+			d.Added = append(d.Added, ReportNameSet{Name: n.Name, Versions: append([]string{}, n.Versions...)})
+		} else {
+			d.Other++
+		}
+	}
+	for _, n := range r.Removed {
+		if goodName(n.Name) && versionsOK(n.Versions) {
+			d.Removed = append(d.Removed, ReportNameSet{Name: n.Name, Versions: append([]string{}, n.Versions...)})
+		} else {
+			d.Other++
+		}
+	}
+	for _, c := range r.Changed {
+		if goodName(c.Name) && versionsOK(c.Before) && versionsOK(c.After) {
+			d.Changed = append(d.Changed, ReportChange{Name: c.Name, Before: append([]string{}, c.Before...), After: append([]string{}, c.After...)})
+		} else {
+			d.Other++
+		}
+	}
+	for _, i := range r.Introduced {
+		if goodName(i.Name) && goodVersion(i.Version) && introReasons[i.Reason] {
+			d.Introduced = append(d.Introduced, ReportIntroduced{Name: i.Name, Version: i.Version, Host: reportHostOf(i.Origin), Reason: i.Reason})
+		} else {
+			d.Other++
+		}
+	}
+	return d
+}
+
+func coverageOf(gaps []CoverageGap) ReportCoverage {
+	out := ReportCoverage{Gaps: len(gaps), Causes: []ReportGapCause{}}
+	byCause := map[string]*ReportGapCause{}
+	for _, g := range gaps {
+		if !gapCauses[g.Cause] {
+			out.Other++
+			continue
+		}
+		c := byCause[g.Cause]
+		if c == nil {
+			c = &ReportGapCause{Cause: g.Cause, First: []ReportGapFirst{}}
+			byCause[g.Cause] = c
+		}
+		c.Count++
+		if len(c.First) >= maxFirstGaps {
+			continue
+		}
+		sides := []string{}
+		ok := true
+		for _, side := range g.Sides {
+			if gapSides[side] {
+				sides = append(sides, side)
+			} else {
+				ok = false
+			}
+		}
+		if (g.Name == "" || goodName(g.Name)) && (g.Version == "" || goodVersion(g.Version)) && ok {
+			c.First = append(c.First, ReportGapFirst{Name: g.Name, Version: g.Version, Sides: sides})
+		}
+	}
+	causes := make([]string, 0, len(byCause))
+	for cause := range byCause {
+		causes = append(causes, cause)
+	}
+	sort.Strings(causes)
+	for _, cause := range causes {
+		out.Causes = append(out.Causes, *byCause[cause])
+	}
+	return out
+}
+
 func severityOf(s string) string {
 	if severities[s] {
 		return s
@@ -434,23 +664,19 @@ func severityOf(s string) string {
 	return "unknown"
 }
 
-func promptsOf(in ReportInputs) ReportPrompts {
-	p := ReportPrompts{Asked: capped(in.Asked), Ended: in.Ended, Answered: []ReportAnswer{}}
-	if !reportEnded[p.Ended] {
-		p.Ended = "none"
-	}
-	for _, line := range strings.Split(string(in.Answered), "\n") {
+// promptsOf reads the prompt log: one line per class the operator was asked about, in the order asked.
+func promptsOf(raw []byte) []ReportPrompt {
+	out := []ReportPrompt{}
+	for _, line := range strings.Split(string(raw), "\n") {
 		if line == "" {
 			continue
 		}
 		f := strings.Split(line, "\t")
-		if len(f) >= 3 && goodName(f[0]) && goodVersion(f[1]) && answerClass[f[2]] {
-			p.Answered = append(p.Answered, ReportAnswer{Name: f[0], Version: f[1], Class: f[2]})
-		} else {
-			p.Other++
+		if len(f) == 2 && classNames[f[0]] && promptEnded[f[1]] {
+			out = append(out, ReportPrompt{Class: f[0], Ended: f[1]})
 		}
 	}
-	return p
+	return out
 }
 
 func binderOf(raw []byte) *ReportBinder {
@@ -479,6 +705,14 @@ func eventsOf(in []string) ([]string, bool) {
 	return out, true
 }
 
+func hostPackageOK(host string) bool {
+	if host == "" {
+		return true
+	}
+	at := strings.LastIndex(host, "@")
+	return at > 0 && goodName(host[:at]) && goodVersion(host[at+1:])
+}
+
 func scriptsOf(raw []byte) *ReportScripts {
 	var s ScriptsReport
 	if err := json.Unmarshal(raw, &s); err != nil || s.SchemaVersion != 3 || (s.Source != ScriptsLock && s.Source != ScriptsSource) {
@@ -492,13 +726,8 @@ func scriptsOf(raw []byte) *ReportScripts {
 	pack := func(in []ScriptPackage, dst *[]ReportScriptP, other *int) {
 		for _, p := range in {
 			events, ok := eventsOf(p.Events)
-			host := p.Host
-			if host != "" {
-				at := strings.LastIndex(host, "@")
-				ok = ok && at > 0 && goodName(host[:at]) && goodVersion(host[at+1:])
-			}
-			if ok && goodName(p.Name) && goodVersion(p.Version) {
-				*dst = append(*dst, ReportScriptP{Name: p.Name, Version: p.Version, Host: host, Events: events, Gyp: p.Gyp, Declared: p.Declared})
+			if ok && goodName(p.Name) && goodVersion(p.Version) && hostPackageOK(p.Host) {
+				*dst = append(*dst, ReportScriptP{Name: p.Name, Version: p.Version, Host: p.Host, Events: events, Gyp: p.Gyp, Declared: p.Declared})
 			} else {
 				*other++
 			}
@@ -516,56 +745,63 @@ func scriptsOf(raw []byte) *ReportScripts {
 
 func scanOf(raw []byte) *ReportScan {
 	var s struct {
-		Status         string       `json:"status"`
-		Reason         string       `json:"reason"`
-		Summary        *ScanSummary `json:"summary"`
-		LockfileSHA256 string       `json:"lockfile_sha256"`
-		LockfileStable bool         `json:"lockfile_stable"`
+		Status            string       `json:"status"`
+		Reason            string       `json:"reason"`
+		Summary           *ScanSummary `json:"summary"`
+		LockfilePublished bool         `json:"lockfile_published"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil
 	}
-	out := &ReportScan{Status: s.Status, Reason: s.Reason, LockfileSHA256: s.LockfileSHA256, LockfileStable: s.LockfileStable}
+	out := &ReportScan{Status: s.Status, Reason: s.Reason, LockfilePublished: s.LockfilePublished}
 	if s.Summary != nil {
-		summary := *s.Summary
-		clean := ScanSummary{SchemaVersion: 1, CriticalTotal: capped(summary.CriticalTotal), Critical: map[string]int{}, Unattributed: capped(summary.Unattributed),
-			CoverageFailures: []string{}, CoverageOther: capped(summary.CoverageOther)}
+		in := *s.Summary
+		clean := ScanSummary{SchemaVersion: 1, CriticalTotal: capped(in.CriticalTotal), Critical: map[string]int{}, Unattributed: capped(in.Unattributed),
+			CoverageGaps: []ScanGap{}, CoverageOther: capped(in.CoverageOther), CoverageUnreadable: in.CoverageUnreadable}
 		known := map[string]bool{}
 		for _, e := range ScanEcosystems {
 			known[e] = true
 		}
-		for k, v := range summary.Critical {
+		for k, v := range in.Critical {
 			if known[k] && v > 0 {
 				clean.Critical[k] = v
 			} else {
 				clean.Unattributed += capped(v)
 			}
 		}
-		for _, n := range summary.CoverageFailures {
-			if scannerName.MatchString(n) {
-				clean.CoverageFailures = append(clean.CoverageFailures, n)
+		for _, g := range in.CoverageGaps {
+			if scannerName.MatchString(g.Scanner) && ScanStatuses[g.Status] {
+				clean.CoverageGaps = append(clean.CoverageGaps, g)
 			} else {
 				clean.CoverageOther++
 			}
 		}
-		sort.Strings(clean.CoverageFailures)
 		out.Summary = &clean
 	}
-	if (out.Status != "completed" && out.Status != "not_completed") || !scanReasons[out.Reason] || !digestGrammar.MatchString(out.LockfileSHA256) ||
-		(out.Status == "completed") != (out.Summary != nil) {
+	if (out.Status != "completed" && out.Status != "not_completed") || !scanReasons[out.Reason] || (out.Status == "completed") != (out.Summary != nil) {
 		return nil
 	}
 	return out
 }
 
-// ValidateReportDocument holds every token of the document to its grammar or closed list.
+func validNameVersions(sets []ReportNameSet) bool {
+	for _, n := range sets {
+		if !goodName(n.Name) || !versionsOK(n.Versions) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateReportDocument holds every token of the document to its grammar or closed list, and the end to the status.
 func ValidateReportDocument(d ReportDocument) error {
 	bad := func(what string) error { return fmt.Errorf("%s is outside its grammar", what) }
 	if d.SchemaVersion != ReportDocumentSchema {
 		return bad("schema_version")
 	}
-	if !timeGrammar.MatchString(d.WrittenAt) || !safeVersion.MatchString(d.SafeVersion) || !digestGrammar.MatchString(d.LockfileSHA256) {
-		return bad("written_at, safe_version or lockfile_sha256")
+	if !timeGrammar.MatchString(d.WrittenAt) || !safeVersion.MatchString(d.SafeVersion) || !digestGrammar.MatchString(d.Lockfiles.TargetSHA256) ||
+		!digestGrammar.MatchString(d.Lockfiles.BaselineSHA256) {
+		return bad("written_at, safe_version or a lockfile digest")
 	}
 	if !reportVerbs[d.Command.Verb] || !reportEnds[d.End] || d.Status < 0 || d.Status > 255 {
 		return bad("verb, end or status")
@@ -573,15 +809,41 @@ func ValidateReportDocument(d ReportDocument) error {
 	if d.Passed != ((d.End == "published" || d.End == "published_lockfile") && d.Status == 0) {
 		return errors.New("passed does not follow from the end and the status")
 	}
+	// an end that reads as a pass exists only with status 0, and every other end needs a status that is not 0
+	if passEnds[d.End] != (d.Status == 0) {
+		return errors.New("the end does not agree with the status")
+	}
 	dec := d.Decision
-	if !baselines[dec.Baseline] || !outcomeState[dec.Outcome.Status] || !outcomeClass[dec.Outcome.Class] || dec.Outcome.Exit < 0 || dec.Outcome.Exit > 255 {
+	if !baselines[dec.Baseline] || !outcomeState[dec.Outcome.Status] || (dec.Outcome.Class != "" && !classNames[dec.Outcome.Class]) || dec.Outcome.Exit < 0 || dec.Outcome.Exit > 255 {
 		return bad("the decision's baseline or outcome")
 	}
-	for _, n := range []int{dec.Entries, dec.Added, dec.Changed, dec.Removed, dec.Introduced, dec.AdvisoriesOther, dec.MaliceOther, dec.CoverageGaps, dec.Cooldown.Days,
-		dec.Cooldown.Checked, dec.Cooldown.Other, dec.Cooldown.Missing, dec.SocketOther, dec.AdverseOther, d.Prompts.Asked, d.Prompts.Other} {
+	for _, c := range dec.Classes {
+		if !classNames[c.Class] || c.Exit < 0 || c.Exit > 255 || c.AtStake < 0 || c.Outstanding < 0 {
+			return bad("a class")
+		}
+	}
+	df := dec.Difference
+	for _, n := range []int{dec.Entries, df.AddedCount, df.RemovedCount, df.ChangedCount, df.IntroducedCount, df.Other, dec.AdvisoriesOther, dec.MaliceOther, dec.Coverage.Gaps,
+		dec.Coverage.Other, dec.Cooldown.Days, dec.Cooldown.Checked, dec.Cooldown.Other, dec.Cooldown.Missing, dec.SocketOther, dec.AdverseOther} {
 		if n < 0 {
 			return bad("a count")
 		}
+	}
+	if !validNameVersions(df.Added) || !validNameVersions(df.Removed) {
+		return bad("a name set")
+	}
+	for _, c := range df.Changed {
+		if !goodName(c.Name) || !versionsOK(c.Before) || !versionsOK(c.After) {
+			return bad("a changed package")
+		}
+	}
+	for _, i := range df.Introduced {
+		if !goodName(i.Name) || !goodVersion(i.Version) || !introReasons[i.Reason] || (i.Host != "" && !hostGrammar.MatchString(i.Host)) {
+			return bad("an introduced artifact")
+		}
+	}
+	if !df.Listed && (len(df.Added)+len(df.Removed)+len(df.Changed)+len(df.Introduced) > 0) {
+		return errors.New("a difference that is counts only lists identities")
 	}
 	for _, a := range append(append([]ReportAdvisory{}, dec.Fixed...), dec.IntroducedAdv...) {
 		if !goodName(a.Name) || !idGrammar.MatchString(a.ID) || !severities[a.Severity] || (a.Class != "" && !advClasses[a.Class]) {
@@ -599,18 +861,36 @@ func ValidateReportDocument(d ReportDocument) error {
 		}
 	}
 	for _, m := range dec.Malice {
-		if !goodName(m.Name) || !maliceSignal[m.Signal] || (m.ID != "" && !idGrammar.MatchString(m.ID)) {
+		if !goodName(m.Name) || !maliceSignal[m.Signal] || (m.ID != "" && !idGrammar.MatchString(m.ID)) || !versionsOK(m.Versions) {
 			return bad("a malice fact")
 		}
-		for _, v := range m.Versions {
-			if !goodVersion(v) {
-				return bad("a malice version")
+	}
+	for _, c := range dec.Coverage.Causes {
+		if !gapCauses[c.Cause] || c.Count < 0 || len(c.First) > maxFirstGaps {
+			return bad("a coverage cause")
+		}
+		for _, f := range c.First {
+			if (f.Name != "" && !goodName(f.Name)) || (f.Version != "" && !goodVersion(f.Version)) {
+				return bad("a coverage identity")
+			}
+			for _, side := range f.Sides {
+				if !gapSides[side] {
+					return bad("a coverage side")
+				}
 			}
 		}
 	}
+	if !fixPolicies[dec.Cooldown.SecurityFix] {
+		return bad("the cooldown's policy")
+	}
 	for _, w := range dec.Cooldown.Waits {
-		if !goodName(w.Name) || !goodVersion(w.Version) {
+		if !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) || !goodStamp(w.Installable) {
 			return bad("a cooldown wait")
+		}
+	}
+	for _, w := range dec.Cooldown.Waived {
+		if !goodName(w.Name) || !goodVersion(w.Version) || !goodStamp(w.Published) {
+			return bad("a cooldown waiver")
 		}
 	}
 	for _, s := range dec.Socket {
@@ -623,12 +903,9 @@ func ValidateReportDocument(d ReportDocument) error {
 			return bad("an adverse artifact")
 		}
 	}
-	if !reportEnded[d.Prompts.Ended] {
-		return bad("the end of the prompts")
-	}
-	for _, a := range d.Prompts.Answered {
-		if !goodName(a.Name) || !goodVersion(a.Version) || !answerClass[a.Class] {
-			return bad("an answer")
+	for _, p := range d.Prompts {
+		if !classNames[p.Class] || !promptEnded[p.Ended] {
+			return bad("a prompt")
 		}
 	}
 	if b := d.Binder; b != nil {
@@ -637,18 +914,13 @@ func ValidateReportDocument(d ReportDocument) error {
 		}
 	}
 	if s := d.Scripts; s != nil {
-		if (s.Source != ScriptsLock && s.Source != ScriptsSource) || (s.Previous != "read" && s.Previous != "none" && s.Previous != "unreadable") || s.Total < 0 || s.UnreadTotal < 0 {
+		if (s.Source != ScriptsLock && s.Source != ScriptsSource) || (s.Previous != "read" && s.Previous != "none" && s.Previous != "unreadable") || s.Total < 0 || s.UnreadTotal < 0 ||
+			s.Other < 0 || s.UnreadOther < 0 {
 			return bad("the scripts' header")
 		}
 		for _, p := range append(append([]ReportScriptP{}, s.Packages...), s.Unread...) {
-			if !goodName(p.Name) || !goodVersion(p.Version) {
+			if !goodName(p.Name) || !goodVersion(p.Version) || !hostPackageOK(p.Host) {
 				return bad("a package with scripts")
-			}
-			if p.Host != "" {
-				at := strings.LastIndex(p.Host, "@")
-				if at <= 0 || !goodName(p.Host[:at]) || !goodVersion(p.Host[at+1:]) {
-					return bad("a host package")
-				}
 			}
 			for _, e := range p.Events {
 				if !scriptEvents[e] {
@@ -665,7 +937,7 @@ func ValidateReportDocument(d ReportDocument) error {
 		}
 	}
 	if s := d.Scan; s != nil {
-		if (s.Status != "completed" && s.Status != "not_completed") || !scanReasons[s.Reason] || !digestGrammar.MatchString(s.LockfileSHA256) || (s.Status == "completed") != (s.Summary != nil) {
+		if (s.Status != "completed" && s.Status != "not_completed") || !scanReasons[s.Reason] || (s.Status == "completed") != (s.Summary != nil) {
 			return bad("the scan's header")
 		}
 		if s.Summary != nil {
@@ -678,9 +950,9 @@ func ValidateReportDocument(d ReportDocument) error {
 					return bad("a scan ecosystem")
 				}
 			}
-			for _, n := range s.Summary.CoverageFailures {
-				if !scannerName.MatchString(n) {
-					return bad("a scanner name")
+			for _, g := range s.Summary.CoverageGaps {
+				if !scannerName.MatchString(g.Scanner) || !ScanStatuses[g.Status] {
+					return bad("a scanner coverage gap")
 				}
 			}
 		}
@@ -688,9 +960,9 @@ func ValidateReportDocument(d ReportDocument) error {
 	return nil
 }
 
-// MarshalReportDocument is the one byte form of a document: indented, one trailing newline.
+// MarshalReportDocument is the one byte form of a document: compact (jq shows it), one trailing newline.
 func MarshalReportDocument(d ReportDocument) ([]byte, error) {
-	raw, err := json.MarshalIndent(d, "", "  ")
+	raw, err := json.Marshal(d)
 	if err != nil {
 		return nil, err
 	}

@@ -15,8 +15,18 @@ const reportTestDecision = `{"schema_version":1,"baseline":{"source":"graph","er
 "advisories":{"fixed":[],"already_present":[],"introduced":[]},"malice":[],"coverage":[],"outcome":{"status":"clear","class":"","exit":0},"adverse":[]}`
 
 func reportArgs(data, project, scratch, lock string, extra ...string) []string {
-	return append([]string{"project-report", "write", "--data", data, "--project", project, "--scratch", scratch, "--lockfile", lock, "--verb", "install",
-		"--status", "0", "--version", "1.2.3", "--published", "tree", "--asked", "0", "--ended", "none"}, extra...)
+	return append([]string{"project-report", "write", "--data", data, "--project", project, "--scratch", scratch, "--verb", "install",
+		"--status", "0", "--version", "1.2.3", "--published", "tree"}, extra...)
+}
+
+func withStatus(args []string, status string) []string {
+	out := append([]string{}, args...)
+	for i, a := range out {
+		if a == "--status" {
+			out[i+1] = status
+		}
+	}
+	return out
 }
 
 func TestProjectReportWritesAndChecksOneDocument(t *testing.T) {
@@ -26,9 +36,13 @@ func TestProjectReportWritesAndChecksOneDocument(t *testing.T) {
 	}
 	lock := filepath.Join(t.TempDir(), "package-lock.json")
 	os.WriteFile(lock, []byte("{}\n"), 0o600)
-	// no decision report: nothing is written, and the word says so
-	if code, stdout, _ := runWithStdin("", reportArgs(data, "/work/p", scratch, lock)...); code != 3 || strings.TrimSpace(stdout) != "no-decision" {
-		t.Fatalf("no decision: %d %q", code, stdout)
+	// a decision piece that is not there, or not readable, when the gate called the writer: a failure to write, never silence
+	if code, stdout, _ := runWithStdin("", reportArgs(data, "/work/p", scratch, lock)...); code != 3 || strings.TrimSpace(stdout) != "failed" {
+		t.Fatalf("no decision piece: %d %q", code, stdout)
+	}
+	os.WriteFile(filepath.Join(scratch, "report.json"), []byte("{"), 0o600)
+	if code, stdout, _ := runWithStdin("", reportArgs(data, "/work/p", scratch, lock)...); code != 3 || strings.TrimSpace(stdout) != "failed" {
+		t.Fatalf("an unreadable decision piece: %d %q", code, stdout)
 	}
 	os.WriteFile(filepath.Join(scratch, "report.json"), []byte(reportTestDecision), 0o600)
 	os.WriteFile(filepath.Join(scratch, "bind.json"), []byte(`{"schema_version":1,"outcome":"published","exit":0}`), 0o600)
@@ -44,13 +58,13 @@ func TestProjectReportWritesAndChecksOneDocument(t *testing.T) {
 	}
 	// a document that was edited is not a report
 	raw, _ := os.ReadFile(path)
-	os.WriteFile(path, []byte(strings.Replace(string(raw), `"end": "published"`, `"end": "published!"`, 1)), 0o600)
+	os.WriteFile(path, []byte(strings.Replace(string(raw), `"end":"published"`, `"end":"published!"`, 1)), 0o600)
 	if code, _, _ := runWithStdin("", "project-report", "check", path); code != 3 {
 		t.Fatalf("an edited document checked")
 	}
 	// usage
 	for _, args := range [][]string{{"project-report"}, {"project-report", "write"}, {"project-report", "check"}, {"project-report", "nope"},
-		reportArgs(data, "/work/p", scratch, lock, "--status", "1")} {
+		reportArgs(data, "/work/p", scratch, lock, "--status", "1"), reportArgs(data, "/work/p", scratch, lock, "--asked", "1")} {
 		if code, _, _ := runWithStdin("", args...); code != 2 {
 			t.Errorf("%v: code %d, not usage", args, code)
 		}
@@ -60,13 +74,13 @@ func TestProjectReportWritesAndChecksOneDocument(t *testing.T) {
 	elsewhere := filepath.Join(t.TempDir(), "bind.json")
 	os.WriteFile(elsewhere, []byte(`{"schema_version":1,"outcome":"published","exit":0}`), 0o600)
 	os.Symlink(elsewhere, filepath.Join(scratch, "bind.json"))
-	if code, _, _ := runWithStdin("", reportArgs(data, "/work/q", scratch, lock)...); code != 0 {
+	if code, _, _ := runWithStdin("", withStatus(reportArgs(data, "/work/q", scratch, lock), "1")...); code != 0 {
 		t.Fatalf("write with a link piece: %d", code)
 	}
 	qkey, _ := projectlane.ReportKey("/work/q")
 	qfiles, _ := os.ReadDir(filepath.Join(data, "project-lane", "reports", qkey))
 	qraw, _ := os.ReadFile(filepath.Join(data, "project-lane", "reports", qkey, qfiles[0].Name()))
-	if !strings.Contains(string(qraw), `"end": "bind_unreadable"`) || strings.Contains(string(qraw), `"passed": true`) {
+	if !strings.Contains(string(qraw), `"end":"bind_unreadable"`) || strings.Contains(string(qraw), `"passed":true`) {
 		t.Fatalf("a binder piece that is a link was read:\n%s", qraw)
 	}
 }

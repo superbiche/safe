@@ -566,7 +566,7 @@ fz = find(r'(safe_gate_project_lane_cleanup\(\) \{\n)')
 fo = find(r'(safe_gate_project_lane_frozen_check\(\) \{\n)')
 # (the report function is where a helpful rebuild would be written: it is held like every other function of the lane, and the words
 # that run scripts live in its text function only)
-sr = find(r'(  local -a args=\(project-scripts --lock "\$\{lockfile\}" --limit 25\)\n)')
+sr = find(r'(  local -a args=\(project-scripts --lock "\$\{lockfile\}" --limit 100000\)\n)')
 write("a-rebuild-in-the-lane", src[:sr.end()] + '  node-gyp rebuild >/dev/null 2>&1\n' + src[sr.end():])
 write("a-bare-npm-in-the-lane", src[:sr.end()] + '  npm ci --ignore-scripts >/dev/null 2>&1\n' + src[sr.end():])
 write("an-npm-run-started-by-an-owner", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" run prepare --ignore-scripts || return 1\n' + src[fo.end():])
@@ -587,30 +587,39 @@ pj = find(r'    safe_gate_lane_npm_in "\$\{proj\}" --package-lock-only --ignore-
 write("projection-without-ignore-scripts", src[:pj.start()] + '    safe_gate_lane_npm_in "${proj}" --package-lock-only ' + src[pj.end():])
 bd = find(r'-- "\$\{SAFE_GATE_LANE_NPM\[@\]\}" "\$\{frozen_args\[@\]\}"\)')
 write("binder-given-something-else", src[:bd.start()] + '-- "${SAFE_GATE_LANE_NPM[@]}" "${proj_args[@]}")' + src[bd.end():])
-# R12 (ticket 1639): the scan after the lane is a report: it returns 0 and never exits, it is called once from the entry as `|| true`,
-# after the lock is released and before the scratch is freed, and the facts it rests on have owners
+# R12 (ticket 1639): the scan after the lane is a report: it returns 0 and never exits, it is called once from the one path every end goes
+# through, as `|| true`, after the lock is released and before the report and the scratch; the facts it rests on have owners
 sc = find(r'(safe_gate_project_lane_scan_report\(\) \{\n)')
 write("the-scan-exits", src[:sc.end()] + '  exit 3\n' + src[sc.end():])
 write("the-scan-returns-a-status", src[:sc.end()] + '  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" ]] || return 1\n' + src[sc.end():])
 sh = find(r'    safe_gate_project_lane_scan_report \|\| true\n')
 write("the-scan-status-is-not-swallowed", src[:sh.start()] + '    safe_gate_project_lane_scan_report\n' + src[sh.end():])
-write("the-scan-is-called-outside-the-entry", src[:fz.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[fz.end():])
-ul = find(r'  safe_gate_project_lane_unlock\n  if \(\( rc == 0 \)\)')
-write("the-scan-before-the-lock-is-released", src[:ul.start()] + '  safe_gate_project_lane_scan_report || true\n' + src[ul.start():])
+write("the-scan-is-called-outside-the-finishing-path", src[:fz.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[fz.end():])
+fl = find(r'(safe_gate_project_lane_finish\(\) \{\n  local [^\n]*\n  SAFE_GATE_LANE_FINISHING=1\n)  safe_gate_project_lane_unlock\n')
+write("the-scan-before-the-lock-is-released", src[:fl.end(1)] + '  safe_gate_project_lane_scan_report || true\n' + src[fl.end(1):])
 pf = find(r'    SAFE_GATE_LANE_FACT_PUBLISHED=tree\n')
 write("the-published-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_PUBLISHED=tree\n' + src[fz.end():])
-# R13 (ticket 1639): the report document has one writer, one caller, and nothing of the gate reads the reports directory
+write("the-finishing-path-started-outside-its-callers", src[:fz.end()] + '  safe_gate_project_lane_finish 0 normal\n' + src[fz.end():])
+fs = find(r'  SAFE_GATE_LANE_FINISHING=1\n')
+write("the-finishing-flag-raised-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FINISHING=1\n' + src[fz.end():])
+# R13 (ticket 1639): the report document has one writer, started once, called once from the finishing path, and the gate never names the reports directory
 wr = find(r'(safe_gate_project_lane_report_write\(\) \{\n)')
 write("the-report-writer-returns-a-status", src[:wr.end()] + '  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" ]] || return 1\n' + src[wr.end():])
-write("the-report-is-written-outside-the-entry", src[:fz.end()] + '  safe_gate_project_lane_report_write 0 || true\n' + src[fz.end():])
-rw = find(r'    safe_gate_project_lane_report_write "\$\{rc\}" \|\| true\n')
-write("the-report-status-is-not-swallowed", src[:rw.start()] + '    safe_gate_project_lane_report_write "${rc}"\n' + src[rw.end():])
+write("the-report-is-written-outside-the-finishing-path", src[:fz.end()] + '  safe_gate_project_lane_report_write 0 || true\n' + src[fz.end():])
+rw = find(r'    safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n')
+write("the-report-status-is-not-swallowed", src[:rw.start()] + '    safe_gate_project_lane_report_write "${public}" "${bound}"\n' + src[rw.end():])
 write("the-report-core-command-outside-its-writer", src[:fz.end()] + '  "${SAFE_GATE_LANE_CORE}" project-report write\n' + src[fz.end():])
 write("a-reader-of-the-reports-in-the-gate", src[:fz.end()] + '  cat -- "${SAFE_DATA_DIR}/project-lane/reports/x" 2>/dev/null\n' + src[fz.end():])
 write("a-listing-of-the-reports-in-the-runner", src[:fo.end()] + '  ls -- "${lane_dir}/reports"\n' + src[fo.end():])
-write("the-prompt-fact-written-outside-its-owner", src[:fz.end()] + '  SAFE_GATE_LANE_FACT_ENDED=accepted\n' + src[fz.end():])
-rs = find(r'    safe_gate_project_lane_scan_report \|\| true\n  fi\n')
-write("the-report-is-written-before-the-scan", src[:rs.start()] + '    safe_gate_project_lane_report_write "${rc}" || true\n' + src[rs.start():])
+write("the-runner-makes-the-reports-directory", src[:fo.end()] + '  safe_gate_lane_private_dir "${lane_dir}/reports" || return 1\n' + src[fo.end():])
+sd = find(r'(safe_gate_project_lane_scan_digest\(\) \{\n)')
+write("a-reader-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  ls -- "${SAFE_DATA_DIR}/project-lane/reports" >/dev/null 2>&1\n' + src[sd.end():])
+write("a-copy-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  cp -r -- "${SAFE_DATA_DIR}/project-lane/reports" "${TMPDIR}" 2>/dev/null\n' + src[sd.end():])
+write("a-second-invocation-inside-the-writer", src[:wr.end()] + '  "${core}" "${args[@]}" >/dev/null 2>&1\n' + src[wr.end():])
+write("a-second-writer-function-names-the-core-command", src[:sd.end()] + '  printf "%s" project-report\n' + src[sd.end():])
+fn_ = find(r'  safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n  fi\n  safe_gate_project_lane_cleanup\n')
+write("the-report-is-written-after-the-scratch-is-freed", src[:fn_.start()] + '  fi\n  safe_gate_project_lane_cleanup\n  safe_gate_project_lane_report_write "${public}" "${bound}" || true\n' + src[fn_.end():])
+write("the-finish-signal-written-outside-its-owners", src[:fz.end()] + '  SAFE_GATE_LANE_FINISH_SIGNAL=143\n' + src[fz.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
 def under_timeout(name, plain):
@@ -630,7 +639,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 64 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 70 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

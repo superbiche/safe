@@ -145,6 +145,19 @@ if [[ "${1:-}" == "package-audit" && "$*" == *"--evidence-only"* ]]; then
   jq -c '{schema_version: 1, roots: [.roots[] | {name, version, outcome: "clear", gate_exit: 0, line: "PASS (score=95)", causes: [], cached: false}], cached_blocks: [], cache_gap: "", untied: []}'
   exit 0
 fi
+# The whole-project scan, as the lane runs it after a publication (`repo-audit . --deps-only --result-out <file>`): it writes a result
+# document like the real auditor's, with what the scenario asks for (a critical finding in another ecosystem, scanners that are not ok, a
+# failing scan); without a result file asked for it writes none.
+if [[ "${1:-}" == "repo-audit" ]]; then
+  result_out=""; prev=""
+  for arg in "$@"; do [[ "${prev}" == "--result-out" ]] && result_out="${arg}"; prev="${arg}"; done
+  [[ "${LIVE_SCAN_EXIT:-0}" == 0 ]] || exit "${LIVE_SCAN_EXIT}"
+  [[ -z "${result_out}" ]] || jq -n --argjson py "${LIVE_SCAN_PYTHON_CRITICAL:-0}" --argjson partial "${LIVE_SCAN_PARTIAL:-0}" \
+    '{verdict: "GO", audit_totals: {critical: $py, by_ecosystem: (if $py > 0 then {python: {critical: $py}} else {} end)},
+      tool_status: (if $partial == 1 then {"osv-scanner": {status: "partial", note: "could not read a lockfile"}, syft: {status: "skipped", note: "unavailable"}, grype: {status: "ok", note: null}} else {grype: {status: "ok", note: null}} end),
+      ecosystem_audits: []}' > "${result_out}"
+  exit 0
+fi
 exit 0
 AUDIT
 chmod +x "${WORK}/safe/bin/safe-audit"
@@ -768,6 +781,40 @@ if (( status == 0 )) && jq -e '.scripts.install == "node husky install"' "${WORK
   pass "K2: the installed husky declares the install script that writes git hooks, and the project's repository holds none (no control runs a registry package's scripts; the loopback suite holds that scripts run when they are on)"
 else
   fail "K2: husky hooks in the repository: $(hooks_written "${WORK}/k"); or the installed package no longer declares the script this scenario reads"
+fi
+
+# --- scenario L: the project scan as a report, through the real gate (ticket 1639) -----------------------------------------------
+# The stand-in auditor beside the dispatcher implements `repo-audit`: it writes a result document with a critical finding in ANOTHER
+# ecosystem and scanners that are not ok. The lane prints the scan's lines after the install and the status is the install's.
+# (An earlier stand-in exited 0 for `repo-audit` and wrote nothing, which the lane read, correctly, as "left no readable result".)
+new_project "${WORK}/l" || { fail "scenario L project"; exit 1; }
+LIVE_SCAN_PYTHON_CRITICAL=2 LIVE_SCAN_PARTIAL=1 gate_in "${WORK}/l" "${WORK}/l" install semver@7.7.1
+status=$?
+sed 's/^/# L gate: /' "${WORK}/l.err" | tail -n 4
+if (( status == 0 )) && [[ -d "${WORK}/l/node_modules/semver" ]] \
+    && grep -qF 'safe: project lane: project scan: critical findings: python 2; detail: safe audit repo-audit .' "${WORK}/l.err" \
+    && grep -qF 'safe: project lane: project scan: scanner coverage: osv-scanner partial, syft skipped; that coverage is missing' "${WORK}/l.err" \
+    && ! grep -qF 'the lockfile it read is not the one this command published' "${WORK}/l.err" \
+    && ! grep -qF 'did not complete' "${WORK}/l.err"; then
+  pass "L1: a lane install of semver@7.7.1 through the real gate exits 0 and prints the scan's two lines (a critical finding in python, two scanners that are not ok)"
+else
+  fail "L1: exit ${status}; $(tail -n 4 "${WORK}/l.err")"
+fi
+report_file="$(find "${HOME}/.local/share/safe/project-lane/reports" -type f -name '*.json' -newer "${WORK}/l/package.json" 2>/dev/null | head -n 1)"
+if [[ -n "${report_file}" ]] && "${WORK}/safe/bin/safe-core" project-report check "${report_file}" \
+    && jq -e '.end == "published" and .passed == true and .status == 0 and .scan.status == "completed" and .scan.lockfile_published == true and .scan.summary.critical.python == 2
+              and (.scan.summary.coverage_gaps | map(.scanner + ":" + .status) | sort) == ["osv-scanner:partial", "syft:skipped"]' "${report_file}" >/dev/null; then
+  pass "L2: the document the real gate wrote checks, says published with status 0, and holds the scan's summary as typed values"
+else
+  fail "L2: the report document: ${report_file:-none}"
+fi
+new_project "${WORK}/l2" || { fail "scenario L project 2"; exit 1; }
+LIVE_SCAN_EXIT=3 gate_in "${WORK}/l2" "${WORK}/l2" install semver@7.7.1
+status=$?
+if (( status == 0 )) && grep -qF 'safe: project lane: project scan: did not complete (it failed); the project'"'"'s other ecosystems were not reported' "${WORK}/l2.err"; then
+  pass "L3: a scan that fails leaves the install's own status (0) and says so in one line"
+else
+  fail "L3: exit ${status}; $(tail -n 3 "${WORK}/l2.err")"
 fi
 
 # --- scenario J: the cooldown, on the real npm (ticket 1635) ---------------------------------------

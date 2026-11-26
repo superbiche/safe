@@ -386,3 +386,18 @@ func TestScriptsFilesPreviousRecordThatCannotBeReadIsSaid(t *testing.T) {
 		t.Fatalf("%+v %v", report, err)
 	}
 }
+
+// A version the lane admitted is a version the scripts report keeps: the lane's own grammar, not a shorter one.
+func TestScriptsKeepEveryVersionTheLaneAdmits(t *testing.T) {
+	long := "1.0.0-" + strings.Repeat("a", 65)
+	for _, v := range []string{"1.0.0", "1.2.3-beta.4+build.5", long} {
+		if got := printableVersion(v); got != v {
+			t.Errorf("%q was shown as %q", v, got)
+		}
+	}
+	for _, v := range []string{"1.0", "v1.0.0", "1.0.0 x", "", "1.0.0\n"} {
+		if got := printableVersion(v); got != "?" {
+			t.Errorf("%q was shown as %q", v, got)
+		}
+	}
+}

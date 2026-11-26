@@ -6,7 +6,6 @@ import (
 	"errors"
 	"regexp"
 	"sort"
-	"strings"
 
 	"github.com/superbiche/safe/internal/strictjson"
 )
@@ -34,18 +33,30 @@ type ScanSummary struct {
 	// Unattributed are the critical findings not attributed to an ecosystem of the known set: those of any other key, or all of them
 	// when the document has no breakdown, or one that does not add up to the total.
 	Unattributed int `json:"unattributed"`
-	// CoverageFailures are the scanners that did not run to completion, as names; CoverageOther counts those whose name does not read
-	// as one (or that do not fit the bound).
-	CoverageFailures []string `json:"coverage_failures"`
-	CoverageOther    int      `json:"coverage_other"`
+	// CoverageGaps are the scanners whose status is not "ok" (the producer's own rule: bin/safe-audit treats every scanner whose status is
+	// not ok as a gap), as the scanner's name and the status WORD, from the closed list ScanStatuses. No note is read. CoverageOther
+	// counts a gap whose name does not read as one, whose status is another word, or that does not fit the bound. CoverageUnreadable is
+	// true when a coverage section is there and cannot be read: that is not zero gaps.
+	CoverageGaps       []ScanGap `json:"coverage_gaps"`
+	CoverageOther      int       `json:"coverage_other"`
+	CoverageUnreadable bool      `json:"coverage_unreadable"`
 }
+
+// ScanGap is a scanner that did not give its whole coverage.
+type ScanGap struct {
+	Scanner string `json:"scanner"`
+	Status  string `json:"status"`
+}
+
+// ScanStatuses is the closed list of the producer's non-ok statuses.
+var ScanStatuses = map[string]bool{"partial": true, "skipped": true, "unavailable": true, "error": true}
 
 // ErrNoVerdict: the document is not one that carries a verdict.
 var ErrNoVerdict = errors.New("the scan result carries no verdict")
 
 // ReadScanSummary reads a scan result document.
 func ReadScanSummary(raw []byte) (ScanSummary, error) {
-	summary := ScanSummary{SchemaVersion: 1, Critical: map[string]int{}, CoverageFailures: []string{}}
+	summary := ScanSummary{SchemaVersion: 1, Critical: map[string]int{}, CoverageGaps: []ScanGap{}}
 	members, err := strictjson.ParseObject(raw)
 	if err != nil {
 		return summary, ErrNoVerdict
@@ -73,46 +84,80 @@ func ReadScanSummary(raw []byte) (ScanSummary, error) {
 			}
 		}
 	}
-	names := map[string]bool{}
+	gaps := map[ScanGap]bool{}
 	other := 0
-	note := func(name string) {
-		if scannerName.MatchString(name) {
-			names[name] = true
-		} else {
+	note := func(name, status string) {
+		switch {
+		case scannerName.MatchString(name) && ScanStatuses[status]:
+			gaps[ScanGap{Scanner: name, Status: status}] = true
+		default:
 			other++
 		}
 	}
-	var status map[string]json.RawMessage
-	if json.Unmarshal(members["tool_status"], &status) == nil {
-		for name, value := range status {
-			if scanBroken(value) {
-				note(name)
+	// status reads a scanner's status word the producer's way: absent is ok; present and not a string is unreadable.
+	status := func(raw json.RawMessage) (word string, readable bool) {
+		var entry map[string]json.RawMessage
+		if json.Unmarshal(raw, &entry) != nil || entry == nil {
+			return "", false
+		}
+		value, present := entry["status"]
+		if !present {
+			return "ok", true
+		}
+		if json.Unmarshal(value, &word) != nil {
+			return "", false
+		}
+		return word, true
+	}
+	if raw, present := members["tool_status"]; present {
+		var tools map[string]json.RawMessage
+		if json.Unmarshal(raw, &tools) != nil || tools == nil {
+			summary.CoverageUnreadable = true
+		}
+		for name, value := range tools {
+			word, readable := status(value)
+			switch {
+			case !readable:
+				summary.CoverageUnreadable = true
+			case word != "ok":
+				note(name, word)
 			}
 		}
 	}
-	var audits []json.RawMessage
-	if json.Unmarshal(members["ecosystem_audits"], &audits) == nil {
+	if raw, present := members["ecosystem_audits"]; present {
+		var audits []json.RawMessage
+		if json.Unmarshal(raw, &audits) != nil || audits == nil {
+			summary.CoverageUnreadable = true
+		}
 		for _, value := range audits {
-			if !scanBroken(value) {
+			word, readable := status(value)
+			if !readable {
+				summary.CoverageUnreadable = true
+				continue
+			}
+			if word == "ok" {
 				continue
 			}
 			var named struct {
 				Scanner string `json:"scanner"`
 			}
-			if json.Unmarshal(value, &named) != nil || named.Scanner == "" {
-				note("unknown")
-				continue
-			}
-			note(named.Scanner)
+			_ = json.Unmarshal(value, &named)
+			note(named.Scanner, word)
 		}
 	}
-	for name := range names {
-		summary.CoverageFailures = append(summary.CoverageFailures, name)
+	for gap := range gaps {
+		summary.CoverageGaps = append(summary.CoverageGaps, gap)
 	}
-	sort.Strings(summary.CoverageFailures)
-	if len(summary.CoverageFailures) > maxScanFailures {
-		other += len(summary.CoverageFailures) - maxScanFailures
-		summary.CoverageFailures = summary.CoverageFailures[:maxScanFailures]
+	sort.Slice(summary.CoverageGaps, func(i, j int) bool {
+		a, b := summary.CoverageGaps[i], summary.CoverageGaps[j]
+		if a.Scanner != b.Scanner {
+			return a.Scanner < b.Scanner
+		}
+		return a.Status < b.Status
+	})
+	if len(summary.CoverageGaps) > maxScanFailures {
+		other += len(summary.CoverageGaps) - maxScanFailures
+		summary.CoverageGaps = summary.CoverageGaps[:maxScanFailures]
 	}
 	summary.CoverageOther = other
 	return summary, nil
@@ -160,27 +205,4 @@ func breakdownOf(members map[string]json.RawMessage, total int) (map[string]int,
 		sum += entry.Critical
 	}
 	return counts, sum == total
-}
-
-// scanBroken is the gate's predicate: status "error", or a status that is not "ok" whose note says it failed or errored.
-func scanBroken(raw json.RawMessage) bool {
-	var entry struct {
-		Status string `json:"status"`
-		Note   string `json:"note"`
-	}
-	if json.Unmarshal(raw, &entry) != nil {
-		return false
-	}
-	status := entry.Status
-	if status == "" {
-		status = "ok"
-	}
-	if status == "error" {
-		return true
-	}
-	if status == "ok" {
-		return false
-	}
-	text := strings.ToLower(entry.Note)
-	return strings.Contains(text, "fail") || strings.Contains(text, "error")
 }
