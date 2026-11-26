@@ -44,6 +44,7 @@ FIXTURES = {
     "dep-chain-a": [package("dep-chain-a", "1.0.0", S("postinstall"), {"dependencies": {"dep-chain-b": "1.0.0"}})],
     "dep-chain-b": [package("dep-chain-b", "1.0.0", S("postinstall"))],
     "dep-update": [package("dep-update", "1.0.0", S("install")), package("dep-update", "1.0.1", S("install"))],
+    "dep-both": [package("dep-both", "1.0.0", S("postinstall"), None, {"binding.gyp": GYP})],
     "dep-plain": [package("dep-plain", "1.0.0")],
 }
 

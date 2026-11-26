@@ -11,7 +11,7 @@ import (
 
 // project-scripts reads, from data only, what a lane command put in the project that has install-time scripts (the lane runs none; the
 // operator is told which did not run). Exits 0 with the document on stdout, 3 when an input cannot be read, 2 for usage.
-const projectScriptsUsage = "safe-core: usage: safe-core project-scripts --lock <judged lockfile> [--tree <node_modules dir>] [--previous <hidden lockfile>] [--all] [--manifest <package.json> --project <dir>] [--limit <n>]"
+const projectScriptsUsage = "safe-core: usage: safe-core project-scripts --lock <judged lockfile> [--tree <node_modules dir>] [--previous <hidden lockfile> | --previous-unreadable] [--manifest <package.json> --project <dir>] [--limit <n>]"
 
 func projectScripts(args []string, stdout, stderr io.Writer) int {
 	usage := func() int {
@@ -22,11 +22,11 @@ func projectScripts(args []string, stdout, stderr io.Writer) int {
 	req := projectlane.ScriptsRequest{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--all":
-			if req.All {
+		case "--previous-unreadable":
+			if req.PreviousUnreadable {
 				return usage()
 			}
-			req.All = true
+			req.PreviousUnreadable = true
 		case "--lock", "--tree", "--previous", "--manifest", "--project", "--limit":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return usage()
@@ -40,7 +40,7 @@ func projectScripts(args []string, stdout, stderr io.Writer) int {
 			return usage()
 		}
 	}
-	if values["--lock"] == "" || (values["--manifest"] != "") != (values["--project"] != "") {
+	if values["--lock"] == "" || (values["--manifest"] != "") != (values["--project"] != "") || (req.PreviousUnreadable && values["--previous"] != "") {
 		return usage()
 	}
 	req.TreeRoot = values["--tree"]

@@ -3,16 +3,21 @@
 ## Unreleased
 
 - Project lane (behind `install.project_lane`): the lane runs no lifecycle script and says which ones it did not run (ticket 1638). A
-  separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs (not the project's own
-  scripts, not npm's order, not npm's handling of a failure), so none runs. After a verified publication one section names, from the
-  judged lockfile and the published tree only (`safe-core project-scripts`, new), the packages the command put into the tree that
-  have install-time scripts (a bundled member with its host; npm's implicit native build included), the project's own install-time
-  scripts for a bare `install` and `ci`, and the command that runs them (`npm rebuild ./node_modules/<name>`, `npm run <event>`),
-  with npm's own script policy applying to it. The tree wins over the lockfile's `hasInstallScript` where they disagree. A command
-  that introduces nothing with scripts says nothing; at most 25 packages are listed. New live suite `tests/live/project_lane_no_scripts.sh`
-  (a local registry of marker fixtures, the lane's projection and binder, npm 11.20.0 and 12.2.1, controls with scripts on); the lane
-  lint (R11) refuses an npm of the lane without `--ignore-scripts` and any `rebuild`, `run-script` or script-enabling word. The tree
-  reader opens a manifest without blocking on a FIFO.
+  separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs, so none runs. After a
+  verified publication one section names, from the judged lockfile and the published tree only (`safe-core project-scripts`, new), the
+  packages the command put into the tree that have install-time scripts (a bundled member with its outermost host, introduced when
+  that host is; npm's implicit native build, a `binding.gyp` file, included), a package whose scripts the lockfile entry does not
+  declare apart with what npm does about it (measured: `npm ci` and `npm rebuild` run nothing for a script, the build for a
+  `binding.gyp`), a package it could not read apart, the project's own install-time scripts for a bare `install` and `ci` (one `npm run
+  <event> --ignore-scripts` per defined event: measured to run the named event alone), and the `npm rebuild ./node_modules/<name>`
+  command. The lines are held to a grammar token by token, fail as a whole when one token is outside it, and are printed as they are
+  (the diagnostic cleaner turned `basic`, `token`, `bearer` followed by a path into `***`); an unreadable previous record, a reader that
+  fails, prints nothing or answers another version is said, with what failed. A command that introduces nothing with scripts says
+  nothing; at most 25 packages per group are listed. Live suites: `tests/live/project_lane_no_scripts.sh` (a local registry of marker
+  fixtures, the lane's projection and binder, npm 11.20.0 and 12.2.1, with the measures the report rests on) and scenario K of
+  `tests/live/project_lane_binding.sh` (husky@4.3.8 through the real gate: the report, and no git hook written). The lane lint (R11)
+  refuses an npm of the lane without `--ignore-scripts`, a bare `npm`, and script words outside the report's text function, which is held
+  to being one jq program. The tree reader opens a manifest without blocking on a FIFO.
 - Project lane, standing decision: the route's one deadline reaches a question in flight. No step of the route runs
   under `timeout`, which puts its command in a process group of its own: an npm started late would have outlived the
   deadline that stops the route's group, and written in a scratch directory already removed.

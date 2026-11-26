@@ -734,6 +734,43 @@ else
   fail "the exit-99 launcher control: gate exit ${status}, launcher ran: $([[ -f "${WORK}/launcher99.ran" ]] && echo yes || echo no), assertions said: ${problems:-nothing}"
 fi
 
+# --- scenario K: the scripts report on a real tree, through the real gate (ticket 1638) -----------------------------------------
+# husky@4.3.8 (published 2021-01-15, far older than the cooldown window, so its graph is judged as of T1 like the others): a registry
+# package whose own `install` script (`node husky install`) writes git hooks into the project's repository, and a `postinstall`. The lane
+# runs neither; the section names the package, the script events and the command that runs them. The script leaves something
+# observable, so the scenario also holds that nothing was written: the project's .git/hooks has no hook. A control installs the same
+# package with scripts on, in a repository of its own, to show that the hooks do appear (so that the absence can fail); if the control
+# writes none on this machine (husky skips itself when it thinks it runs in CI), the scenario proves the report and not the absence, and
+# says so.
+new_project "${WORK}/k" && new_project "${WORK}/k-control" || { fail "scenario K projects"; exit 1; }
+( cd "${WORK}/k-control" && unset CI CONTINUOUS_INTEGRATION HUSKY_SKIP_INSTALL && real_npm install husky@4.3.8 --ignore-scripts=false --no-audit --no-fund >"${WORK}/k-control.out" 2>&1 )
+hooks_written() { # <repository>: the number of git hooks husky wrote
+  local hook count=0
+  for hook in "$1"/.git/hooks/*; do [[ -f "${hook}" ]] && grep -q husky "${hook}" 2>/dev/null && count=$((count + 1)); done
+  printf '%s' "${count}"
+}
+control_hooks="$(hooks_written "${WORK}/k-control")"
+gate_in "${WORK}/k" "${WORK}/k" install husky@4.3.8
+status=$?
+sed 's/^/# K gate: /' "${WORK}/k.err" | tail -n 5
+if (( status == 0 )) && [[ -d "${WORK}/k/node_modules/husky" ]] \
+    && grep -q 'install scripts did not run (the lane installs with scripts off): 1 introduced package(s) have them: husky@4.3.8 (install, postinstall)' "${WORK}/k.err" \
+    && grep -q "scripts: to run them: npm rebuild ./node_modules/husky; npm's own script policy applies to that command" "${WORK}/k.err" \
+    && ! grep -q "this project's own install-time scripts" "${WORK}/k.err"; then
+  pass "K1: a lane install of husky@4.3.8 through the real gate names the package, its events and the command that runs them (and not the project's own scripts: the install names a package)"
+else
+  fail "K1: exit ${status}; $(tail -n 4 "${WORK}/k.err")"
+fi
+if (( control_hooks > 0 )); then
+  if [[ "$(hooks_written "${WORK}/k")" == 0 ]]; then
+    pass "K2: husky's install script writes ${control_hooks} git hook(s) when run (control), and the lane's install wrote none: the script did not run"
+  else
+    fail "K2: the lane's install left husky hooks in the repository"
+  fi
+else
+  printf '# K2: the control installed husky with scripts on and it wrote no hook here (husky skips itself in some environments): this scenario proves the report, not the absence\n'
+fi
+
 # --- scenario J: the cooldown, on the real npm (ticket 1635) ---------------------------------------
 # The window is WINDOW days (the cutoff is T1). npm's release-age filter is on every command line of the lane, so a bare
 # install resolves nothing younger than the window and the report lists nothing young; a version the caller names exactly

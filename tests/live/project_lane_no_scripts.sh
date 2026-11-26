@@ -14,6 +14,12 @@
 # wiring around the binder (the hermetic suite pins the frozen command's flags and that the lane starts no other npm), and a
 # canonical-registry artifact whose scripts a real publisher wrote.
 #
+# It also holds what the report says about RUNNING them (measured on both versions; the report's words rest on these): for a package whose
+# lockfile entry lacks hasInstallScript, `npm ci` and `npm rebuild <path>` run nothing for an install-time script, run the implicit native
+# build for a binding.gyp, and for a postinstall plus a binding.gyp `npm ci` runs only the build while `npm rebuild` runs both; and
+# `npm run <event> --ignore-scripts` runs the named event alone, for each of the seven events, also with ignore-scripts=true in the user
+# configuration.
+#
 # Controls, so that the suite can fail: the same project installed by plain `npm ci` with scripts on writes the markers (the
 # dependency's, the bundled member's, the native build's and the project's own seven); and the binder given a frozen command without
 # --ignore-scripts writes the dependencies' markers.
@@ -119,7 +125,7 @@ lane_case() { # <version> <label> <verb> <setup>: runs the lane's way, asserts n
       cp "${judged}/package-lock.json" "${project}/package-lock.json"
       judged="$(project_verb "${node}" "${project}" install dep-host@1.0.0 dep-gyp@1.0.0 dep-all@1.0.0 dep-bin@1.0.0 dep-chain-a@1.0.0)" || { fail "${version}: ${label}: the projection failed"; return; } ;;
     "update")
-      new_project "${project}" "\"dependencies\":{\"dep-update\":\"^1.0.0\",\"dep-host\":\"1.0.0\"},${ROOT_SCRIPTS}"
+      new_project "${project}" "\"dependencies\":{\"dep-update\":\"^1.0.0\",\"dep-host\":\"1.0.0\",\"dep-gyp\":\"1.0.0\"},${ROOT_SCRIPTS}"
       judged="$(project_verb "${node}" "${project}" install dep-update@1.0.0)" || { fail "${version}: ${label}: the base projection failed"; return; }
       cp "${judged}/package-lock.json" "${project}/package-lock.json"
       judged="$(project_verb "${node}" "${project}" update)" || { fail "${version}: ${label}: the projection failed"; return; }
@@ -135,7 +141,7 @@ lane_case() { # <version> <label> <verb> <setup>: runs the lane's way, asserts n
   jq -e '.outcome == "published" and .verification.ok == true' "${WORK}/bind.json" >/dev/null 2>&1 || { fail "${version}: ${label}: not a verified publication: $(head -c 300 "${WORK}/bind.json")"; return; }
   # the tree is there (so that no marker is not an empty tree), bundled member, native-build package and bin package included
   case "${label}" in
-    "update") tree_has "${project}" dep-update dep-host dep-host/node_modules/dep-bundled || { fail "${version}: ${label}: the tree lacks its packages"; return; } ;;
+    "update") tree_has "${project}" dep-update dep-host dep-host/node_modules/dep-bundled dep-gyp || { fail "${version}: ${label}: the tree lacks its packages"; return; } ;;
     *) tree_has "${project}" dep-install ${verb:+dep-host dep-host/node_modules/dep-bundled dep-gyp dep-all dep-bin dep-chain-a dep-chain-b} || { fail "${version}: ${label}: the tree lacks its packages"; return; } ;;
   esac
   if markers_absent; then pass "${version}: lane ${label}: verified tree published, no marker (no dependency, bundled member, native build or project script ran)"
@@ -165,6 +171,56 @@ control_case() { # <version>: the same fixtures with scripts ON write the marker
   else fail "${version}: control: the frozen install without --ignore-scripts wrote no marker: $(head -c 400 "${WORK}/bind.json") $(head -c 400 "${WORK}/bind.err")"; fi
 }
 
+
+# What the report says about running the scripts it names (measured on the lane's own published tree).
+claims_case() { # <version>
+  local version="$1" node="${MISE}/${NODE_OF[$1]}" project="${WORK}/proj-claims" judged shape name flag expect_ci expect_rb got_ci got_rb extra=() ev
+  [[ "${version}" != 12.* ]] || extra=(--dangerously-allow-all-scripts)
+  for shape in "dep-install|absent||" "dep-gyp|absent|dep-gyp install;|dep-gyp install;" "dep-both|absent|dep-both install;|dep-both install;dep-both postinstall;" "dep-install|present||dep-install install;"; do
+    IFS='|' read -r name flag expect_ci expect_rb <<<"${shape}"
+    new_project "${project}" "\"dependencies\":{\"${name}\":\"1.0.0\"}"
+    judged="$(project_verb "${node}" "${project}" install)" || { fail "${version}: claims ${name}: the projection failed"; return; }
+    if [[ "${flag}" == absent ]]; then
+      jq -c 'del(.packages["node_modules/'"${name}"'"].hasInstallScript)' "${judged}/package-lock.json" > "${judged}/lock.new" && mv "${judged}/lock.new" "${judged}/package-lock.json"
+    fi
+    # plain `npm ci` with scripts on, from that lockfile
+    : > "${MARKS}"; rm -rf "${WORK}/proj-claims-ci"; mkdir -p "${WORK}/proj-claims-ci"
+    cp "${project}/package.json" "${project}/.npmrc" "${WORK}/proj-claims-ci/"; cp "${judged}/package-lock.json" "${WORK}/proj-claims-ci/"
+    npm_in "${node}" "${WORK}/proj-claims-ci" ci --no-audit --no-fund "${extra[@]}" $(dest) >/dev/null 2>&1
+    got_ci="$(sort -u "${MARKS}" | tr '\n' ';')"
+    # the lane's tree (verified, published), then `npm rebuild <path>` with scripts on
+    : > "${MARKS}"; cp "${judged}/package-lock.json" "${project}/package-lock.json.judged"
+    bind "${node}" "${project}" "${judged}" ci --ignore-scripts --no-audit --no-fund $(dest) || { fail "${version}: claims ${name}: the binder failed"; return; }
+    npm_in "${node}" "${project}" rebuild "./node_modules/${name}" --no-audit --no-fund "${extra[@]}" $(dest) >/dev/null 2>&1
+    got_rb="$(sort -u "${MARKS}" | tr '\n' ';')"
+    if [[ "${flag}" == absent ]]; then
+      if [[ "${got_ci}" == "${expect_ci}" && "${got_rb}" == "${expect_rb}" ]]; then pass "${version}: ${name}, lockfile flag absent: npm ci ran [${got_ci}], npm rebuild on the lane's tree ran [${got_rb}]"
+      else fail "${version}: ${name}, lockfile flag absent: npm ci ran [${got_ci}] (want [${expect_ci}]), npm rebuild ran [${got_rb}] (want [${expect_rb}])"; fi
+    else
+      if [[ "${got_rb}" == "${expect_rb}" ]]; then pass "${version}: ${name}, lockfile flag present (control): npm rebuild on the lane's tree ran [${got_rb}]"
+      else fail "${version}: ${name}, flag present: npm rebuild ran [${got_rb}] (want [${expect_rb}])"; fi
+    fi
+  done
+  # `npm run <event> --ignore-scripts` runs the named event alone: each of the seven, with the user's configuration saying ignore-scripts=true
+  local rootdir="${WORK}/proj-run" names=()
+  for ev in preinstall install postinstall prepublish preprepare prepare postprepare; do names+=("${ev}" "pre${ev}" "post${ev}"); done
+  rm -rf "${rootdir}"; mkdir -p "${rootdir}"
+  printf '%s\n' "${names[@]}" | sort -u | jq -R --arg w "${WORK}" '{(.): ("node " + $w + "/marks/event.js")}' | jq -sc '{name:"root",version:"1.0.0",scripts:add}' > "${rootdir}/package.json"
+  printf "const fs=require('fs');fs.appendFileSync(%s,process.env.npm_lifecycle_event+'\\\\n');\n" "'${MARKS}'" > "${WORK}/marks/event.js"
+  printf 'ignore-scripts=true\n' > "${WORK}/home/.npmrc"
+  local bad=""
+  for ev in preinstall install postinstall prepublish preprepare prepare postprepare; do
+    : > "${MARKS}"
+    npm_in "${node}" "${rootdir}" run "${ev}" --ignore-scripts >/dev/null 2>&1
+    [[ "$(tr '\n' ' ' < "${MARKS}")" == "${ev} " ]] || bad="${bad} ${ev}=[$(tr '\n' ' ' < "${MARKS}")]"
+  done
+  : > "${MARKS}"; rm -f "${WORK}/home/.npmrc"
+  npm_in "${node}" "${rootdir}" run postinstall >/dev/null 2>&1
+  [[ "$(tr '\n' ' ' < "${MARKS}")" == "prepostinstall postinstall postpostinstall " ]] || bad="${bad} control=[$(tr '\n' ' ' < "${MARKS}")]"
+  if [[ -z "${bad}" ]]; then pass "${version}: npm run <event> --ignore-scripts runs the named event alone, for each of the seven, with ignore-scripts=true in the user configuration (control: without the flag the pre- and post- hooks run too)"
+  else fail "${version}: npm run <event> --ignore-scripts:${bad}"; fi
+}
+
 TAG=none
 ran=0
 for version in 11.20.0 12.2.1; do
@@ -177,6 +233,7 @@ for version in 11.20.0 12.2.1; do
   printf '# npm %s\n' "${version}"
   TAG="${version}"
   control_case "${version}"
+  claims_case "${version}"
   for label in "install (bare)" "install (naming a package)" "update" "ci"; do lane_case "${version}" "${label}" "${label}"; done
 done
 (( ran > 0 )) || { printf 'SKIP: no npm build to run\n'; exit 0; }

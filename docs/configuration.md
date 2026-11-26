@@ -242,19 +242,34 @@ pass and warnings under `environment.release_follow`.
   (`ignore-scripts=true`) today's gate runs none either. After a verified publication the lane says which scripts did not run, from
   data only (`safe-core project-scripts`: the judged lockfile and the published tree, never npm's messages, never a question to npm):
   the packages the command put into the tree (new or changed against the previous tree's own record, `node_modules/.package-lock.json`;
-  every package for `ci`) that declare a `preinstall`, `install` or `postinstall` script or that npm would build natively on its own (a
-  `binding.gyp`, no `install` and no `preinstall` script, `gypfile` not false: measured on both versions), a bundled member with its
-  host; for a bare `install` and for `ci`, the project's own install-time scripts, and not for an install that names packages. The
-  report names the command that runs them (`npm rebuild ./node_modules/<name> …`, a bundled member through its host's path; `npm run
-  install`, `npm run prepare` and the others measured to fire the same events) and says that npm's own script policy applies to it; it
-  prints no option that overrides that policy. **The tree decides where the two sources disagree:** npm's own install trusts the
-  lockfile's `hasInstallScript` over what is on disk (measured: with the flag removed, `npm ci` skipped an install script that `npm
-  rebuild` runs), so a package whose files have scripts its lockfile entry does not declare is listed and marked. `--dry-run` and
-  `--package-lock-only` publish no tree: the report is then the lockfile's `hasInstallScript` alone for what the command would
-  introduce, labelled as such, and the project's own scripts are not named. At most 25 packages are listed, with the count of the
-  rest and `npm rebuild` alone for all; a name is cleaned like every other the lane prints. A command that introduced nothing with
-  scripts says nothing about scripts. Accepted limit: the previous tree's record is the project's own file (a forged one can only make
-  the report smaller, never the lane run anything).
+  every package for `ci`, which builds a whole new tree and is given no record) that declare a `preinstall`, `install` or `postinstall`
+  script or that npm builds natively on its own (a `binding.gyp` FILE, a link to one included, no `install` and no `preinstall` script,
+  `gypfile` not false: measured on both versions; a directory of that name is no native build). A bundled member has no resolved
+  location and no integrity of its own, its bytes come from its outermost host's tarball: it is introduced when that host's artifact is
+  (version, resolved, integrity) or when its own entry is, and it is named with that host. For a bare `install` and for `ci`, the
+  project's own install-time scripts, and not for an install that names packages. The commands are the ones measured: `npm rebuild
+  ./node_modules/<name> …` (a bundled member through its outermost host's path), and for the project's own scripts one `npm run
+  <event> --ignore-scripts` per defined event in npm's order (measured on both versions, also with `ignore-scripts=true` in the user
+  configuration: an explicitly named script runs whatever npm's script policy says, and its pre- and post- scripts do not run, which a
+  plain `npm run <event>` would). npm's script policy applies to the `npm rebuild`. The lines are built from tokens held to a grammar (a
+  package name, a version, an install path of `node_modules/<name>` steps, an event of a closed list, a host as `name@version`), checked
+  once in the core and again where the text is made; one token outside its grammar, an unreadable document, a document of another
+  version or a reader that fails gives the line "the report ... could not be read: <what failed>" and none of the document's text. The
+  lines are printed as they are: the lane's diagnostic cleaner is not applied, because it reads `basic`, `token` or `bearer` followed by
+  text as a credential and would turn a pasted `npm rebuild ./node_modules/basic ./node_modules/x` into a wildcard. **The tree decides where
+  the two sources disagree, and a package the lockfile entry does not declare is named apart** (measured on npm 11.20.0 and 12.2.1, on
+  the tree the lane publishes, the flag absent): `npm ci` and `npm rebuild <path>` with scripts on run nothing for a package whose only
+  install-time script is a script; run the native build of a package that has a `binding.gyp`; and for a script with a `binding.gyp`
+  `npm ci` runs only the build while `npm rebuild` runs the build and the script. Such a package is listed after the declared ones with
+  that sentence, and its path is in the command only where `npm rebuild` runs something for it; no workaround is printed. A package whose
+  directory or `package.json` cannot be read is named apart ("could not be read, so nothing is said ... and no command is given"), and
+  when the previous tree's record cannot be read the line says every package is counted as introduced. `--dry-run` and
+  `--package-lock-only` publish no tree: the report is then the lockfile's `hasInstallScript` alone for what the command would introduce,
+  labelled as such, with no command, and the project's own scripts are not named. At most 25 packages are listed per group, with the
+  count of the rest (the full list is the differential document's, ticket 1639), and the command says that `npm rebuild` with no
+  argument rebuilds every package of the tree, those already present included. A command that introduced nothing with scripts says
+  nothing about scripts. The copy of the previous tree's record is bounded in time and size and is not made for `ci`. Accepted limit: the
+  previous tree's record is the project's own file (a forged one can only make the report smaller, never the lane run anything).
   **How each verb yields its plan.** `install` and `update`: the original arguments resolved in the
   scratch copy, lockfile only. `dedupe` and `prune`: the same, with the verb's own arguments (npm writes
   a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries

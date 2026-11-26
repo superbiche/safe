@@ -64,10 +64,19 @@ func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 	writePackage(t, tree, "plain-gyp", `{}`, "binding.gyp")                               // the implicit build
 	writePackage(t, tree, "prepare-only", `{"scripts":{"prepare":"x","prepublish":"y"}}`) // not install-time of a dependency
 	writePackage(t, tree, "empty-script", `{"scripts":{"install":""}}`)                   // an empty script is no script
+	writePackage(t, tree, "dir-gyp", `{}`)                                                // a DIRECTORY named binding.gyp is no native build
+	if err := os.Mkdir(filepath.Join(tree, "dir-gyp", "binding.gyp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writePackage(t, tree, "link-gyp", `{}`, "real.gyp")
+	if err := os.Symlink("real.gyp", filepath.Join(tree, "link-gyp", "binding.gyp")); err != nil {
+		t.Fatal(err)
+	}
 	lock := lockOf(map[string]string{
 		"node_modules/a": entryOf("1.0.0", `,"hasInstallScript":true`), "node_modules/pre-gyp": entryOf("1.0.0", ""),
 		"node_modules/post-gyp": entryOf("1.0.0", ""), "node_modules/install-gyp": entryOf("1.0.0", ""), "node_modules/off-gyp": entryOf("1.0.0", ""),
 		"node_modules/plain-gyp": entryOf("1.0.0", ""), "node_modules/prepare-only": entryOf("1.0.0", ""), "node_modules/empty-script": entryOf("1.0.0", ""),
+		"node_modules/dir-gyp": entryOf("1.0.0", ""), "node_modules/link-gyp": entryOf("1.0.0", ""),
 		"node_modules/gone": entryOf("1.0.0", `,"hasInstallScript":true`), // omitted: not in the tree
 	})
 	report, err := ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree})
@@ -75,7 +84,11 @@ func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := map[string]ScriptPackage{}
+	declared := map[string]bool{}
 	for _, p := range report.Packages {
+		got[p.Path], declared[p.Path] = p, true
+	}
+	for _, p := range report.Undeclared {
 		got[p.Path] = p
 	}
 	want := map[string]struct {
@@ -88,14 +101,15 @@ func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 		"node_modules/post-gyp":    {[]string{"postinstall"}, true, false},
 		"node_modules/install-gyp": {[]string{"install"}, false, false},
 		"node_modules/plain-gyp":   {[]string{}, true, false},
+		"node_modules/link-gyp":    {[]string{}, true, false}, // a link to a file is a file, as npm sees it
 	}
-	if len(got) != len(want) || report.Total != len(want) || report.Source != ScriptsSource {
-		t.Fatalf("packages %v total %d source %s", pathsOf(report), report.Total, report.Source)
+	if len(got) != len(want) || report.Total != 1 || report.UndeclaredTotal != len(want)-1 || report.UnreadTotal != 0 || report.Source != ScriptsSource {
+		t.Fatalf("packages %v undeclared %v unread %v", pathsOf(report), report.UndeclaredTotal, report.UnreadTotal)
 	}
 	for key, w := range want {
 		p, ok := got[key]
-		if !ok || !reflect.DeepEqual(p.Events, w.events) || p.Native != w.native || p.Declared != w.declared {
-			t.Fatalf("%s: %+v, want %+v", key, p, w)
+		if !ok || !reflect.DeepEqual(p.Events, w.events) || p.Native != w.native || declared[key] != w.declared {
+			t.Fatalf("%s: %+v declared=%v, want %+v", key, p, declared[key], w)
 		}
 	}
 }
@@ -108,7 +122,7 @@ func TestScriptsLockfileAloneUsesTheDeclaredFlag(t *testing.T) {
 	}
 }
 
-func TestScriptsBundledMemberIsNamedWithItsHostAndRebuiltThroughTheOutermost(t *testing.T) {
+func TestScriptsBundledMemberIsNamedWithItsOutermostHostAndRebuiltThroughIt(t *testing.T) {
 	tree := t.TempDir()
 	writePackage(t, tree, "host", `{}`)
 	writePackage(t, tree, "host/node_modules/mid", `{}`)
@@ -123,8 +137,59 @@ func TestScriptsBundledMemberIsNamedWithItsHostAndRebuiltThroughTheOutermost(t *
 		t.Fatalf("%+v %v", report, err)
 	}
 	p := report.Packages[0]
-	if p.Name != "leaf" || p.Version != "4.0.0" || p.Host != "mid@3.0.0" || p.RebuildPath != "node_modules/host" {
+	if p.Name != "leaf" || p.Version != "4.0.0" || p.Host != "host@2.0.0" || p.RebuildPath != "node_modules/host" {
 		t.Fatalf("%+v", p)
+	}
+}
+
+// A bundled entry has no resolved location and no integrity: its bytes come from the tarball of its outermost host. The member is
+// introduced when that host's artifact is, whatever its own entry says (the family "a bundled member judged apart from its host").
+func TestScriptsBundledMemberIsIntroducedWhenItsHostIs(t *testing.T) {
+	tree := t.TempDir()
+	writePackage(t, tree, "host", `{}`)
+	writePackage(t, tree, "host/node_modules/mid", `{}`)
+	writePackage(t, tree, "host/node_modules/mid/node_modules/leaf", `{"scripts":{"postinstall":"x"}}`)
+	writePackage(t, tree, "alone/node_modules/leaf2", `{"scripts":{"postinstall":"x"}}`)
+	build := func(hostEntry string, mid, leaf string) []byte {
+		return lockOf(map[string]string{
+			"node_modules/host":                                    hostEntry,
+			"node_modules/host/node_modules/mid":                   mid,
+			"node_modules/host/node_modules/mid/node_modules/leaf": leaf,
+		})
+	}
+	bundled := func(v string) string { return entryOf(v, `,"inBundle":true`) }
+	member := strings.Replace(bundled("1.0.0"), `"resolved":"https://registry.npmjs.org/x/-/x-1.0.0.tgz","integrity":"sha512-AAAA",`, "", 1)
+	if member == bundled("1.0.0") {
+		member = `{"version":"1.0.0","inBundle":true,"hasInstallScript":true}`
+	}
+	leaf := `{"version":"1.0.0","inBundle":true,"hasInstallScript":true}`
+	mid := `{"version":"1.0.0","inBundle":true}`
+	previous := build(entryOf("1.0.0", ""), mid, leaf)
+	cases := []struct {
+		name string
+		lock []byte
+		want []string
+	}{
+		{"host unchanged, members unchanged: nothing", build(entryOf("1.0.0", ""), mid, leaf), nil},
+		{"host version changed, member entries identical", build(entryOf("2.0.0", ""), mid, leaf), []string{"node_modules/host/node_modules/mid/node_modules/leaf"}},
+		{"host integrity changed at the same version", build(strings.Replace(entryOf("1.0.0", ""), "AAAA", "BBBB", 1), mid, leaf), []string{"node_modules/host/node_modules/mid/node_modules/leaf"}},
+		{"host resolved changed at the same version", build(strings.Replace(entryOf("1.0.0", ""), "registry.npmjs.org", "other.example", 1), mid, leaf), []string{"node_modules/host/node_modules/mid/node_modules/leaf"}},
+		{"the member's own entry changed under an unchanged host", build(entryOf("1.0.0", ""), mid, `{"version":"1.1.0","inBundle":true,"hasInstallScript":true}`), []string{"node_modules/host/node_modules/mid/node_modules/leaf"}},
+	}
+	for _, c := range cases {
+		report, err := ReadScripts(ScriptsRequest{Lock: c.lock, TreeRoot: tree, Previous: previous})
+		got := []string{}
+		for _, p := range report.Packages {
+			got = append(got, p.Path)
+		}
+		if err != nil || report.Previous != "read" || !reflect.DeepEqual(got, append([]string{}, c.want...)) {
+			t.Fatalf("%s: %v %v (%s)", c.name, got, err, report.Previous)
+		}
+	}
+	// a member whose host is not in the previous record at all is introduced
+	report, _ := ReadScripts(ScriptsRequest{Lock: build(entryOf("1.0.0", ""), mid, leaf), TreeRoot: tree, Previous: lockOf(map[string]string{"node_modules/other": entryOf("1.0.0", "")})})
+	if len(report.Packages) != 1 {
+		t.Fatalf("a member of a new host: %v", pathsOf(report))
 	}
 }
 
@@ -133,26 +198,28 @@ func TestScriptsIntroducedAgainstThePreviousTree(t *testing.T) {
 	for _, n := range []string{"same", "moved", "fresh"} {
 		writePackage(t, tree, n, `{"scripts":{"install":"x"}}`)
 	}
-	lock := lockOf(map[string]string{"node_modules/same": entryOf("1.0.0", ""), "node_modules/moved": entryOf("2.0.0", ""), "node_modules/fresh": entryOf("1.0.0", "")})
-	previous := lockOf(map[string]string{"node_modules/same": entryOf("1.0.0", ""), "node_modules/moved": entryOf("1.0.0", "")})
+	lock := lockOf(map[string]string{"node_modules/same": entryOf("1.0.0", `,"hasInstallScript":true`), "node_modules/moved": entryOf("2.0.0", `,"hasInstallScript":true`), "node_modules/fresh": entryOf("1.0.0", `,"hasInstallScript":true`)})
+	previous := lockOf(map[string]string{"node_modules/same": entryOf("1.0.0", `,"hasInstallScript":true`), "node_modules/moved": entryOf("1.0.0", `,"hasInstallScript":true`)})
 	report, _ := ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree, Previous: previous})
 	if !reflect.DeepEqual(pathsOf(report), []string{"node_modules/fresh", "node_modules/moved"}) || report.Previous != "read" {
 		t.Fatalf("%v %s", pathsOf(report), report.Previous)
 	}
 	// a changed integrity at the same version is a change
-	changed := lockOf(map[string]string{"node_modules/same": strings.Replace(entryOf("1.0.0", ""), "AAAA", "BBBB", 1)})
+	changed := lockOf(map[string]string{"node_modules/same": strings.Replace(entryOf("1.0.0", `,"hasInstallScript":true`), "AAAA", "BBBB", 1)})
 	report, _ = ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree, Previous: changed})
 	if !reflect.DeepEqual(pathsOf(report), []string{"node_modules/fresh", "node_modules/moved", "node_modules/same"}) {
 		t.Fatalf("an integrity that changed was not introduced: %v", pathsOf(report))
 	}
-	// ci builds a whole tree: the previous one is ignored; an unreadable one makes everything new
-	report, _ = ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree, Previous: previous, All: true})
-	if len(report.Packages) != 3 {
-		t.Fatalf("ci: %v", pathsOf(report))
+	// no previous record (what `ci` is given, since it builds a whole tree) makes everything new; an unreadable one too, and says so
+	report, _ = ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree})
+	if len(report.Packages) != 3 || report.Previous != "none" {
+		t.Fatalf("no record: %v %s", pathsOf(report), report.Previous)
 	}
-	report, _ = ReadScripts(ScriptsRequest{Lock: lock, TreeRoot: tree, Previous: []byte("{not json")})
-	if len(report.Packages) != 3 || report.Previous != "unreadable" {
-		t.Fatalf("unreadable previous: %v %s", pathsOf(report), report.Previous)
+	for _, req := range []ScriptsRequest{{Lock: lock, TreeRoot: tree, Previous: []byte("{")}, {Lock: lock, TreeRoot: tree, PreviousUnreadable: true}} {
+		report, _ = ReadScripts(req)
+		if len(report.Packages) != 3 || report.Previous != "unreadable" {
+			t.Fatalf("unreadable previous: %v %s", pathsOf(report), report.Previous)
+		}
 	}
 }
 
@@ -183,22 +250,21 @@ func TestScriptsHostileInputsAreNotTrusted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range report.Packages {
-		switch p.Name {
-		case "linked-manifest", "fifo-manifest", "dup", "array", "link-dir":
-			if !p.Unread || len(p.Events) != 0 {
-				t.Fatalf("%s was read: %+v", p.Name, p)
-			}
-		case "evil":
-			if p.Version != "?" || len(p.Events) != 1 {
-				t.Fatalf("a hostile version is printable: %+v", p)
-			}
-		default:
-			t.Fatalf("unexpected %+v", p)
+	// a package that cannot be read is never among those that have scripts
+	unread := map[string]bool{}
+	for _, p := range report.Unread {
+		unread[p.Name] = true
+		if len(p.Events) != 0 || p.Native {
+			t.Fatalf("%s was read: %+v", p.Name, p)
 		}
 	}
-	if len(report.Packages) != 6 {
-		t.Fatalf("%v", pathsOf(report))
+	for _, name := range []string{"linked-manifest", "fifo-manifest", "dup", "array", "link-dir"} {
+		if !unread[name] {
+			t.Fatalf("%s is not among the unread: %v", name, report.Unread)
+		}
+	}
+	if len(report.Packages) != 0 || len(report.Undeclared) != 1 || report.Undeclared[0].Name != "evil" || report.Undeclared[0].Version != "?" || report.UnreadTotal != 5 {
+		t.Fatalf("packages %v undeclared %+v unread %d", pathsOf(report), report.Undeclared, report.UnreadTotal)
 	}
 }
 
@@ -227,6 +293,15 @@ func TestScriptsRootInstallTimeScripts(t *testing.T) {
 	report, _ = ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"name":"p"}`), RootDir: dir})
 	if report.Root == nil || !report.Root.Native {
 		t.Fatalf("%+v", report.Root)
+	}
+	// a directory of that name is no native build, for the project as for a package
+	dirRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dirRoot, "binding.gyp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	report, _ = ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"name":"p"}`), RootDir: dirRoot})
+	if report.Root == nil || report.Root.Native {
+		t.Fatalf("a directory named binding.gyp is a native build of the project: %+v", report.Root)
 	}
 	if _, err := ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"scripts":{"a":"x","a":"y"}}`), RootDir: dir}); err == nil {
 		t.Fatal("a manifest with a repeated member was read")
@@ -293,5 +368,22 @@ func TestScriptsOnlyAnInstallPathReachesTheCommandLine(t *testing.T) {
 				t.Fatalf("tree %q: %+v", req.TreeRoot, p)
 			}
 		}
+	}
+}
+
+// A previous record that cannot be read from its file (the reader's own read, not the gate's copy) is said, not taken for none.
+func TestScriptsFilesPreviousRecordThatCannotBeReadIsSaid(t *testing.T) {
+	dir := t.TempDir()
+	lockFile := filepath.Join(dir, "package-lock.json")
+	if err := os.WriteFile(lockFile, lockOf(map[string]string{"node_modules/a": entryOf("1.0.0", `,"hasInstallScript":true`)}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := ReadScriptsFiles(lockFile, filepath.Join(dir, "missing.json"), "", ScriptsRequest{})
+	if err != nil || report.Previous != "unreadable" || len(report.Packages) != 1 {
+		t.Fatalf("%+v %v", report, err)
+	}
+	report, err = ReadScriptsFiles(lockFile, "", "", ScriptsRequest{})
+	if err != nil || report.Previous != "none" {
+		t.Fatalf("%+v %v", report, err)
 	}
 }

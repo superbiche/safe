@@ -18,12 +18,17 @@ import (
 // question to npm:
 //
 //   - the published tree: each package's own package.json (a preinstall, install or postinstall script) and binding.gyp (npm's
-//     implicit native build: a binding.gyp, no install and no preinstall script, and gypfile not false, on npm 11.20.0 and 12.2.1);
+//     implicit native build: a binding.gyp FILE, no install and no preinstall script, and gypfile not false, on npm 11.20.0 and 12.2.1);
 //   - the judged lockfile: `hasInstallScript`, which is all there is when no tree was published (--dry-run, --package-lock-only).
 //
-// The tree wins where both exist: npm's own install trusts a lockfile that says "no scripts" over what is on disk (measured: a
-// lockfile without the flag made `npm ci` skip an install script that `npm rebuild` would run), so a package with scripts on disk that
-// its lockfile entry does not declare is listed and marked.
+// Where the tree has scripts that the lockfile entry does not declare, npm itself does not run them the way it runs a declared one
+// (measured on npm 11.20.0 and 12.2.1, on the tree the binder publishes, with the flag absent): `npm ci` with scripts on runs NOTHING
+// for a package whose only install-time script is a script, runs the implicit native build of a package that has a binding.gyp, and
+// for a package with a postinstall AND a binding.gyp runs only the native build; `npm rebuild <path>` with scripts on likewise runs
+// nothing for the first, the native build for the second, and the native build and the script for the third. Such a package is
+// reported apart ("undeclared"), with what npm does about it, and its path is in the printed command only when `npm rebuild` runs
+// something for it. A package whose files cannot be read is reported apart ("unread"): nothing is said about its scripts and it has
+// no command.
 const (
 	ScriptsSource = "tree"
 	ScriptsLock   = "lockfile"
@@ -32,21 +37,18 @@ const (
 	scriptsMaxLock     = 256 << 20
 )
 
-// ScriptPackage is one installed package with install-time scripts.
+// ScriptPackage is one installed package with install-time scripts, or one that could not be read.
 type ScriptPackage struct {
 	Path    string `json:"path"`
 	Name    string `json:"name"`
 	Version string `json:"version"`
-	Host    string `json:"host,omitempty"` // name@version of the package that bundles it, for a bundled member
-	// RebuildPath is the install path `npm rebuild` is given for it: its own, or for a bundled member its outermost host's (measured: a
-	// bundled member is rebuilt through the host's path, also when the host has no script, and not by its own path).
+	// Host is name@version of the OUTERMOST package that is not itself bundled and supplies the bytes of a bundled member: the artifact
+	// that is introduced when the member is, and the one whose install path `npm rebuild` is given (measured: a bundled member is
+	// rebuilt through its host's path, also when the host has no script, and not by its own path).
+	Host        string   `json:"host,omitempty"`
 	RebuildPath string   `json:"rebuild_path"`
 	Events      []string `json:"events"` // of preinstall, install, postinstall, in npm's order (tree source only)
 	Native      bool     `json:"native"` // the implicit native build
-	// Declared is what the lockfile entry says (hasInstallScript: true); false next to Events or Native is a disagreement.
-	Declared bool `json:"declared"`
-	// Unread: the tree has the directory and its package.json cannot be read as one plain JSON object, so nothing can be said about it.
-	Unread bool `json:"unread,omitempty"`
 }
 
 // RootScripts is the project's own install-time scripts (the manifest the lane published).
@@ -55,25 +57,35 @@ type RootScripts struct {
 	Native bool     `json:"native"`
 }
 
-// ScriptsReport is the document `safe-core project-scripts` prints.
+// ScriptsReport is the document `safe-core project-scripts` prints (schema 2). Packages are those whose lockfile entry declares
+// install scripts and whose files (or, without a tree, whose entry) have them; Undeclared are those whose files have scripts that
+// their entry does not declare; Unread are those whose directory or package.json could not be read. Each list is cut at the request's
+// limit and its Total is the true count.
 type ScriptsReport struct {
-	SchemaVersion int             `json:"schema_version"`
-	Source        string          `json:"source"` // tree or lockfile
-	Previous      string          `json:"previous"`
-	Total         int             `json:"total"`
-	Packages      []ScriptPackage `json:"packages"`
-	Root          *RootScripts    `json:"root,omitempty"`
+	SchemaVersion   int             `json:"schema_version"`
+	Source          string          `json:"source"`   // tree or lockfile
+	Previous        string          `json:"previous"` // read, none, or unreadable (every package is then counted as introduced)
+	Total           int             `json:"total"`
+	Packages        []ScriptPackage `json:"packages"`
+	UndeclaredTotal int             `json:"undeclared_total"`
+	Undeclared      []ScriptPackage `json:"undeclared"`
+	UnreadTotal     int             `json:"unread_total"`
+	Unread          []ScriptPackage `json:"unread"`
+	Root            *RootScripts    `json:"root,omitempty"`
 }
 
 // ScriptsRequest is what is read.
 type ScriptsRequest struct {
-	Lock         []byte
-	TreeRoot     string // the published node_modules directory; "" reads the lockfile alone
-	Previous     []byte // the previous tree's hidden lockfile, nil when there was none
-	All          bool   // every package is introduced (npm ci builds a whole new tree)
-	RootManifest []byte // nil: the project's own scripts are not asked for
-	RootDir      string
-	Limit        int
+	Lock     []byte
+	TreeRoot string // the published node_modules directory; "" reads the lockfile alone
+	// Previous is the previous tree's hidden lockfile. nil: there was none, every package is introduced (so for `ci`, which builds a
+	// whole new tree, the caller gives none). PreviousUnreadable: there was one that could not be read; every package is introduced
+	// and the report says why.
+	Previous           []byte
+	PreviousUnreadable bool
+	RootManifest       []byte // nil: the project's own scripts are not asked for
+	RootDir            string
+	Limit              int
 }
 
 var rootEvents = []string{"preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"}
@@ -81,7 +93,7 @@ var packageEvents = []string{"preinstall", "install", "postinstall"}
 
 // ReadScripts builds the report.
 func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
-	report := ScriptsReport{SchemaVersion: 1, Source: ScriptsLock, Previous: "none", Packages: []ScriptPackage{}}
+	report := ScriptsReport{SchemaVersion: 2, Source: ScriptsLock, Previous: "none", Packages: []ScriptPackage{}, Undeclared: []ScriptPackage{}, Unread: []ScriptPackage{}}
 	if req.TreeRoot != "" {
 		report.Source = ScriptsSource
 	}
@@ -91,12 +103,13 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 	}
 	var previous *judgedLock
 	switch {
-	case req.All:
-		report.Previous = "ignored (every package is new in a tree built by ci)"
+	case req.PreviousUnreadable:
+		report.Previous = "unreadable"
 	case req.Previous == nil:
 		report.Previous = "none"
 	default:
 		// the previous tree's own record; anything unreadable about it makes every package new (the larger report, never the smaller)
+		// and is said
 		if prev, perr := parseJudgedLockfile(req.Previous, true); prev != nil && (perr == nil || errors.Is(perr, ErrLinkEntries)) {
 			previous, report.Previous = prev, "read"
 		} else {
@@ -105,37 +118,23 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 	}
 	for _, key := range lock.paths {
 		entry := lock.entries[key]
-		if previous != nil {
-			if old, ok := previous.entries[key]; ok && old.Version == entry.Version && old.Resolved == entry.Resolved && old.Integrity == entry.Integrity {
-				continue
-			}
+		if !introduced(lock, previous, key) {
+			continue
 		}
-		pkg := ScriptPackage{Path: key, Name: packageNameOfPath(key), Version: printableVersion(entry.Version), Events: []string{},
-			Declared: strings.TrimSpace(string(entry.HasInstallScript)) == "true"}
-		pkg.RebuildPath = key
-		if entry.InBundle {
-			if host := parentEntry(key); host != "" {
-				hostVersion := "?"
-				if h, ok := lock.entries[host]; ok {
-					hostVersion = printableVersion(h.Version)
-				}
-				pkg.Host = packageNameOfPath(host) + "@" + hostVersion
-				outer := host
-				for {
-					e, ok := lock.entries[outer]
-					if !ok || !e.InBundle || parentEntry(outer) == "" {
-						break
-					}
-					outer = parentEntry(outer)
-				}
-				pkg.RebuildPath = outer
+		pkg := ScriptPackage{Path: key, Name: packageNameOfPath(key), Version: printableVersion(entry.Version), Events: []string{}, RebuildPath: key}
+		if outer, bundled := outermostHost(lock, key); bundled {
+			pkg.RebuildPath = outer
+			hostVersion := "?"
+			if h, ok := lock.entries[outer]; ok {
+				hostVersion = printableVersion(h.Version)
 			}
+			pkg.Host = packageNameOfPath(outer) + "@" + hostVersion
 		}
+		declared := strings.TrimSpace(string(entry.HasInstallScript)) == "true"
 		if req.TreeRoot == "" {
-			if !pkg.Declared {
-				continue
+			if declared {
+				report.Packages = append(report.Packages, pkg)
 			}
-			report.Packages = append(report.Packages, pkg)
 			continue
 		}
 		dir, state := chainDir(req.TreeRoot, key)
@@ -143,14 +142,12 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 			continue // not installed (omitted, or another platform's): nothing to say about it
 		}
 		if state == chainUnusable {
-			pkg.Unread = true
-			report.Packages = append(report.Packages, pkg)
+			report.Unread = append(report.Unread, pkg)
 			continue
 		}
 		events, native, rerr := packageScripts(dir)
 		if rerr != nil {
-			pkg.Unread = true
-			report.Packages = append(report.Packages, pkg)
+			report.Unread = append(report.Unread, pkg)
 			continue
 		}
 		if len(events) == 0 && !native {
@@ -160,12 +157,22 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 		if events != nil {
 			pkg.Events = events
 		}
-		report.Packages = append(report.Packages, pkg)
+		if declared {
+			report.Packages = append(report.Packages, pkg)
+		} else {
+			report.Undeclared = append(report.Undeclared, pkg)
+		}
 	}
-	sort.Slice(report.Packages, func(i, j int) bool { return report.Packages[i].Path < report.Packages[j].Path })
-	report.Total = len(report.Packages)
-	if req.Limit > 0 && len(report.Packages) > req.Limit {
-		report.Packages = report.Packages[:req.Limit]
+	for _, group := range []*[]ScriptPackage{&report.Packages, &report.Undeclared, &report.Unread} {
+		sort.Slice(*group, func(i, j int) bool { return (*group)[i].Path < (*group)[j].Path })
+	}
+	report.Total, report.UndeclaredTotal, report.UnreadTotal = len(report.Packages), len(report.Undeclared), len(report.Unread)
+	if req.Limit > 0 {
+		for _, group := range []*[]ScriptPackage{&report.Packages, &report.Undeclared, &report.Unread} {
+			if len(*group) > req.Limit {
+				*group = (*group)[:req.Limit]
+			}
+		}
 	}
 	if req.RootManifest != nil {
 		root, rerr := rootScripts(req.RootManifest, req.RootDir)
@@ -175,6 +182,49 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 		report.Root = &root
 	}
 	return report, nil
+}
+
+// outermostHost returns the install path of the artifact that supplies the bytes of a bundled member: the first ancestor entry that is
+// not itself bundled. A member whose entry says it is bundled and has no ancestor entry has no host that can be named (false).
+func outermostHost(lock *judgedLock, key string) (string, bool) {
+	entry := lock.entries[key]
+	if entry == nil || !entry.InBundle {
+		return "", false
+	}
+	outer := parentEntry(key)
+	if outer == "" {
+		return "", false
+	}
+	for {
+		e, ok := lock.entries[outer]
+		if !ok || !e.InBundle || parentEntry(outer) == "" {
+			return outer, true
+		}
+		outer = parentEntry(outer)
+	}
+}
+
+// sameArtifact: an entry the previous tree's record has at the same path, with the same version, resolved location and integrity.
+func sameArtifact(previous *judgedLock, key string, entry *lockEntry) bool {
+	old, ok := previous.entries[key]
+	return ok && old.Version == entry.Version && old.Resolved == entry.Resolved && old.Integrity == entry.Integrity
+}
+
+// introduced: the package at key is new or changed in the tree. A bundled entry has no resolved location and no integrity of its own:
+// its bytes come from the tarball of its outermost host, so it is introduced when that host's artifact is, or when its own entry is new
+// or changed. Without a previous record everything is introduced.
+func introduced(lock *judgedLock, previous *judgedLock, key string) bool {
+	if previous == nil {
+		return true
+	}
+	if !sameArtifact(previous, key, lock.entries[key]) {
+		return true
+	}
+	if outer, bundled := outermostHost(lock, key); bundled {
+		host, ok := lock.entries[outer]
+		return !ok || !sameArtifact(previous, outer, host)
+	}
+	return false
 }
 
 var plainVersion = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
@@ -274,8 +324,9 @@ func nativeBuild(dir string, members map[string]json.RawMessage, have map[string
 	if value, ok := members["gypfile"]; ok && strings.TrimSpace(string(value)) == "false" {
 		return false
 	}
-	_, err := os.Lstat(filepath.Join(dir, "binding.gyp"))
-	return err == nil
+	// as npm sees it: a regular file, a link to one included (Stat follows it); a directory of that name is no native build
+	info, err := os.Stat(filepath.Join(dir, "binding.gyp"))
+	return err == nil && info.Mode().IsRegular()
 }
 
 func rootScripts(manifest []byte, dir string) (RootScripts, error) {
@@ -307,6 +358,8 @@ func ReadScriptsFiles(lockFile, previousFile, manifestFile string, req ScriptsRe
 	if previousFile != "" {
 		if raw, perr := readFileNoFollow(previousFile, scriptsMaxPrevious); perr == nil {
 			req.Previous = raw
+		} else {
+			req.PreviousUnreadable = true
 		}
 	}
 	if manifestFile != "" {
