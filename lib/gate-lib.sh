@@ -5615,79 +5615,81 @@ safe_gate_project_lane_previous_tree() {
   [[ "${verb}" != ci ]] || return 0
   [[ -e "${hidden}" || -L "${hidden}" ]] || return 0
   if [[ -f "${hidden}" && ! -L "${hidden}" && ! -L "${project_dir}/node_modules" ]] && command -v timeout >/dev/null 2>&1 \
-      && timeout --kill-after=1s 10s head -c 67108864 -- "${hidden}" >"${kept}" 2>/dev/null; then
+      && timeout --kill-after=1s 10s head -c 67108865 -- "${hidden}" >"${kept}" 2>/dev/null; then
     printf '%s' "${kept}"
   else
     printf 'unreadable'
   fi
 }
 
-# The scripts section's lines, from the core's document on stdin. This function is one jq program and starts nothing else: it is the
-# only place of the lane where the words that run scripts (npm rebuild, npm run) are written, as text for the operator (lane lint, R11).
-# Every token it prints is held to its grammar first (a package name, a version, an install path of node_modules/<name> steps, an
-# event of a closed list, a host as name@version); one token outside it fails the whole render, and nothing of the document is printed.
-# The lines are the operator's to paste into a shell, so they are printed as they are (no cleaner): they hold validated tokens and the
-# program's own words only.
+# The scripts section's lines, from the core's document on stdin. This function is one jq program and starts nothing else (it holds
+# exactly one jq): it is the only place of the lane where the words that run scripts (npm rebuild, npm run) are written, as text for
+# the operator (lane lint, R11). It says what is on disk and nothing about what npm would do with it, except the one clause every
+# measure agrees on. It takes exactly one document (none, or two, fails the render) and holds every token it prints to its grammar,
+# anchored on the whole string (a final newline would split a printed command): a package name, a version, an install path of
+# node_modules/<name> steps, an event of a closed list, a host as name@version; every flag is a boolean. One token outside its grammar
+# fails the whole render, and nothing of the document is printed. The lines are the operator's to paste into a shell, so they are
+# printed as they are (no cleaner): they hold validated tokens and the program's own words only.
 safe_gate_project_lane_scripts_lines() {
-  jq -r '
+  jq -rs '
     def bad($why): error("scripts-report: " + $why);
     def nmch: "[A-Za-z0-9~][A-Za-z0-9._~-]*";
     def nm: "(@" + nmch + "/)?" + nmch;
     def ver: "([0-9A-Za-z][0-9A-Za-z.+_-]{0,63}|\\?)";
-    def okpath: type == "string" and test("^node_modules/" + nm + "(/node_modules/" + nm + ")*$");
+    def okpath: type == "string" and test("\\Anode_modules/" + nm + "(/node_modules/" + nm + ")*\\z");
     def pkgev: ["preinstall", "install", "postinstall"];
     def rootev: ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"];
     def checkpkg:
       if (type == "object"
           and (.path | okpath) and (.rebuild_path | okpath)
-          and (.name | type == "string" and test("^" + nm + "$"))
-          and (.version | type == "string" and test("^" + ver + "$"))
-          and ((.host // "") | type == "string" and (. == "" or test("^" + nm + "@" + ver + "$")))
-          and (.native | type == "boolean")
+          and (.name | type == "string" and test("\\A" + nm + "\\z"))
+          and (.version | type == "string" and test("\\A" + ver + "\\z"))
+          and ((.host // "") | type == "string" and (. == "" or test("\\A" + nm + "@" + ver + "\\z")))
+          and (.gyp | type == "boolean") and (.declared | type == "boolean")
           and (.events | type == "array" and all(.[]; type == "string" and (. as $e | pkgev | index($e) != null))))
       then . else bad("a token outside its grammar") end;
     def checkgroup($total): if (type == "array") and ($total | type == "number") and ($total >= length) then map(checkpkg) else bad("the document is not the report") end;
-    if (type != "object") or .schema_version != 2 or ((.source // "") | IN("tree", "lockfile") | not) or ((.previous // "") | IN("read", "none", "unreadable") | not)
-    then bad("the document is not the report of this version") else . end
-    | . as $d | .packages = ($d.packages | checkgroup($d.total)) | .undeclared = ($d.undeclared | checkgroup($d.undeclared_total)) | .unread = ($d.unread | checkgroup($d.unread_total))
-    | (if .root != null then (.root.events |= (if (type == "array") and all(.[]; type == "string" and (. as $e | rootev | index($e) != null)) then . else bad("a token outside its grammar") end)) else . end)
+    def checkroot:
+      if (type == "object") and (.gyp | type == "boolean")
+         and (.events | type == "array" and all(.[]; type == "string" and (. as $e | rootev | index($e) != null)))
+      then . else bad("a token outside its grammar") end;
+    (if length == 1 then .[0] else bad("no document or more than one document") end)
+    | if (type != "object") or .schema_version != 3 or ((.source // "") | IN("tree", "lockfile") | not) or ((.previous // "") | IN("read", "none", "unreadable") | not)
+      then bad("the document is not the report of this version") else . end
+    | . as $d | .packages = ($d.packages | checkgroup($d.total)) | .unread = ($d.unread | checkgroup($d.unread_total))
+    | (if .root != null then (.root |= checkroot) else . end)
     | def lbl: .name + "@" + .version;
       def host: if (.host // "") != "" then "bundled in " + .host else empty end;
-      def evs: [(if (.events | length) > 0 then (.events | join(", ")) else empty end), (if .native then "native build" else empty end), host] | join("; ");
+      def attrs: [(if (.events | length) > 0 then (.events | join(", ")) else empty end), (if .gyp then "binding.gyp" else empty end), host,
+                  (if .declared | not then "not declared by its lockfile entry" else empty end)] | join("; ");
       def more($t; $n): if $t > $n then ", and " + (($t - $n) | tostring) + " more not listed" else "" end;
-      def declared: .packages | map(lbl + (evs | if . == "" then "" else " (" + . + ")" end)) | join(", ");
-      def apart:
-        .undeclared | map(
-          lbl + " (" + evs + "): "
-          + (if (.events | length) > 0 and .native then "at install npm runs only its native build; npm rebuild runs the build and its scripts"
-             elif .native then "npm builds it at install and with npm rebuild"
-             else "npm runs these scripts neither at install nor with npm rebuild" end)) | join("; ");
-      def paths: [(.packages[]), (.undeclared[] | select(.native))] | map(.rebuild_path) | unique | map("./" + .) | join(" ");
-      def truncated: (.total > (.packages | length)) or (.undeclared_total > (.undeclared | length));
+      def items: .packages | map(lbl + (attrs | if . == "" then "" else " (" + . + ")" end)) | join(", ");
+      def paths: .packages | map(.rebuild_path) | unique | map("./" + .) | join(" ");
+      def truncated: .total > (.packages | length);
       def runs: .root.events | map("npm run " + . + " --ignore-scripts") | join("; ");
-      def found: (.total + .undeclared_total + .unread_total) > 0;
+      def found: (.total + .unread_total) > 0;
       (if .total > 0 and .source == "tree" then
-         "safe: project lane: install scripts did not run (the lane installs with scripts off): " + (.total | tostring) + " introduced package(s) have them: " + declared + more(.total; (.packages | length))
+         "safe: project lane: install scripts did not run (the lane installs with scripts off): " + (.total | tostring) + " introduced package(s) have install-time scripts or a binding.gyp on disk: " + items + more(.total; (.packages | length))
        elif .total > 0 then
-         "safe: project lane: scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for " + (.total | tostring) + " package(s) this command would introduce: " + declared + more(.total; (.packages | length))
-       else empty end),
-      (if .undeclared_total > 0 then
-         "safe: project lane: install scripts did not run (the lane installs with scripts off); on disk and not declared by their lockfile entry (" + (.undeclared_total | tostring) + "): " + apart + more(.undeclared_total; (.undeclared | length)) + " (measured on npm 11.20.0 and 12.2.1)"
+         "safe: project lane: scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for " + (.total | tostring) + " package(s)"
+         + (if .previous == "read" then " that are new or changed against the installed tree'"'"'s record" else "" end) + ": " + items + more(.total; (.packages | length))
        else empty end),
       (if .unread_total > 0 then
-         "safe: project lane: scripts: could not be read, so nothing is said about their scripts and no command is given for them (" + (.unread_total | tostring) + "): " + (.unread | map(lbl) | join(", ")) + more(.unread_total; (.unread | length))
+         "safe: project lane: scripts: " + (.unread_total | tostring) + " introduced package(s) could not be read, so nothing is said about their scripts and no command is given for them: " + (.unread | map(lbl) | join(", ")) + more(.unread_total; (.unread | length))
        else empty end),
-      (if .source == "tree" and (paths | length) > 0 then
-         "safe: project lane: scripts: to run them: npm rebuild " + paths + (if truncated then " (the listed packages; npm rebuild with no argument rebuilds every package of the tree, those already present included)" else "" end) + "; npm'"'"'s own script policy applies to that command"
+      (if .source == "tree" and .total > 0 then
+         "safe: project lane: scripts: to run them: npm rebuild " + paths + (if truncated then " (the listed packages; npm rebuild with no argument rebuilds every package of the tree, those already present included)" else "" end)
+         + "; npm decides what it runs: its own script policy applies, and it can skip a script that a lockfile entry does not declare"
        else empty end),
       (if .previous == "unreadable" and found then
          "safe: project lane: scripts: the previous tree'"'"'s record could not be read, so every package of the tree is counted as introduced"
        else empty end),
-      (if .root != null and ((.root.events | length) > 0 or .root.native) then
-         "safe: project lane: this project'"'"'s own install-time scripts did not run either ("
-         + ([.root.events[]] + (if .root.native then ["native build"] else [] end) | join(", ")) + ")"
-         + (if (.root.events | length) > 0 then "; to run them: " + runs + "; an explicitly named script runs whatever npm'"'"'s script policy says and its pre- and post- scripts do not (measured on npm 11.20.0 and 12.2.1, also with ignore-scripts=true in the user configuration)" else "" end)
-         + (if .root.native then "; its native build (a binding.gyp file, no install or preinstall script) has no npm command of its own on those versions" else "" end)
+      (if .root != null and (.root.events | length) > 0 then
+         "safe: project lane: this project'"'"'s own install-time scripts did not run either (" + (.root.events | join(", ")) + "); to run them: " + runs
+         + "; an explicitly named script runs whatever npm'"'"'s script policy says and its pre- and post- scripts do not (measured on npm 11.20.0 and 12.2.1, also with ignore-scripts=true in the user configuration)"
+       else empty end),
+      (if .root != null and .root.gyp then
+         "safe: project lane: this project has a binding.gyp file, which the lane did not build"
        else empty end)'
 }
 

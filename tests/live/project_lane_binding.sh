@@ -744,6 +744,9 @@ fi
 # policy). That scripts DO run when they are on, and that the absence of their effect can therefore fail, is held with safe's own
 # loopback fixtures in tests/live/project_lane_no_scripts.sh; here the absence of hooks is asserted on what the package declares.
 new_project "${WORK}/k" || { fail "scenario K project"; exit 1; }
+# the project defines install-time scripts of its own (the lane never runs them; for an install that names a package it does not name them)
+( cd "${WORK}/k" && jq -c '.scripts = {preinstall: "echo own-preinstall", postinstall: "echo own-postinstall"}' package.json > package.json.new && mv package.json.new package.json \
+    && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m scripts ) || { fail "scenario K: the project's own scripts are written"; exit 1; }
 hooks_written() { # <repository>: the number of git hooks husky wrote
   local hook count=0
   for hook in "$1"/.git/hooks/*; do [[ -f "${hook}" ]] && grep -q husky "${hook}" 2>/dev/null && count=$((count + 1)); done
@@ -753,10 +756,10 @@ gate_in "${WORK}/k" "${WORK}/k" install husky@4.3.8
 status=$?
 sed 's/^/# K gate: /' "${WORK}/k.err" | tail -n 5
 if (( status == 0 )) && [[ -d "${WORK}/k/node_modules/husky" ]] \
-    && grep -q 'install scripts did not run (the lane installs with scripts off): 1 introduced package(s) have them: husky@4.3.8 (install, postinstall)' "${WORK}/k.err" \
-    && grep -q "scripts: to run them: npm rebuild ./node_modules/husky; npm's own script policy applies to that command" "${WORK}/k.err" \
+    && grep -q 'install scripts did not run (the lane installs with scripts off): 1 introduced package(s) have install-time scripts or a binding.gyp on disk: husky@4.3.8 (install, postinstall)' "${WORK}/k.err" \
+    && grep -q "scripts: to run them: npm rebuild ./node_modules/husky; npm decides what it runs: its own script policy applies, and it can skip a script that a lockfile entry does not declare" "${WORK}/k.err" \
     && ! grep -q "this project's own install-time scripts" "${WORK}/k.err"; then
-  pass "K1: a lane install of husky@4.3.8 through the real gate names the package, its events and the command that runs them (and not the project's own scripts: the install names a package)"
+  pass "K1: a lane install of husky@4.3.8 through the real gate names the package, its events and the command that runs them (and not the project's own scripts, which the project defines: the install names a package)"
 else
   fail "K1: exit ${status}; $(tail -n 4 "${WORK}/k.err")"
 fi

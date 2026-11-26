@@ -54,17 +54,19 @@ func pathsOf(r ScriptsReport) []string {
 	return out
 }
 
+// The reader states what is on disk: a package is listed when its own files hold a preinstall, install or postinstall script or a
+// binding.gyp file; gypfile, the scripts beside the file and the lockfile flag decide nothing about whether it is listed.
 func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 	tree := t.TempDir()
 	writePackage(t, tree, "a", `{"scripts":{"preinstall":"x","install":"y","postinstall":"z","test":"t"}}`)
-	writePackage(t, tree, "pre-gyp", `{"scripts":{"preinstall":"x"}}`, "binding.gyp")     // its own preinstall: no implicit build
-	writePackage(t, tree, "post-gyp", `{"scripts":{"postinstall":"x"}}`, "binding.gyp")   // postinstall alone still builds
-	writePackage(t, tree, "install-gyp", `{"scripts":{"install":"x"}}`, "binding.gyp")    // its own install: no implicit build
-	writePackage(t, tree, "off-gyp", `{"gypfile":false}`, "binding.gyp")                  // gypfile false: none
-	writePackage(t, tree, "plain-gyp", `{}`, "binding.gyp")                               // the implicit build
+	writePackage(t, tree, "pre-gyp", `{"scripts":{"preinstall":"x"}}`, "binding.gyp")
+	writePackage(t, tree, "post-gyp", `{"scripts":{"postinstall":"x"}}`, "binding.gyp")
+	writePackage(t, tree, "install-gyp", `{"scripts":{"install":"x"}}`, "binding.gyp")
+	writePackage(t, tree, "off-gyp", `{"gypfile":false}`, "binding.gyp") // npm builds it anyway from a lockfile that declares it: listed
+	writePackage(t, tree, "plain-gyp", `{}`, "binding.gyp")
 	writePackage(t, tree, "prepare-only", `{"scripts":{"prepare":"x","prepublish":"y"}}`) // not install-time of a dependency
 	writePackage(t, tree, "empty-script", `{"scripts":{"install":""}}`)                   // an empty script is no script
-	writePackage(t, tree, "dir-gyp", `{}`)                                                // a DIRECTORY named binding.gyp is no native build
+	writePackage(t, tree, "dir-gyp", `{}`)                                                // a DIRECTORY named binding.gyp is no file
 	if err := os.Mkdir(filepath.Join(tree, "dir-gyp", "binding.gyp"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +76,7 @@ func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 	}
 	lock := lockOf(map[string]string{
 		"node_modules/a": entryOf("1.0.0", `,"hasInstallScript":true`), "node_modules/pre-gyp": entryOf("1.0.0", ""),
-		"node_modules/post-gyp": entryOf("1.0.0", ""), "node_modules/install-gyp": entryOf("1.0.0", ""), "node_modules/off-gyp": entryOf("1.0.0", ""),
+		"node_modules/post-gyp": entryOf("1.0.0", ""), "node_modules/install-gyp": entryOf("1.0.0", `,"hasInstallScript":true`), "node_modules/off-gyp": entryOf("1.0.0", `,"hasInstallScript":true`),
 		"node_modules/plain-gyp": entryOf("1.0.0", ""), "node_modules/prepare-only": entryOf("1.0.0", ""), "node_modules/empty-script": entryOf("1.0.0", ""),
 		"node_modules/dir-gyp": entryOf("1.0.0", ""), "node_modules/link-gyp": entryOf("1.0.0", ""),
 		"node_modules/gone": entryOf("1.0.0", `,"hasInstallScript":true`), // omitted: not in the tree
@@ -84,32 +86,29 @@ func TestScriptsTreeReadsWhatIsOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := map[string]ScriptPackage{}
-	declared := map[string]bool{}
 	for _, p := range report.Packages {
-		got[p.Path], declared[p.Path] = p, true
-	}
-	for _, p := range report.Undeclared {
 		got[p.Path] = p
 	}
 	want := map[string]struct {
 		events   []string
-		native   bool
+		gyp      bool
 		declared bool
 	}{
 		"node_modules/a":           {[]string{"preinstall", "install", "postinstall"}, false, true},
-		"node_modules/pre-gyp":     {[]string{"preinstall"}, false, false},
+		"node_modules/pre-gyp":     {[]string{"preinstall"}, true, false},
 		"node_modules/post-gyp":    {[]string{"postinstall"}, true, false},
-		"node_modules/install-gyp": {[]string{"install"}, false, false},
+		"node_modules/install-gyp": {[]string{"install"}, true, true},
+		"node_modules/off-gyp":     {[]string{}, true, true},
 		"node_modules/plain-gyp":   {[]string{}, true, false},
 		"node_modules/link-gyp":    {[]string{}, true, false}, // a link to a file is a file, as npm sees it
 	}
-	if len(got) != len(want) || report.Total != 1 || report.UndeclaredTotal != len(want)-1 || report.UnreadTotal != 0 || report.Source != ScriptsSource {
-		t.Fatalf("packages %v undeclared %v unread %v", pathsOf(report), report.UndeclaredTotal, report.UnreadTotal)
+	if len(got) != len(want) || report.Total != len(want) || report.UnreadTotal != 0 || report.Source != ScriptsSource || report.SchemaVersion != 3 {
+		t.Fatalf("packages %v unread %v", pathsOf(report), report.UnreadTotal)
 	}
 	for key, w := range want {
 		p, ok := got[key]
-		if !ok || !reflect.DeepEqual(p.Events, w.events) || p.Native != w.native || declared[key] != w.declared {
-			t.Fatalf("%s: %+v declared=%v, want %+v", key, p, declared[key], w)
+		if !ok || !reflect.DeepEqual(p.Events, w.events) || p.Gyp != w.gyp || p.Declared != w.declared {
+			t.Fatalf("%s: %+v, want %+v", key, p, w)
 		}
 	}
 }
@@ -254,7 +253,7 @@ func TestScriptsHostileInputsAreNotTrusted(t *testing.T) {
 	unread := map[string]bool{}
 	for _, p := range report.Unread {
 		unread[p.Name] = true
-		if len(p.Events) != 0 || p.Native {
+		if len(p.Events) != 0 || p.Gyp {
 			t.Fatalf("%s was read: %+v", p.Name, p)
 		}
 	}
@@ -263,8 +262,8 @@ func TestScriptsHostileInputsAreNotTrusted(t *testing.T) {
 			t.Fatalf("%s is not among the unread: %v", name, report.Unread)
 		}
 	}
-	if len(report.Packages) != 0 || len(report.Undeclared) != 1 || report.Undeclared[0].Name != "evil" || report.Undeclared[0].Version != "?" || report.UnreadTotal != 5 {
-		t.Fatalf("packages %v undeclared %+v unread %d", pathsOf(report), report.Undeclared, report.UnreadTotal)
+	if len(report.Packages) != 1 || report.Packages[0].Name != "evil" || report.Packages[0].Version != "?" || report.Packages[0].Declared || report.UnreadTotal != 5 {
+		t.Fatalf("packages %+v unread %d", report.Packages, report.UnreadTotal)
 	}
 }
 
@@ -283,15 +282,15 @@ func TestScriptsRootInstallTimeScripts(t *testing.T) {
 	dir := t.TempDir()
 	manifest := []byte(`{"name":"p","scripts":{"postinstall":"a","prepare":"b","postprepare":"c","test":"d","build":"e"}}`)
 	report, err := ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: manifest, RootDir: dir})
-	if err != nil || report.Root == nil || !reflect.DeepEqual(report.Root.Events, []string{"postinstall", "prepare", "postprepare"}) || report.Root.Native {
+	if err != nil || report.Root == nil || !reflect.DeepEqual(report.Root.Events, []string{"postinstall", "prepare", "postprepare"}) || report.Root.Gyp {
 		t.Fatalf("%+v %v", report.Root, err)
 	}
-	// a binding.gyp at the root with no install or preinstall script is the implicit native build
+	// a binding.gyp file at the root is a fact of the project, whatever scripts it has
 	if err := os.WriteFile(filepath.Join(dir, "binding.gyp"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	report, _ = ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"name":"p"}`), RootDir: dir})
-	if report.Root == nil || !report.Root.Native {
+	if report.Root == nil || !report.Root.Gyp {
 		t.Fatalf("%+v", report.Root)
 	}
 	// a directory of that name is no native build, for the project as for a package
@@ -300,8 +299,8 @@ func TestScriptsRootInstallTimeScripts(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, _ = ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"name":"p"}`), RootDir: dirRoot})
-	if report.Root == nil || report.Root.Native {
-		t.Fatalf("a directory named binding.gyp is a native build of the project: %+v", report.Root)
+	if report.Root == nil || report.Root.Gyp {
+		t.Fatalf("a directory named binding.gyp is a binding.gyp of the project: %+v", report.Root)
 	}
 	if _, err := ReadScripts(ScriptsRequest{Lock: lockOf(nil), RootManifest: []byte(`{"scripts":{"a":"x","a":"y"}}`), RootDir: dir}); err == nil {
 		t.Fatal("a manifest with a repeated member was read")

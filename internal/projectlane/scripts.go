@@ -17,18 +17,16 @@ import (
 // that has install-time scripts, so that the operator is told which ones did not run. Two sources, never npm's messages and never a
 // question to npm:
 //
-//   - the published tree: each package's own package.json (a preinstall, install or postinstall script) and binding.gyp (npm's
-//     implicit native build: a binding.gyp FILE, no install and no preinstall script, and gypfile not false, on npm 11.20.0 and 12.2.1);
+//   - the published tree: facts read from each package's own files, a preinstall, install or postinstall script in its package.json and
+//     a binding.gyp that is a file as npm sees it (a regular file, a link to one included; a directory of that name is not);
 //   - the judged lockfile: `hasInstallScript`, which is all there is when no tree was published (--dry-run, --package-lock-only).
 //
-// Where the tree has scripts that the lockfile entry does not declare, npm itself does not run them the way it runs a declared one
-// (measured on npm 11.20.0 and 12.2.1, on the tree the binder publishes, with the flag absent): `npm ci` with scripts on runs NOTHING
-// for a package whose only install-time script is a script, runs the implicit native build of a package that has a binding.gyp, and
-// for a package with a postinstall AND a binding.gyp runs only the native build; `npm rebuild <path>` with scripts on likewise runs
-// nothing for the first, the native build for the second, and the native build and the script for the third. Such a package is
-// reported apart ("undeclared"), with what npm does about it, and its path is in the printed command only when `npm rebuild` runs
-// something for it. A package whose files cannot be read is reported apart ("unread"): nothing is said about its scripts and it has
-// no command.
+// The reader states facts and nothing else. What npm does with them is not its business and no rule here predicts it: not whether a
+// binding.gyp is built (gypfile, the scripts beside it), not whether a script runs when the lockfile entry does not declare it, not
+// which package a command would introduce under a selection. Every package whose own files hold one of the facts is listed, with
+// whether its lockfile entry declares scripts as one more fact. A package whose files cannot be read is listed apart as unread: nothing
+// is said about it. The measures that the report's sentences still rest on (what `npm rebuild <path>` and `npm run <event>
+// --ignore-scripts` do, on npm 11.20.0 and 12.2.1) are held by the live suite, tests/live/project_lane_no_scripts.sh.
 const (
 	ScriptsSource = "tree"
 	ScriptsLock   = "lockfile"
@@ -37,7 +35,7 @@ const (
 	scriptsMaxLock     = 256 << 20
 )
 
-// ScriptPackage is one installed package with install-time scripts, or one that could not be read.
+// ScriptPackage is one installed package whose own files hold install-time scripts or a binding.gyp, or that could not be read.
 type ScriptPackage struct {
 	Path    string `json:"path"`
 	Name    string `json:"name"`
@@ -47,31 +45,29 @@ type ScriptPackage struct {
 	// rebuilt through its host's path, also when the host has no script, and not by its own path).
 	Host        string   `json:"host,omitempty"`
 	RebuildPath string   `json:"rebuild_path"`
-	Events      []string `json:"events"` // of preinstall, install, postinstall, in npm's order (tree source only)
-	Native      bool     `json:"native"` // the implicit native build
+	Events      []string `json:"events"`   // of preinstall, install, postinstall, in npm's order, as the package.json holds them (tree source only)
+	Gyp         bool     `json:"gyp"`      // a binding.gyp file is there (tree source only)
+	Declared    bool     `json:"declared"` // the lockfile entry says hasInstallScript: true
 }
 
-// RootScripts is the project's own install-time scripts (the manifest the lane published).
+// RootScripts is the project's own install-time scripts (the manifest the lane published) and whether a binding.gyp file is in it.
 type RootScripts struct {
 	Events []string `json:"events"` // of the seven npm runs on a bare install, in npm's order
-	Native bool     `json:"native"`
+	Gyp    bool     `json:"gyp"`
 }
 
-// ScriptsReport is the document `safe-core project-scripts` prints (schema 2). Packages are those whose lockfile entry declares
-// install scripts and whose files (or, without a tree, whose entry) have them; Undeclared are those whose files have scripts that
-// their entry does not declare; Unread are those whose directory or package.json could not be read. Each list is cut at the request's
-// limit and its Total is the true count.
+// ScriptsReport is the document `safe-core project-scripts` prints (schema 3). Packages are those whose own files (or, without a tree,
+// whose lockfile entry) hold the facts above; Unread are those whose directory or package.json could not be read. Each list is cut at
+// the request's limit and its Total is the true count.
 type ScriptsReport struct {
-	SchemaVersion   int             `json:"schema_version"`
-	Source          string          `json:"source"`   // tree or lockfile
-	Previous        string          `json:"previous"` // read, none, or unreadable (every package is then counted as introduced)
-	Total           int             `json:"total"`
-	Packages        []ScriptPackage `json:"packages"`
-	UndeclaredTotal int             `json:"undeclared_total"`
-	Undeclared      []ScriptPackage `json:"undeclared"`
-	UnreadTotal     int             `json:"unread_total"`
-	Unread          []ScriptPackage `json:"unread"`
-	Root            *RootScripts    `json:"root,omitempty"`
+	SchemaVersion int             `json:"schema_version"`
+	Source        string          `json:"source"`   // tree or lockfile
+	Previous      string          `json:"previous"` // read, none, or unreadable (every package is then counted as introduced)
+	Total         int             `json:"total"`
+	Packages      []ScriptPackage `json:"packages"`
+	UnreadTotal   int             `json:"unread_total"`
+	Unread        []ScriptPackage `json:"unread"`
+	Root          *RootScripts    `json:"root,omitempty"`
 }
 
 // ScriptsRequest is what is read.
@@ -93,7 +89,7 @@ var packageEvents = []string{"preinstall", "install", "postinstall"}
 
 // ReadScripts builds the report.
 func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
-	report := ScriptsReport{SchemaVersion: 2, Source: ScriptsLock, Previous: "none", Packages: []ScriptPackage{}, Undeclared: []ScriptPackage{}, Unread: []ScriptPackage{}}
+	report := ScriptsReport{SchemaVersion: 3, Source: ScriptsLock, Previous: "none", Packages: []ScriptPackage{}, Unread: []ScriptPackage{}}
 	if req.TreeRoot != "" {
 		report.Source = ScriptsSource
 	}
@@ -121,7 +117,8 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 		if !introduced(lock, previous, key) {
 			continue
 		}
-		pkg := ScriptPackage{Path: key, Name: packageNameOfPath(key), Version: printableVersion(entry.Version), Events: []string{}, RebuildPath: key}
+		pkg := ScriptPackage{Path: key, Name: packageNameOfPath(key), Version: printableVersion(entry.Version), Events: []string{}, RebuildPath: key,
+			Declared: strings.TrimSpace(string(entry.HasInstallScript)) == "true"}
 		if outer, bundled := outermostHost(lock, key); bundled {
 			pkg.RebuildPath = outer
 			hostVersion := "?"
@@ -130,9 +127,8 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 			}
 			pkg.Host = packageNameOfPath(outer) + "@" + hostVersion
 		}
-		declared := strings.TrimSpace(string(entry.HasInstallScript)) == "true"
 		if req.TreeRoot == "" {
-			if declared {
+			if pkg.Declared {
 				report.Packages = append(report.Packages, pkg)
 			}
 			continue
@@ -145,30 +141,26 @@ func ReadScripts(req ScriptsRequest) (ScriptsReport, error) {
 			report.Unread = append(report.Unread, pkg)
 			continue
 		}
-		events, native, rerr := packageScripts(dir)
+		events, gyp, rerr := packageFacts(dir)
 		if rerr != nil {
 			report.Unread = append(report.Unread, pkg)
 			continue
 		}
-		if len(events) == 0 && !native {
+		if len(events) == 0 && !gyp {
 			continue
 		}
-		pkg.Native = native
+		pkg.Gyp = gyp
 		if events != nil {
 			pkg.Events = events
 		}
-		if declared {
-			report.Packages = append(report.Packages, pkg)
-		} else {
-			report.Undeclared = append(report.Undeclared, pkg)
-		}
+		report.Packages = append(report.Packages, pkg)
 	}
-	for _, group := range []*[]ScriptPackage{&report.Packages, &report.Undeclared, &report.Unread} {
+	for _, group := range []*[]ScriptPackage{&report.Packages, &report.Unread} {
 		sort.Slice(*group, func(i, j int) bool { return (*group)[i].Path < (*group)[j].Path })
 	}
-	report.Total, report.UndeclaredTotal, report.UnreadTotal = len(report.Packages), len(report.Undeclared), len(report.Unread)
+	report.Total, report.UnreadTotal = len(report.Packages), len(report.Unread)
 	if req.Limit > 0 {
-		for _, group := range []*[]ScriptPackage{&report.Packages, &report.Undeclared, &report.Unread} {
+		for _, group := range []*[]ScriptPackage{&report.Packages, &report.Unread} {
 			if len(*group) > req.Limit {
 				*group = (*group)[:req.Limit]
 			}
@@ -270,9 +262,9 @@ func chainDir(treeRoot, key string) (string, chainResult) {
 	return dir, chainDirectory
 }
 
-// packageScripts reads a package directory: which of preinstall, install and postinstall it declares, and whether npm would build it
-// natively on its own.
-func packageScripts(dir string) (events []string, native bool, err error) {
+// packageFacts reads a package directory: which of preinstall, install and postinstall its package.json holds (a non-empty string), and
+// whether a binding.gyp file is there. No more: what npm makes of them is not decided here.
+func packageFacts(dir string) (events []string, gyp bool, err error) {
 	raw, err := readFileNoFollow(filepath.Join(dir, "package.json"), maxManifestBytes)
 	if err != nil {
 		return nil, false, err
@@ -281,7 +273,7 @@ func packageScripts(dir string) (events []string, native bool, err error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if err := strictjson.RejectVariants(members, "scripts", "gypfile"); err != nil {
+	if err := strictjson.RejectVariants(members, "scripts"); err != nil {
 		return nil, false, err
 	}
 	have, err := scriptNames(members["scripts"])
@@ -293,8 +285,7 @@ func packageScripts(dir string) (events []string, native bool, err error) {
 			events = append(events, name)
 		}
 	}
-	native = nativeBuild(dir, members, have)
-	return events, native, nil
+	return events, bindingGyp(dir), nil
 }
 
 func scriptNames(raw json.RawMessage) (map[string]bool, error) {
@@ -315,16 +306,8 @@ func scriptNames(raw json.RawMessage) (map[string]bool, error) {
 	return have, nil
 }
 
-// nativeBuild is npm's implicit native build: a binding.gyp in the directory, no install and no preinstall script, and gypfile not
-// false (measured on npm 11.20.0 and 12.2.1: postinstall alone still builds; preinstall alone, install alone and gypfile:false do not).
-func nativeBuild(dir string, members map[string]json.RawMessage, have map[string]bool) bool {
-	if have["install"] || have["preinstall"] {
-		return false
-	}
-	if value, ok := members["gypfile"]; ok && strings.TrimSpace(string(value)) == "false" {
-		return false
-	}
-	// as npm sees it: a regular file, a link to one included (Stat follows it); a directory of that name is no native build
+// bindingGyp: a binding.gyp as npm sees it, a regular file (a link to one included: Stat follows it); a directory of that name is not.
+func bindingGyp(dir string) bool {
 	info, err := os.Stat(filepath.Join(dir, "binding.gyp"))
 	return err == nil && info.Mode().IsRegular()
 }
@@ -333,6 +316,9 @@ func rootScripts(manifest []byte, dir string) (RootScripts, error) {
 	root := RootScripts{Events: []string{}}
 	members, err := strictjson.ParseObject(manifest)
 	if err != nil {
+		return root, fmt.Errorf("package.json: %w", err)
+	}
+	if err := strictjson.RejectVariants(members, "scripts"); err != nil {
 		return root, fmt.Errorf("package.json: %w", err)
 	}
 	have, err := scriptNames(members["scripts"])
@@ -344,7 +330,7 @@ func rootScripts(manifest []byte, dir string) (RootScripts, error) {
 			root.Events = append(root.Events, name)
 		}
 	}
-	root.Native = nativeBuild(dir, members, have)
+	root.Gyp = bindingGyp(dir)
 	return root, nil
 }
 

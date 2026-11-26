@@ -348,7 +348,7 @@ With `install.project_lane` on ([configuration](configuration.md)), npm
 `install`, `update`, `ci`, `dedupe` and `prune` (with `--dry-run`; with `--package-lock-only` for
 `install`, `update` and `dedupe` only) take the project lane instead: judged on what they introduce, installed by
 `safe-core project-bind` from the judged lockfile, with scripts off: the lane runs no lifecycle script and, after the publication, says which
-install-time scripts the command left unrun ([scripts](configuration.md)). `ci` has no projection: its plan is the lockfile on
+install-time scripts and `binding.gyp` files are on disk in what the command put there ([scripts](configuration.md)). `ci` has no projection: its plan is the lockfile on
 disk, and malice is read over the whole graph. A shape the lane cannot judge that is established (every
 file it comes from committed and unchanged: a recognised legacy lockfile, a source that is not a registry
 package, a committed `.npmrc` setting outside the allow-list) goes to the checks below after a

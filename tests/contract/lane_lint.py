@@ -24,7 +24,7 @@ Rules
       (it is started through the owners' resolved command only), and what an owner starts is one of the lane's three commands (config,
       a --package-lock-only projection, ci): `npm run`, `npm exec` and the like run code whatever --ignore-scripts says. The words
       that run scripts are written in one function, the text of the report (safe_gate_project_lane_scripts_lines), which is one jq
-      program from its first line to its last: it names no variable, function or substitution of the shell.
+      program (`jq -rs`) from its first line to its last, holding exactly one jq: it names no variable, function or substitution of the shell.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -273,7 +273,7 @@ def main(path):
         # (the report's text function prints the commands that run them, as a jq program that spans lines: it is held to being text)
         if fn == SCRIPT_TEXT:
             first = number == starts.get(fn, -1) + 1
-            if re.search(r"\$\(|`|\$\{|(?<![A-Za-z0-9_])(?:safe|SAFE)_", text) or (first and text != "  jq -r '") or (text == "}" and not before.endswith("'")):
+            if re.search(r"\$\(|`|\$\{|(?<![A-Za-z0-9_])(?:safe|SAFE)_", text) or (first and text != "  jq -rs '") or (text == "}" and not before.endswith("'")):
                 problems.append(f"{number}:{fn}:R11: the report's text function is not one jq program (it names something of the shell)")
             before = text
             continue
@@ -297,6 +297,10 @@ def main(path):
             problems.append(f"{number}:{fn}:R9: the standing decision's store is named outside the two questions")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:return|exit)\s+25[23](?![0-9])", bare):
             problems.append(f"{number}:{fn}:R8: a reserved status is written as a literal")
+    # R11: the report's text function holds exactly one jq (a second invocation would be a second program in a function held to being one)
+    jq_words = sum(len(re.findall(r"(?<![A-Za-z0-9_\-])jq(?![A-Za-z0-9_\-])", t)) for n, fn, t, b in lane if fn == SCRIPT_TEXT and not FN.match(t))
+    if jq_words != 1:
+        problems.append(f"0:{SCRIPT_TEXT}:R11: the report's text function holds {jq_words} jq words, not exactly one")
     if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
         problems.append("0::R9: the runner does not read the standing decision exactly once")
     # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them

@@ -240,36 +240,45 @@ pass and warnings under `environment.release_follow`.
   runs the same set of dependency scripts as a plain install, but not the project's own, not in npm's order and not with npm's handling
   of a failure, so it cannot be shown to run exactly what today's policy runs. On a host that follows the operator's standing policy
   (`ignore-scripts=true`) today's gate runs none either. After a verified publication the lane says which scripts did not run, from
-  data only (`safe-core project-scripts`: the judged lockfile and the published tree, never npm's messages, never a question to npm):
-  the packages the command put into the tree (new or changed against the previous tree's own record, `node_modules/.package-lock.json`;
-  every package for `ci`, which builds a whole new tree and is given no record) that declare a `preinstall`, `install` or `postinstall`
-  script or that npm builds natively on its own (a `binding.gyp` FILE, a link to one included, no `install` and no `preinstall` script,
-  `gypfile` not false: measured on both versions; a directory of that name is no native build). A bundled member has no resolved
-  location and no integrity of its own, its bytes come from its outermost host's tarball: it is introduced when that host's artifact is
-  (version, resolved, integrity) or when its own entry is, and it is named with that host. For a bare `install` and for `ci`, the
-  project's own install-time scripts, and not for an install that names packages. The commands are the ones measured: `npm rebuild
-  ./node_modules/<name> …` (a bundled member through its outermost host's path), and for the project's own scripts one `npm run
-  <event> --ignore-scripts` per defined event in npm's order (measured on both versions, also with `ignore-scripts=true` in the user
-  configuration: an explicitly named script runs whatever npm's script policy says, and its pre- and post- scripts do not run, which a
-  plain `npm run <event>` would). npm's script policy applies to the `npm rebuild`. The lines are built from tokens held to a grammar (a
-  package name, a version, an install path of `node_modules/<name>` steps, an event of a closed list, a host as `name@version`), checked
-  once in the core and again where the text is made; one token outside its grammar, an unreadable document, a document of another
-  version or a reader that fails gives the line "the report ... could not be read: <what failed>" and none of the document's text. The
-  lines are printed as they are: the lane's diagnostic cleaner is not applied, because it reads `basic`, `token` or `bearer` followed by
-  text as a credential and would turn a pasted `npm rebuild ./node_modules/basic ./node_modules/x` into a wildcard. **The tree decides where
-  the two sources disagree, and a package the lockfile entry does not declare is named apart** (measured on npm 11.20.0 and 12.2.1, on
-  the tree the lane publishes, the flag absent): `npm ci` and `npm rebuild <path>` with scripts on run nothing for a package whose only
-  install-time script is a script; run the native build of a package that has a `binding.gyp`; and for a script with a `binding.gyp`
-  `npm ci` runs only the build while `npm rebuild` runs the build and the script. Such a package is listed after the declared ones with
-  that sentence, and its path is in the command only where `npm rebuild` runs something for it; no workaround is printed. A package whose
-  directory or `package.json` cannot be read is named apart ("could not be read, so nothing is said ... and no command is given"), and
-  when the previous tree's record cannot be read the line says every package is counted as introduced. `--dry-run` and
-  `--package-lock-only` publish no tree: the report is then the lockfile's `hasInstallScript` alone for what the command would introduce,
-  labelled as such, with no command, and the project's own scripts are not named. At most 25 packages are listed per group, with the
-  count of the rest (the full list is the differential document's, ticket 1639), and the command says that `npm rebuild` with no
-  argument rebuilds every package of the tree, those already present included. A command that introduced nothing with scripts says
-  nothing about scripts. The copy of the previous tree's record is bounded in time and size and is not made for `ci`. Accepted limit: the
-  previous tree's record is the project's own file (a forged one can only make the report smaller, never the lane run anything).
+  data only (`safe-core project-scripts`: the judged lockfile and the published tree, never npm's messages, never a question to npm),
+  and it says what is on disk and nothing about what npm would do with it. **What it prints**, for the packages the command put into the
+  tree (new or changed against the previous tree's own record, `node_modules/.package-lock.json`; every package for `ci`, which builds a
+  whole new tree and is given no record): `install scripts did not run (the lane installs with scripts off): N introduced package(s)
+  have install-time scripts or a binding.gyp on disk: name@version (events; binding.gyp; bundled in host@version; not declared by its
+  lockfile entry), …`. A package is listed when its own files hold a `preinstall`, `install` or `postinstall` script or a `binding.gyp`
+  that is a file (a link to one included; a directory of that name is not); `gypfile`, the scripts beside the file and the lockfile flag
+  decide nothing about whether it is listed, and nothing is called a "native build". "Not declared by its lockfile entry" is a fact about
+  the entry (`hasInstallScript` is not true), printed next to the package. A package whose directory or `package.json` cannot be read is
+  named apart ("M introduced package(s) could not be read, so nothing is said about their scripts and no command is given for them").
+  A bundled member has no resolved location and no integrity of its own, its bytes come from its outermost host's tarball: it is
+  introduced when that host's artifact is (version, resolved, integrity) or when its own entry is, and it is named with that host.
+  **The command** is `npm rebuild` with the path of every listed package, each once (a bundled member through its outermost host's path:
+  measured, it is rebuilt through the host's path, also when the host has no script, and not by its own), followed by one sentence:
+  npm decides what it runs, its own script policy applies, and it can skip a script that a lockfile entry does not declare. That last
+  clause is the one measure every party made (npm 11.20.0 and 12.2.1, on the tree the lane publishes: `npm ci` and `npm rebuild <path>`
+  with scripts on run nothing for a package whose only install-time script is a script that its lockfile entry does not declare); the
+  live suite holds it. **The project's own scripts**, for a bare `install` and for `ci` and not for an install that names packages: one
+  `npm run <event> --ignore-scripts` per defined event in npm's order (measured on both versions, also with `ignore-scripts=true` in the
+  user configuration: an explicitly named script runs whatever npm's script policy says, and its pre- and post- scripts do not run,
+  which a plain `npm run <event>` would). **The project's own `binding.gyp`** is stated as a fact ("this project has a binding.gyp file,
+  which the lane did not build"), with no command: `npm rebuild .` runs the build but also the project's `postinstall` when it has one,
+  and on npm 12 nothing unless the policy allows it (measured, live suite). **The lines are built from tokens held to a grammar** (a
+  package name, a version, an install path of `node_modules/<name>` steps, an event of a closed list, a host as `name@version`, booleans
+  for the flags), checked once in the core and again where the text is made, anchored on the whole string (a final newline would split
+  a printed command); the document must be exactly one, of this schema version. One token outside its grammar, an unreadable document,
+  none or two, a version of another schema, or a reader that fails gives the line "the report ... could not be read: <what failed>" and
+  none of the document's text. The lines are printed as they are: the lane's diagnostic cleaner is not applied, because it reads `basic`,
+  `token` or `bearer` followed by text as a credential and would turn a pasted `npm rebuild ./node_modules/basic ./node_modules/x` into a
+  wildcard. When the previous tree's record cannot be read (unparseable, a link, past the bound, a copy that does not end in time) the
+  line says every package of the tree is counted as introduced. `--dry-run` and `--package-lock-only` publish no tree: the report is the
+  lockfile's `hasInstallScript` alone, without a command and without the project's own scripts: "the lockfile declares install scripts
+  for N package(s)", followed, when the installed tree's record was read, by "that are new or changed against the installed tree's
+  record"; it does not say what the command would introduce (a selection such as `--omit=dev` is not applied to the lockfile). At most
+  25 packages are listed per list, with the count of the rest (the full list is the differential document's, ticket 1639), and the
+  command then says that `npm rebuild` with no argument rebuilds every package of the tree, those already present included. A command
+  that introduced nothing with scripts says nothing about scripts. The copy of the previous tree's record is bounded in time and takes
+  one byte more than the reader's bound, so that an oversized record is refused by the reader; it is not made for `ci`. Accepted limit:
+  the previous tree's record is the project's own file (a forged one can only make the report smaller, never the lane run anything).
   **How each verb yields its plan.** `install` and `update`: the original arguments resolved in the
   scratch copy, lockfile only. `dedupe` and `prune`: the same, with the verb's own arguments (npm writes
   a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries

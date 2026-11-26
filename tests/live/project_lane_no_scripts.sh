@@ -14,11 +14,16 @@
 # wiring around the binder (the hermetic suite pins the frozen command's flags and that the lane starts no other npm), and a
 # canonical-registry artifact whose scripts a real publisher wrote.
 #
-# It also holds what the report says about RUNNING them (measured on both versions; the report's words rest on these): for a package whose
-# lockfile entry lacks hasInstallScript, `npm ci` and `npm rebuild <path>` run nothing for an install-time script, run the implicit native
-# build for a binding.gyp, and for a postinstall plus a binding.gyp `npm ci` runs only the build while `npm rebuild` runs both; and
-# `npm run <event> --ignore-scripts` runs the named event alone, for each of the seven events, also with ignore-scripts=true in the user
-# configuration.
+# It also holds the measures the report's few sentences about running them rest on (npm 11.20.0 and 12.2.1, every npm call's exit status
+# checked: an absence is asserted only after a success): for a package whose lockfile entry lacks hasInstallScript, `npm ci` and
+# `npm rebuild <path>` run nothing for an install-time script (the one clause the report's command carries: npm can skip a script a
+# lockfile entry does not declare); a bundled member's script runs when its host's path is rebuilt, also when the host has no script,
+# and not by the member's own path; `npm run <event> --ignore-scripts` runs the event alone, for each of the seven events, also with
+# ignore-scripts=true in the user configuration; and what `npm rebuild .` runs for the project's own scripts and binding.gyp (the report
+# states a project's binding.gyp as a fact because that command is not one command: it also runs the project's postinstall, and on
+# npm 12 nothing unless the policy allows).
+#
+# No test here ever runs a lifecycle script of a package from a real registry: scripts run only for this suite's own loopback fixtures.
 #
 # Controls, so that the suite can fail: the same project installed by plain `npm ci` with scripts on writes the markers (the
 # dependency's, the bundled member's, the native build's and the project's own seven); and the binder given a frozen command without
@@ -155,7 +160,9 @@ control_case() { # <version>: the same fixtures with scripts ON write the marker
   judged="$(project_verb "${node}" "${project}" install)" || { fail "${version}: control: the projection failed"; return; }
   cp "${judged}/package-lock.json" "${project}/package-lock.json"
   [[ "${version}" != 12.* ]] || extra=(--dangerously-allow-all-scripts)
-  npm_in "${node}" "${project}" ci --no-audit --no-fund "${extra[@]}" $(dest) >"${WORK}/control.out" 2>&1
+  if ! npm_in "${node}" "${project}" ci --no-audit --no-fund "${extra[@]}" $(dest) >"${WORK}/control.out" 2>&1; then
+    fail "${version}: control: npm ci with scripts on exited ${?}: $(tail -n 2 "${WORK}/control.out" | tr '\n' ' ')"; return
+  fi
   got="$(sort -u "${MARKS}" 2>/dev/null | tr '\n' ';')"
   for want in "dep-install install" "dep-all postinstall" "dep-host postinstall" "dep-bundled postinstall" "dep-gyp install" "dep-bin postinstall" "root preinstall" "root install" "root postinstall" "root prepublish" "root preprepare" "root prepare" "root postprepare"; do
     [[ "${got}" == *"${want};"* ]] || { fail "${version}: control (scripts on): no marker for ${want} (got ${got})"; return; }
@@ -173,35 +180,51 @@ control_case() { # <version>: the same fixtures with scripts ON write the marker
 
 
 # What the report says about running the scripts it names (measured on the lane's own published tree).
+okrun() { # <label> <npm call…>: runs an npm call and fails the case unless it exits 0 (an absence of markers is no claim after a failure)
+  local label="$1"
+  shift
+  "$@" >"${WORK}/okrun.out" 2>&1 || { fail "${label}: npm exited ${?}: $(tail -n 2 "${WORK}/okrun.out" | tr '\n' ' ')"; return 1; }
+}
+marks() { sort -u "${MARKS}" | tr '\n' ';'; }
+
 claims_case() { # <version>
-  local version="$1" node="${MISE}/${NODE_OF[$1]}" project="${WORK}/proj-claims" judged shape name flag expect_ci expect_rb got_ci got_rb extra=() ev
+  local version="$1" node="${MISE}/${NODE_OF[$1]}" project="${WORK}/proj-claims" judged name flag expect got_ci got_rb extra=() ev
   [[ "${version}" != 12.* ]] || extra=(--dangerously-allow-all-scripts)
-  for shape in "dep-install|absent||" "dep-gyp|absent|dep-gyp install;|dep-gyp install;" "dep-both|absent|dep-both install;|dep-both install;dep-both postinstall;" "dep-install|present||dep-install install;"; do
-    IFS='|' read -r name flag expect_ci expect_rb <<<"${shape}"
+  # 1. a script-only package whose lockfile entry lacks hasInstallScript: npm ci and npm rebuild <path> run nothing (control: flag present)
+  for flag in absent present; do
+    name=dep-install
     new_project "${project}" "\"dependencies\":{\"${name}\":\"1.0.0\"}"
-    judged="$(project_verb "${node}" "${project}" install)" || { fail "${version}: claims ${name}: the projection failed"; return; }
+    judged="$(project_verb "${node}" "${project}" install)" || { fail "${version}: claims: the projection failed"; return; }
     if [[ "${flag}" == absent ]]; then
       jq -c 'del(.packages["node_modules/'"${name}"'"].hasInstallScript)' "${judged}/package-lock.json" > "${judged}/lock.new" && mv "${judged}/lock.new" "${judged}/package-lock.json"
     fi
-    # plain `npm ci` with scripts on, from that lockfile
     : > "${MARKS}"; rm -rf "${WORK}/proj-claims-ci"; mkdir -p "${WORK}/proj-claims-ci"
     cp "${project}/package.json" "${project}/.npmrc" "${WORK}/proj-claims-ci/"; cp "${judged}/package-lock.json" "${WORK}/proj-claims-ci/"
-    npm_in "${node}" "${WORK}/proj-claims-ci" ci --no-audit --no-fund "${extra[@]}" $(dest) >/dev/null 2>&1
-    got_ci="$(sort -u "${MARKS}" | tr '\n' ';')"
-    # the lane's tree (verified, published), then `npm rebuild <path>` with scripts on
-    : > "${MARKS}"; cp "${judged}/package-lock.json" "${project}/package-lock.json.judged"
-    bind "${node}" "${project}" "${judged}" ci --ignore-scripts --no-audit --no-fund $(dest) || { fail "${version}: claims ${name}: the binder failed"; return; }
-    npm_in "${node}" "${project}" rebuild "./node_modules/${name}" --no-audit --no-fund "${extra[@]}" $(dest) >/dev/null 2>&1
-    got_rb="$(sort -u "${MARKS}" | tr '\n' ';')"
-    if [[ "${flag}" == absent ]]; then
-      if [[ "${got_ci}" == "${expect_ci}" && "${got_rb}" == "${expect_rb}" ]]; then pass "${version}: ${name}, lockfile flag absent: npm ci ran [${got_ci}], npm rebuild on the lane's tree ran [${got_rb}]"
-      else fail "${version}: ${name}, lockfile flag absent: npm ci ran [${got_ci}] (want [${expect_ci}]), npm rebuild ran [${got_rb}] (want [${expect_rb}])"; fi
+    okrun "${version}: claims ${flag}: npm ci" npm_in "${node}" "${WORK}/proj-claims-ci" ci --no-audit --no-fund "${extra[@]}" $(dest) || return
+    got_ci="$(marks)"
+    : > "${MARKS}"
+    bind "${node}" "${project}" "${judged}" ci --ignore-scripts --no-audit --no-fund $(dest) || { fail "${version}: claims ${flag}: the binder failed"; return; }
+    okrun "${version}: claims ${flag}: npm rebuild" npm_in "${node}" "${project}" rebuild "./node_modules/${name}" --no-audit --no-fund "${extra[@]}" $(dest) || return
+    got_rb="$(marks)"
+    if [[ "${flag}" == absent ]]; then expect=""; else expect="dep-install install;"; fi
+    if [[ "${got_rb}" == "${expect}" && ( "${flag}" == present || -z "${got_ci}" ) ]]; then
+      pass "${version}: ${name}, lockfile flag ${flag}: npm ci ran [${got_ci}] and npm rebuild on the lane's tree ran [${got_rb}], both exit 0"
     else
-      if [[ "${got_rb}" == "${expect_rb}" ]]; then pass "${version}: ${name}, lockfile flag present (control): npm rebuild on the lane's tree ran [${got_rb}]"
-      else fail "${version}: ${name}, flag present: npm rebuild ran [${got_rb}] (want [${expect_rb}])"; fi
+      fail "${version}: ${name}, lockfile flag ${flag}: npm ci ran [${got_ci}], npm rebuild ran [${got_rb}] (want rebuild [${expect}], and nothing from npm ci when the flag is absent)"
     fi
   done
-  # `npm run <event> --ignore-scripts` runs the named event alone: each of the seven, with the user's configuration saying ignore-scripts=true
+  # 2. a bundled member's script runs when its host's path is rebuilt, also when the host has no script, and not by the member's own path
+  new_project "${project}" "\"dependencies\":{\"dep-shell\":\"1.0.0\"}"
+  judged="$(project_verb "${node}" "${project}" install)" || { fail "${version}: claims bundled: the projection failed"; return; }
+  : > "${MARKS}"
+  bind "${node}" "${project}" "${judged}" ci --ignore-scripts --no-audit --no-fund $(dest) || { fail "${version}: claims bundled: the binder failed"; return; }
+  okrun "${version}: claims bundled: rebuild by the member's own path" npm_in "${node}" "${project}" rebuild ./node_modules/dep-shell/node_modules/dep-bundled --no-audit --no-fund "${extra[@]}" $(dest) || return
+  got_ci="$(marks)"
+  okrun "${version}: claims bundled: rebuild by the host's path" npm_in "${node}" "${project}" rebuild ./node_modules/dep-shell --no-audit --no-fund "${extra[@]}" $(dest) || return
+  got_rb="$(marks)"
+  if [[ -z "${got_ci}" && "${got_rb}" == "dep-bundled postinstall;" ]]; then pass "${version}: a bundled member's script (host without script) did not run by the member's own path [${got_ci}] and ran through the host's path [${got_rb}]"
+  else fail "${version}: bundled member: own path ran [${got_ci}], host path ran [${got_rb}]"; fi
+  # 3. `npm run <event> --ignore-scripts` runs the named event alone: each of the seven, with the user's configuration saying ignore-scripts=true
   local rootdir="${WORK}/proj-run" names=()
   for ev in preinstall install postinstall prepublish preprepare prepare postprepare; do names+=("${ev}" "pre${ev}" "post${ev}"); done
   rm -rf "${rootdir}"; mkdir -p "${rootdir}"
@@ -211,14 +234,40 @@ claims_case() { # <version>
   local bad=""
   for ev in preinstall install postinstall prepublish preprepare prepare postprepare; do
     : > "${MARKS}"
-    npm_in "${node}" "${rootdir}" run "${ev}" --ignore-scripts >/dev/null 2>&1
+    okrun "${version}: npm run ${ev}" npm_in "${node}" "${rootdir}" run "${ev}" --ignore-scripts || { rm -f "${WORK}/home/.npmrc"; return; }
     [[ "$(tr '\n' ' ' < "${MARKS}")" == "${ev} " ]] || bad="${bad} ${ev}=[$(tr '\n' ' ' < "${MARKS}")]"
   done
   : > "${MARKS}"; rm -f "${WORK}/home/.npmrc"
-  npm_in "${node}" "${rootdir}" run postinstall >/dev/null 2>&1
+  okrun "${version}: npm run postinstall (control)" npm_in "${node}" "${rootdir}" run postinstall || return
   [[ "$(tr '\n' ' ' < "${MARKS}")" == "prepostinstall postinstall postpostinstall " ]] || bad="${bad} control=[$(tr '\n' ' ' < "${MARKS}")]"
   if [[ -z "${bad}" ]]; then pass "${version}: npm run <event> --ignore-scripts runs the named event alone, for each of the seven, with ignore-scripts=true in the user configuration (control: without the flag the pre- and post- hooks run too)"
   else fail "${version}: npm run <event> --ignore-scripts:${bad}"; fi
+  # 4. what `npm rebuild .` runs for the project's own scripts and binding.gyp, on a published project (a lockfile and a tree built with scripts off)
+  local shape id gyp script policy want got
+  printf "const fs=require('fs');fs.appendFileSync(%s,['root',process.env.npm_lifecycle_event].join(' ')+'\\\\n');\n" "'${MARKS}'" > "${WORK}/marks/gyp.js"
+  for shape in "a||" "b||postinstall" "c||install" "d|nogyp|postinstall"; do
+    IFS='|' read -r id gyp script <<<"${shape}"
+    rootdir="${WORK}/proj-root-${id}"; rm -rf "${rootdir}"; mkdir -p "${rootdir}"
+    if [[ -n "${script}" ]]; then printf '{"name":"root","version":"1.0.0","scripts":{"%s":"node %s/marks/root.js"}}\n' "${script}" "${WORK}" > "${rootdir}/package.json"
+    else printf '{"name":"root","version":"1.0.0"}\n' > "${rootdir}/package.json"; fi
+    [[ "${gyp}" == nogyp ]] || printf '{"targets":[{"target_name":"x","type":"none","actions":[{"action_name":"mark","inputs":[],"outputs":["o"],"action":["node","%s/marks/gyp.js"]}]}]}\n' "${WORK}" > "${rootdir}/binding.gyp"
+    okrun "${version}: root ${id}: lockfile" npm_in "${node}" "${rootdir}" install --package-lock-only --ignore-scripts --no-audit --no-fund || return
+    okrun "${version}: root ${id}: tree" npm_in "${node}" "${rootdir}" ci --ignore-scripts --no-audit --no-fund || return
+    for policy in plain allowed; do
+      : > "${MARKS}"
+      okrun "${version}: root ${id}: npm rebuild ." npm_in "${node}" "${rootdir}" rebuild . --no-audit --no-fund $([[ "${policy}" == allowed ]] && printf '%s' --dangerously-allow-all-scripts) || return
+      got="$(marks)"
+      case "${id}:${policy}:${version%%.*}" in
+        a:*:11|a:allowed:12) want="root install;" ;;
+        b:*:11|b:allowed:12) want="root install;root postinstall;" ;;
+        c:*:11|c:allowed:12) want="root install;" ;;
+        d:*:11|d:allowed:12) want="root postinstall;" ;;
+        *) want="" ;;
+      esac
+      if [[ "${got}" == "${want}" ]]; then pass "${version}: npm rebuild . in a published project (binding.gyp: ${gyp:-yes}, script: ${script:-none}), policy ${policy}: ran [${got}]"
+      else fail "${version}: npm rebuild . (shape ${id}, ${policy}) ran [${got}], want [${want}]"; fi
+    done
+  done
 }
 
 TAG=none
