@@ -736,20 +736,19 @@ fi
 
 # --- scenario K: the scripts report on a real tree, through the real gate (ticket 1638) -----------------------------------------
 # husky@4.3.8 (published 2021-01-15, far older than the cooldown window, so its graph is judged as of T1 like the others): a registry
-# package whose own `install` script (`node husky install`) writes git hooks into the project's repository, and a `postinstall`. The lane
-# runs neither; the section names the package, the script events and the command that runs them. The script leaves something
-# observable, so the scenario also holds that nothing was written: the project's .git/hooks has no hook. A control installs the same
-# package with scripts on, in a repository of its own, to show that the hooks do appear (so that the absence can fail); if the control
-# writes none on this machine (husky skips itself when it thinks it runs in CI), the scenario proves the report and not the absence, and
-# says so.
-new_project "${WORK}/k" && new_project "${WORK}/k-control" || { fail "scenario K projects"; exit 1; }
-( cd "${WORK}/k-control" && unset CI CONTINUOUS_INTEGRATION HUSKY_SKIP_INSTALL && real_npm install husky@4.3.8 --ignore-scripts=false --no-audit --no-fund >"${WORK}/k-control.out" 2>&1 )
+# package that declares an `install` script (`node husky install`, which writes git hooks into the project's repository) and a
+# `postinstall`. The lane runs neither; the section names the package, the script events and the command that runs them, and the
+# project's repository holds no husky hook.
+# There is NO control that runs the package's scripts, and there must never be one: this suite does not execute a registry package's
+# lifecycle scripts (that would be an unaudited install running a stranger's code, outside the gate and against the operator's script
+# policy). That scripts DO run when they are on, and that the absence of their effect can therefore fail, is held with safe's own
+# loopback fixtures in tests/live/project_lane_no_scripts.sh; here the absence of hooks is asserted on what the package declares.
+new_project "${WORK}/k" || { fail "scenario K project"; exit 1; }
 hooks_written() { # <repository>: the number of git hooks husky wrote
   local hook count=0
   for hook in "$1"/.git/hooks/*; do [[ -f "${hook}" ]] && grep -q husky "${hook}" 2>/dev/null && count=$((count + 1)); done
   printf '%s' "${count}"
 }
-control_hooks="$(hooks_written "${WORK}/k-control")"
 gate_in "${WORK}/k" "${WORK}/k" install husky@4.3.8
 status=$?
 sed 's/^/# K gate: /' "${WORK}/k.err" | tail -n 5
@@ -761,14 +760,11 @@ if (( status == 0 )) && [[ -d "${WORK}/k/node_modules/husky" ]] \
 else
   fail "K1: exit ${status}; $(tail -n 4 "${WORK}/k.err")"
 fi
-if (( control_hooks > 0 )); then
-  if [[ "$(hooks_written "${WORK}/k")" == 0 ]]; then
-    pass "K2: husky's install script writes ${control_hooks} git hook(s) when run (control), and the lane's install wrote none: the script did not run"
-  else
-    fail "K2: the lane's install left husky hooks in the repository"
-  fi
+if (( status == 0 )) && jq -e '.scripts.install == "node husky install"' "${WORK}/k/node_modules/husky/package.json" >/dev/null 2>&1 \
+    && [[ -d "${WORK}/k/.git/hooks" || -d "${WORK}/k/.git" ]] && [[ "$(hooks_written "${WORK}/k")" == 0 ]]; then
+  pass "K2: the installed husky declares the install script that writes git hooks, and the project's repository holds none (no control runs a registry package's scripts; the loopback suite holds that scripts run when they are on)"
 else
-  printf '# K2: the control installed husky with scripts on and it wrote no hook here (husky skips itself in some environments): this scenario proves the report, not the absence\n'
+  fail "K2: husky hooks in the repository: $(hooks_written "${WORK}/k"); or the installed package no longer declares the script this scenario reads"
 fi
 
 # --- scenario J: the cooldown, on the real npm (ticket 1635) ---------------------------------------
