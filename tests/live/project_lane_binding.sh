@@ -800,7 +800,7 @@ if (( status == 0 )) && [[ -d "${WORK}/l/node_modules/semver" ]] \
 else
   fail "L1: exit ${status}; $(tail -n 4 "${WORK}/l.err")"
 fi
-report_file="$(find "${HOME}/.local/share/safe/project-lane/reports" -type f -name '*.json' -newer "${WORK}/l/package.json" 2>/dev/null | head -n 1)"
+report_file="$(find "${SAFE_DATA_DIR}/project-lane/reports" -type f -name '*.json' -newer "${WORK}/l/package.json" 2>/dev/null | head -n 1)"
 if [[ -n "${report_file}" ]] && "${WORK}/safe/bin/safe-core" project-report check "${report_file}" \
     && jq -e '.end == "published" and .passed == true and .status == 0 and .scan.status == "completed" and .scan.lockfile_published == true and .scan.summary.critical.python == 2
               and (.scan.summary.coverage_gaps | map(.scanner + ":" + .status) | sort) == ["osv-scanner:partial", "syft:skipped"]' "${report_file}" >/dev/null; then
