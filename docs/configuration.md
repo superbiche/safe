@@ -641,9 +641,11 @@ pass and warnings under `environment.release_follow`.
   install records of a publication are written, and a signal that came in meanwhile and that the binder did not carry ends the command
   then); from there to the scan it ends the command at once, with a document saying `interrupted` (no scan, the write bounded to two
   seconds); during the scan it stops the scan and every process of it, the scan is recorded as not completed because it was interrupted,
-  and the command ends with the signal's status; and **the command's status is settled when the document's writing starts**: a signal that
-  arrives during the writing or the scratch removal changes neither the document nor the process. The process always ends with the status
-  the document holds. The gate never creates, names, reads, lists or removes the reports directory (a lane lint rule): an unusable one
+  and the command ends with the signal's status (the write bounded to two seconds there too); and **the command's status is settled when
+  the document's writing starts**: a signal that arrives during the writing or the scratch removal changes neither the document nor the
+  process. The process always ends with the status the document holds. A signal that ends the command AFTER a verified publication says
+  so in one line (`safe: project lane: interrupted after publication: the judged tree, package.json and package-lock.json are in the
+  project`, or its lockfile-only wording): the status is the signal's, and the project holds what was judged. The gate never creates, names, reads, lists or removes the reports directory (a lane lint rule): an unusable one
   gates nothing, a clean install still exits 0 with one line and a refusal keeps its status and its last line. `safe-core project-report
   write` is the one writer: it builds the document from the pieces the run left (the decision report, the binder's result, the prompts, the
   scripts, the scan's summary, the digests of the judged lockfiles) and from nothing else, establishes its directories itself and writes

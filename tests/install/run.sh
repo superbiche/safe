@@ -8217,6 +8217,8 @@ case "${tamper}:${sub}" in
   diff-no-request:project-diff)          jq -c 'del(.evidence_request)' <<<"${out}"; exit "${rc}" ;;
   diff-no-cooldown-request:project-diff) jq -c 'del(.cooldown_request)' <<<"${out}"; exit "${rc}" ;;
   decide-no-cooldown:project-decide)     jq -c 'del(.cooldown)' <<<"${out}"; exit "${rc}" ;;
+  # a clear decision that still carries a publish time nobody asked for (a reading set aside for a block that did not come)
+  decide-clear-on-skipped:project-decide) jq -c '.cooldown.skipped = 1' <<<"${out}"; exit "${rc}" ;;
   diff-bad-request:project-diff)         jq -c '.evidence_request = [{"name": 1}]' <<<"${out}"; exit "${rc}" ;;
   admit-ok-with-refusals:project-admit)  jq -c '.ok = true | .refusals = [{"where": "x", "text": "", "reason": "y"}]' <<<"${out}"; exit 0 ;;
   admit-two-documents:project-admit)     printf '%s\n%s\n' "${out}" "${out}"; exit "${rc}" ;;
@@ -9394,7 +9396,7 @@ JQ
 # B, D. a signal at every point: the process ends with the status the document holds, and from the validated decision on there is one document
 case_project_lane_report_a_signal_at_every_point_ends_with_the_status_the_document_holds() {
   skip_lockdiff_case "$FUNCNAME" || return
-  local phase sig code want_end doc_status docs
+  local phase sig code want_end doc_status docs said
   local -A codes=([INT]=130 [TERM]=143 [HUP]=129)
   local -a sigs=(INT TERM HUP)
   # a command started in the background ignores SIGINT from its start and cannot trap it: INT is then not tried (it is, in a foreground run)
@@ -9440,6 +9442,14 @@ case_project_lane_report_a_signal_at_every_point_ends_with_the_status_the_docume
         scan) [[ "$(report_jq '[.scan.status, .scan.reason, .binder.outcome] | join(" ")')" == "not_completed interrupted published" ]] || { fail "$FUNCNAME: scan/${sig}: $(jq -c .scan "$(report_one)")"; return; } ;;
         writer) [[ "$(report_jq '.passed')" == true ]] || { fail "$FUNCNAME: writer/${sig}: not a pass"; return; } ;;
       esac
+      # a signal that ends the command after the publication says, once, what the project holds; before a publication, and once the
+      # status is settled (the writer), there is nothing of the kind to say
+      case "${phase}" in
+        scripts|deferred|scan) said=1 ;;
+        *) said=0 ;;
+      esac
+      [[ "$(grep -c 'safe: project lane: interrupted after publication: the judged tree, package.json and package-lock.json are in the project' "${ERR_FILE}")" == "${said}" ]] \
+        || { fail "$FUNCNAME: ${phase}/${sig}: the publication is said $(grep -c 'interrupted after publication' "${ERR_FILE}") time(s), ${said} expected"; return; }
       assert_lane_no_leftover "$FUNCNAME: ${phase}/${sig}" || return
       [[ ! "$(find "$(report_dir)" -name '.staged-*' | head -1)" ]] || { fail "$FUNCNAME: ${phase}/${sig}: a staged file is left"; return; }
     done
@@ -9464,6 +9474,34 @@ case_project_lane_scan_a_signal_stops_the_scan_and_ends_the_command_at_once() {
   sleep 4
   [[ ! -e "${CASE_DIR}/grandchild-ran" ]] || { fail "$FUNCNAME: a child of the scan outlived the signal"; return; }
   assert_lane_no_leftover "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# A command a signal ends after a publication says what the project holds (the lockfile-only publication in its own words), and its
+# writer is bounded to two seconds whichever way the signal came: a writer that stalls while the command ends on a signal noted during
+# the scan is cut off, one line says the report was not written, and the status is the signal's.
+case_project_lane_a_signal_after_a_publication_says_so_and_bounds_the_writer() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scan_prepare "lane-sig-lockonly"
+  lane_instrument || return
+  sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-scripts ]]; then kill -TERM "$(cat "$HOME/lane.pid")"; fi' "${BIN_DIR}/safe-core"
+  NPM_LOCK_MUTATION_JSON="${SCAN_LOCK}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0 --package-lock-only'
+  assert_status 143 "$FUNCNAME: lockfile only" || return
+  [[ "$(report_count)" == 1 && "$(report_jq '[.end, .status, .binder.outcome, .passed] | join(" ")')" == "interrupted 143 published false" ]] \
+    || { fail "$FUNCNAME: lockfile only: $(report_count) documents, $(jq -c '[.end,.status,.binder,.passed]' "$(report_one)" 2>/dev/null)"; return; }
+  assert_err_contains_fragment 'safe: project lane: interrupted after publication: the judged package.json and package-lock.json are in the project; no tree was installed' "$FUNCNAME: lockfile only" || return
+  assert_err_not_contains_fragment 'the judged tree, package.json' "$FUNCNAME: lockfile only" || return
+  assert_lane_no_leftover "$FUNCNAME: lockfile only" || return
+  # the writer stalls for longer than a signalled command waits for it
+  scan_prepare "lane-sig-writer-stalls"
+  lane_instrument || return
+  sed -i '/^sub="\${1:-}"/a\if [[ "$sub" == project-report ]]; then sleep 8; fi' "${BIN_DIR}/safe-core"
+  SAFE_AUDIT_SCAN_SIGNAL_LANE=TERM SAFE_AUDIT_SCAN_SLEEP=3 scan_run
+  assert_status 143 "$FUNCNAME: stalled writer" || return
+  [[ "$(report_count)" == 0 ]] || { fail "$FUNCNAME: stalled writer: a document was written, so the command waited past the two seconds of a signalled command"; return; }
+  assert_err_contains_fragment "safe: project lane: the report could not be written in safe's data directory" "$FUNCNAME: stalled writer" || return
+  assert_err_contains_fragment 'safe: project lane: interrupted after publication: the judged tree, package.json and package-lock.json are in the project' "$FUNCNAME: stalled writer" || return
+  assert_lane_no_leftover "$FUNCNAME: stalled writer" || return
   pass "$FUNCNAME"
 }
 
@@ -10845,7 +10883,7 @@ case_project_lane_large_graph_reaches_a_verdict() {
 case_project_lane_success_needs_a_whole_decision_and_a_whole_bind_document() {
   skip_lockdiff_case "$FUNCNAME" || return
   local kind before
-  for kind in decide-clear-with-gaps decide-two-documents decide-clear-nonzero decide-stopped-zero decide-empty-classes \
+  for kind in decide-clear-with-gaps decide-two-documents decide-clear-nonzero decide-stopped-zero decide-empty-classes decide-clear-on-skipped \
       bind-published-nonzero bind-label-and-status bind-no-verification bind-not-committed bind-two-documents; do
     lane_prepare "lane-tamper-${kind}" kept@1.0.0
     before="$(lane_digests)"
@@ -18313,6 +18351,7 @@ main() {
     case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \
     case_project_lane_report_a_signal_at_every_point_ends_with_the_status_the_document_holds \
     case_project_lane_scan_a_signal_stops_the_scan_and_ends_the_command_at_once \
+    case_project_lane_a_signal_after_a_publication_says_so_and_bounds_the_writer \
     case_project_lane_report_the_socket_answer_is_the_one_the_operator_gave \
     case_project_lane_report_two_bundled_members_of_two_hosts_are_two_rows \
     case_project_lane_report_a_piece_that_could_not_be_read_is_named_not_counted_as_nothing \

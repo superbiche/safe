@@ -5539,7 +5539,11 @@ safe_gate_project_lane_record_confirmed() {
 # A decision report that is complete and consistent, or nothing: ONE document,
 # every member the rendering reads, the exit status the outcome's, and a
 # "clear" only when nothing is outstanding anywhere (no class, no coverage gap,
-# no uncleared introduced advisory, no malice, a bound graph, a graph baseline).
+# no uncleared introduced advisory, no malice, a bound graph, a graph baseline),
+# and never on a publish time that was not asked for: a reading set aside because
+# a block ended the command first (`skipped`) is neither a wait nor missing
+# evidence in the decision, so a clear decision that still carries one is refused
+# here, whatever path of the lane led to it.
 safe_gate_project_lane_report_ok() {
   jq -e -s --argjson rc "$2" '
     length == 1 and (.[0] | . as $r |
@@ -5562,6 +5566,7 @@ safe_gate_project_lane_report_ok() {
            and ($r.baseline.source == "graph" or $r.baseline.source == "empty")
            and ([$r.classes[] | .class] | sort) == ["adverse_advisory", "blocking_advisory", "malice", "missing_evidence", "socket_root", "wait"]
            and ([$r.cooldown.waits[] | select(.cleared | not)] | length) == 0 and (($r.cooldown.missing | length) == 0 or $r.gap_confirmed == true)
+           and (($r.cooldown.skipped // 0) == 0)
            and ([$r.classes[] | .outstanding] | add) == 0
            and ([$r.malice[] | select((.overridden // false) | not)] | length) == 0
            and (($r.coverage | length) == 0 or ($r.gap_confirmed == true))
@@ -6115,7 +6120,8 @@ safe_gate_project_lane_dispatch() {
 # The one path every end the lane handles goes through (ticket 1639): the lock is released, the scan runs when its conditions hold (a
 # verified publication, a normal end), the report document is written (its status is the command's PUBLIC status: the reserved
 # statuses are normalised here, before the write), and the scratch is freed. A signal before a decision exists writes no document; one
-# after it writes one, with the write bounded to two seconds and no scan. $1 the lane's status, $2 normal or signal.
+# after it writes one, with the write bounded to two seconds and no scan; one that ends the command after a verified publication says, in
+# one line, that the project holds what was judged. $1 the lane's status, $2 normal or signal.
 safe_gate_project_lane_finish() {
   local rc="$1" mode="$2" public="$1" bound=30
   SAFE_GATE_LANE_FINISHING=1
@@ -6131,8 +6137,17 @@ safe_gate_project_lane_finish() {
     # and one that comes in after this line changes neither the document nor the process
     SAFE_GATE_LANE_SETTLED=1
     [[ -z "${SAFE_GATE_LANE_FINISH_SIGNAL:-}" ]] || public="${SAFE_GATE_LANE_FINISH_SIGNAL}"
-    [[ "${mode}" == normal ]] || bound=2
+    # a command a signal ends bounds its writer to two seconds, whether the signal came before the finishing started or while the scan ran
+    [[ "${mode}" == normal && -z "${SAFE_GATE_LANE_FINISH_SIGNAL:-}" ]] || bound=2
     safe_gate_project_lane_report_write "${public}" "${bound}" || true
+    # A signal that ends the command AFTER a verified publication is said, in one line: the project holds what was judged, and a command
+    # that ends on a signal with nothing said reads as "nothing was installed".
+    if [[ "${mode}" == signal || -n "${SAFE_GATE_LANE_FINISH_SIGNAL:-}" ]]; then
+      case "${SAFE_GATE_LANE_FACT_PUBLISHED:-}" in
+        tree) safe_gate_err "safe: project lane: interrupted after publication: the judged tree, package.json and package-lock.json are in the project" ;;
+        lockfile) safe_gate_err "safe: project lane: interrupted after publication: the judged package.json and package-lock.json are in the project; no tree was installed" ;;
+      esac
+    fi
   fi
   SAFE_GATE_LANE_SETTLED=1
   safe_gate_project_lane_cleanup

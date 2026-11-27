@@ -627,8 +627,10 @@ write("the-settled-flag-raised-outside-its-owner", src[:fz.end()] + '  SAFE_GATE
 write("the-scan-process-set-outside-its-owners", src[:fz.end()] + '  SAFE_GATE_LANE_SCAN_PID=1\n' + src[fz.end():])
 write("a-second-invocation-inside-the-writer", src[:wr.end()] + '  "${core}" "${args[@]}" >/dev/null 2>&1\n' + src[wr.end():])
 write("a-second-writer-function-names-the-core-command", src[:sd.end()] + '  printf "%s" project-report\n' + src[sd.end():])
-fn_ = find(r'    safe_gate_project_lane_report_write "\$\{public\}" "\$\{bound\}" \|\| true\n  fi\n  SAFE_GATE_LANE_SETTLED=1\n  safe_gate_project_lane_cleanup\n')
-write("the-report-is-written-after-the-scratch-is-freed", src[:fn_.start()] + '  fi\n  SAFE_GATE_LANE_SETTLED=1\n  safe_gate_project_lane_cleanup\n  safe_gate_project_lane_report_write "${public}" "${bound}" || true\n' + src[fn_.end():])
+# the writer's call (rw, above) taken out of its place and put after the scratch is freed
+fn_ = find(r'  SAFE_GATE_LANE_SETTLED=1\n  safe_gate_project_lane_cleanup\n')
+assert rw.end() < fn_.start()
+write("the-report-is-written-after-the-scratch-is-freed", src[:rw.start()] + src[rw.end():fn_.end()] + '  safe_gate_project_lane_report_write "${public}" "${bound}" || true\n' + src[fn_.end():])
 write("the-finish-signal-written-outside-its-owners", src[:fz.end()] + '  SAFE_GATE_LANE_FINISH_SIGNAL=143\n' + src[fz.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline

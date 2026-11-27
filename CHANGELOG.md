@@ -13,7 +13,11 @@
   be read is named (`pieces_unread`) and its count is null, not zero, a binder piece lost after a publication still gives a document, a
   cooldown reading that was not made is `skipped`, not judged and not missing (line and document). A scan result with no coverage section is
   unreadable coverage. A writer never removes its own file. The lane lint holds the finishing path to no early end before the document and to
-  one start per caller.
+  one start per caller. From the coordinator's verification: a signal that ends the command after a verified publication says so in one
+  line (the command ended 130/143/129 with the judged tree in the project and nothing said); the writer of a command that ends on a signal
+  noted during the scan is bounded to two seconds, as on the other signal path (it was thirty); and the gate refuses a clear decision that
+  still carries a `skipped` publish time (the reading is neither a wait nor missing evidence in the decision, so nothing else would stop a
+  path that acted on one).
 - Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2; round two of the review). One document per
   command, written once by ONE path every end goes through (unlock, scan, document, scratch; a handled signal included, with the write
   bounded to two seconds and no scan), for every end at or after the decision, by `safe-core project-report write` (new; `check` is for
