@@ -851,5 +851,5 @@ package; it is trusted for one day at most and never when dated in the future, i
 `<state-dir>/advisory-records/` by `safe-core project-advisory-get`, `project-advisory-put` and `project-advisory-check` (the reader's strict reading of the answer) under the checks of
 the lane's other stores, and is never a decision, a policy label, a coverage statement or a hit list. A record that
 could not be fetched, read or classified is not stored, so a known-malware record or a new advisory is seen by the
-next call. A `withdrawn` member of a record that is not a timestamp makes the record malformed (missing evidence for the identities that carry it, nothing stored). No value whose size follows the number of identities travels as a process argument. The blocklist is read once for all the names (the per-name reading still decides each name a store holds
+next call. A `withdrawn` member of a record that is not a timestamp that existed (a date that converts to another, as 29 February 2025 does, is not one) makes the record malformed (missing evidence for the identities that carry it, nothing stored). No value whose size follows the number of identities travels as a process argument. The blocklist is read once for all the names (the per-name reading still decides each name a store holds
 an entry for).

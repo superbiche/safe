@@ -20,27 +20,30 @@ func TestParseAdvisoryGetRequestIsStrict(t *testing.T) {
 		in string
 		ok bool
 	}{
-		"whole":                        {`{"classifier":"c","keys":[` + goodKey + `]}`, true},
-		"no keys, an empty list":       {`{"classifier":"c","keys":[]}`, true},
-		"no keys member":               {`{"classifier":"c"}`, false},
-		"a null keys":                  {`{"classifier":"c","keys":null}`, false},
-		"a null classifier":            {`{"classifier":null,"keys":[]}`, false},
-		"an empty classifier":          {`{"classifier":"","keys":[]}`, false},
-		"a case variant of keys":       {`{"classifier":"c","Keys":[]}`, false},
-		"a case variant of classifier": {`{"Classifier":"c","keys":[]}`, false},
-		"a repeated member":            {`{"classifier":"c","classifier":"d","keys":[]}`, false},
-		"a repeated member in a key":   {`{"classifier":"c","keys":[{"id":"a","id":"b","modified":"s","package":"p"}]}`, false},
-		"a stray closing delimiter":    {`{"classifier":"c","keys":[]}}`, false},
-		"two documents":                {`{"classifier":"c","keys":[]}{"classifier":"c","keys":[]}`, false},
-		"a member too many":            {`{"classifier":"c","keys":[],"x":1}`, false},
-		"a key with a member too many": {`{"classifier":"c","keys":[{"id":"a","modified":"s","package":"p","x":1}]}`, false},
-		"a key missing a member":       {`{"classifier":"c","keys":[{"id":"a","modified":"s"}]}`, false},
-		"a key with a null member":     {`{"classifier":"c","keys":[{"id":"a","modified":null,"package":"p"}]}`, false},
-		"a key that is not an object":  {`{"classifier":"c","keys":["a"]}`, false},
-		"a key with a newline":         {`{"classifier":"c","keys":[{"id":"a","modified":"s\n","package":"p"}]}`, false},
-		"a key with an empty part":     {`{"classifier":"c","keys":[{"id":"a","modified":"","package":"p"}]}`, false},
-		"not an object":                {`[]`, false},
-		"empty":                        {``, false},
+		"whole":                                     {`{"classifier":"c","keys":[` + goodKey + `]}`, true},
+		"no keys, an empty list":                    {`{"classifier":"c","keys":[]}`, true},
+		"no keys member":                            {`{"classifier":"c"}`, false},
+		"a null keys":                               {`{"classifier":"c","keys":null}`, false},
+		"a null classifier":                         {`{"classifier":null,"keys":[]}`, false},
+		"an empty classifier":                       {`{"classifier":"","keys":[]}`, false},
+		"a case variant of keys":                    {`{"classifier":"c","Keys":[]}`, false},
+		"a case variant of classifier":              {`{"Classifier":"c","keys":[]}`, false},
+		"a repeated member":                         {`{"classifier":"c","classifier":"d","keys":[]}`, false},
+		"a repeated member in a key":                {`{"classifier":"c","keys":[{"id":"a","id":"b","modified":"s","package":"p"}]}`, false},
+		"a stray closing delimiter":                 {`{"classifier":"c","keys":[]}}`, false},
+		"two documents":                             {`{"classifier":"c","keys":[]}{"classifier":"c","keys":[]}`, false},
+		"a member too many":                         {`{"classifier":"c","keys":[],"x":1}`, false},
+		"a key with a member too many":              {`{"classifier":"c","keys":[{"id":"a","modified":"s","package":"p","x":1}]}`, false},
+		"a key missing a member":                    {`{"classifier":"c","keys":[{"id":"a","modified":"s"}]}`, false},
+		"a key with a null member":                  {`{"classifier":"c","keys":[{"id":"a","modified":null,"package":"p"}]}`, false},
+		"a key that is not an object":               {`{"classifier":"c","keys":["a"]}`, false},
+		"two revisions of one advisory and package": {`{"classifier":"c","keys":[{"id":"a","modified":"s","package":"p"},{"id":"a","modified":"t","package":"p"}]}`, false},
+		"one key twice":                             {`{"classifier":"c","keys":[{"id":"a","modified":"s","package":"p"},{"id":"a","modified":"s","package":"p"}]}`, true},
+		"one advisory, two packages, two stamps":    {`{"classifier":"c","keys":[{"id":"a","modified":"s","package":"p"},{"id":"a","modified":"t","package":"q"}]}`, true},
+		"a key with a newline":                      {`{"classifier":"c","keys":[{"id":"a","modified":"s\n","package":"p"}]}`, false},
+		"a key with an empty part":                  {`{"classifier":"c","keys":[{"id":"a","modified":"","package":"p"}]}`, false},
+		"not an object":                             {`[]`, false},
+		"empty":                                     {``, false},
 	} {
 		_, _, err := ParseAdvisoryGetRequest([]byte(tc.in))
 		if (err == nil) != tc.ok {
@@ -110,5 +113,15 @@ func TestCheckAdvisoryReplyIsStrict(t *testing.T) {
 		if tc.ok && name == "whole" && got["GHSA-a|p"] != "high" {
 			t.Fatalf("whole: %v", got)
 		}
+	}
+}
+
+// Asked two revisions of one advisory and package, a reply of two hits would collapse into one answer by order: refused, as the request is.
+func TestCheckAdvisoryReplyRefusesTwoRevisionsOfOneAdvisoryAndPackage(t *testing.T) {
+	asked := []AdvisoryKey{{ID: "GHSA-a", Modified: "s", Package: "p"}, {ID: "GHSA-a", Modified: "t", Package: "p"}}
+	now := wireNow.Unix()
+	hits := goodHit(now) + "," + strings.Replace(strings.Replace(goodHit(now), `"s"`, `"t"`, 1), "high", "moderate", 1)
+	if _, err := CheckAdvisoryReply([]byte(`{"schema_version":1,"hits":[`+hits+`]}`), asked, wireNow); err == nil {
+		t.Fatal("two revisions of one advisory and package gave one answer")
 	}
 }

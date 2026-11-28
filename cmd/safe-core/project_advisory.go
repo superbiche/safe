@@ -74,8 +74,15 @@ func projectAdvisoryCheck(args []string, stdin io.Reader, stdout, stderr io.Writ
 		fmt.Fprintln(stderr, projectAdvisoryCheckUsage)
 		return 2
 	}
-	requestRaw, err := os.ReadFile(args[1])
-	if err != nil || len(requestRaw) > projectlane.AdvisoryInputLimit {
+	// the bound is applied while the request is read, never after it is whole in memory
+	requestFile, err := os.Open(args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: project-advisory-check: unreadable request\n")
+		return 3
+	}
+	requestRaw, err := readAdvisoryInput(requestFile)
+	requestFile.Close()
+	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-advisory-check: unreadable request\n")
 		return 3
 	}

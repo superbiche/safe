@@ -27,7 +27,7 @@ func TestProjectAdvisoryPutThenGet(t *testing.T) {
 	if code, out, errText := runWithStdin(put, "project-advisory-put", "--state-dir", state); code != 0 || out != "" {
 		t.Fatalf("put: %d %q %q", code, out, errText)
 	}
-	get := `{"classifier":"c","keys":[{"id":"GHSA-a","modified":"s","package":"p"},{"id":"GHSA-b","modified":"s","package":"p"},{"id":"GHSA-a","modified":"t","package":"p"}]}`
+	get := `{"classifier":"c","keys":[{"id":"GHSA-a","modified":"s","package":"p"},{"id":"GHSA-b","modified":"s","package":"p"},{"id":"GHSA-c","modified":"t","package":"p"}]}`
 	code, out, errText := runWithStdin(get, "project-advisory-get", "--state-dir", state)
 	if code != 0 {
 		t.Fatalf("get: %d %q", code, errText)
@@ -109,5 +109,29 @@ func TestProjectAdvisoryCheckReadsAReplyStrictly(t *testing.T) {
 	}
 	if code, _, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check"); code != 2 {
 		t.Fatalf("no request argument: exit %d", code)
+	}
+}
+
+func TestProjectAdvisoryCheckRefusesTwoRevisionsAndAnOversizedRequest(t *testing.T) {
+	dir := t.TempDir()
+	two := filepath.Join(dir, "two.json")
+	if err := os.WriteFile(two, []byte(`{"classifier":"c","keys":[{"id":"GHSA-a","modified":"s","package":"p"},{"id":"GHSA-a","modified":"t","package":"p"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check", "--request", two); code != 3 || out != "" {
+		t.Fatalf("two revisions: exit %d, output %q", code, out)
+	}
+	// a request file past the bound is refused while it is read (a sparse file: nothing is written)
+	big := filepath.Join(dir, "big.json")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(66 << 20); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if code, out, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check", "--request", big); code != 3 || out != "" {
+		t.Fatalf("an oversized request: exit %d, output %q", code, out)
 	}
 }

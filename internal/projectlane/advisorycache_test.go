@@ -3,10 +3,13 @@
 package projectlane
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -355,7 +358,9 @@ func TestAdvisoryCacheMakesRoomBeforeItWrites(t *testing.T) {
 	}
 	defer handle.Close()
 	// the room is made by the step before the writes: with the store full and three readings to come, three entries are gone already
-	cache.makeRoom(handle, 3, advisoryNow)
+	cache.makeRoom(handle, map[string]bool{
+		advisoryEntryName("c", adv("GHSA-n1", "s", "p")): true, advisoryEntryName("c", adv("GHSA-n2", "s", "p")): true, advisoryEntryName("c", adv("GHSA-n3", "s", "p")): true,
+	}, advisoryNow)
 	if names, _ := os.ReadDir(dir); len(names) != AdvisoryCap-3 {
 		t.Fatalf("%d entries after making room for three, want %d", len(names), AdvisoryCap-3)
 	}
@@ -445,5 +450,114 @@ func TestAdvisoryCachePutNeverWritesPastTheCap(t *testing.T) {
 	}
 	if names, _ := os.ReadDir(dir); len(names) != AdvisoryCap {
 		t.Fatalf("%d entries at the end, want %d", len(names), AdvisoryCap)
+	}
+}
+
+// prefill writes n entries the way Put does (the same document, the same name, mode 0600) without its fsync, for the tests that need a store of a size
+func prefill(t *testing.T, state, classifier string, from, n int) {
+	t.Helper()
+	dir := filepath.Join(state, advisoryDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := from; i < from+n; i++ {
+		key := adv(fmt.Sprintf("GHSA-pre-%06d", i), "s", "p")
+		raw, _ := json.Marshal(advisoryEntry{AdvisoryCacheSchema, classifier, key, "low", false, advisoryNow.Unix()})
+		if err := os.WriteFile(filepath.Join(dir, advisoryEntryName(classifier, key)), append(raw, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func countEntries(t *testing.T, state string) int {
+	t.Helper()
+	names, err := os.ReadDir(filepath.Join(state, advisoryDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(names)
+}
+
+func fresh(from, n int) []AdvisoryReading {
+	var out []AdvisoryReading
+	for i := from; i < from+n; i++ {
+		out = append(out, advReading(adv(fmt.Sprintf("GHSA-new-%06d", i), "s", "p"), "moderate", advisoryNow))
+	}
+	return out
+}
+
+// Two writers (two projects' commands share the store) took a store of 9,600 to 10,400: one writer at a time, the count, the room and the writes under one lock.
+func TestAdvisoryCacheTwoWritersKeepTheCap(t *testing.T) {
+	state := privateState(t)
+	prefill(t, state, "c", 0, 9600)
+	cache := AdvisoryCache{StateDir: state}
+	var wg sync.WaitGroup
+	for _, start := range []int{0, 400} {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			cache.Put("c", fresh(start, 400), advisoryNow)
+		}(start)
+	}
+	wg.Wait()
+	if n := countEntries(t, state); n > AdvisoryCap {
+		t.Fatalf("%d entries after two writers, past the cap of %d", n, AdvisoryCap)
+	}
+}
+
+// Refreshing entries that exist takes no room: a full store stays full of what it held, the refreshed ones included.
+func TestAdvisoryCacheRefreshingEvictsNothing(t *testing.T) {
+	state := privateState(t)
+	prefill(t, state, "c", 0, AdvisoryCap)
+	cache := AdvisoryCache{StateDir: state}
+	var refresh []AdvisoryReading
+	for i := 0; i < 400; i++ {
+		refresh = append(refresh, advReading(adv(fmt.Sprintf("GHSA-pre-%06d", i), "s", "p"), "high", advisoryNow))
+	}
+	cache.Put("c", refresh, advisoryNow)
+	if n := countEntries(t, state); n != AdvisoryCap {
+		t.Fatalf("%d entries after refreshing 400 of a full store, want %d", n, AdvisoryCap)
+	}
+	for _, reading := range refresh {
+		if got := cache.Get("c", []AdvisoryKey{reading.AdvisoryKey}, advisoryNow); len(got) != 1 || got[0].Severity != "high" {
+			t.Fatalf("a refreshed reading is not there: %+v", got)
+		}
+	}
+	// a mixed request: 100 refreshed and 100 new on a full store: the new ones take room (200 - 100 = the 100 oldest of the others go), the refreshed stay
+	cache.Put("c", append(refresh[:100:100], fresh(0, 100)...), advisoryNow)
+	if n := countEntries(t, state); n != AdvisoryCap {
+		t.Fatalf("%d entries after 100 refreshed and 100 new, want %d", n, AdvisoryCap)
+	}
+}
+
+// A writer that cannot take the lock within the bound writes nothing and returns: the command that called it does not fail.
+func TestAdvisoryCacheWriterThatCannotLockWritesNothing(t *testing.T) {
+	state := privateState(t)
+	cache := AdvisoryCache{StateDir: state}
+	cache.Put("c", fresh(0, 1), advisoryNow)
+	held, err := os.Open(filepath.Join(state, advisoryDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	old := advisoryLockWait
+	advisoryLockWait = 150 * time.Millisecond
+	defer func() { advisoryLockWait = old }()
+	started := time.Now()
+	cache.Put("c", fresh(10, 5), advisoryNow)
+	if time.Since(started) > 5*time.Second {
+		t.Fatalf("a writer that cannot lock waited %v", time.Since(started))
+	}
+	if n := countEntries(t, state); n != 1 {
+		t.Fatalf("%d entries, the writer without the lock wrote some", n)
+	}
+	// the lock is not left behind by a writer that had it
+	_ = syscall.Flock(int(held.Fd()), syscall.LOCK_UN)
+	cache.Put("c", fresh(10, 5), advisoryNow)
+	if n := countEntries(t, state); n != 6 {
+		t.Fatalf("%d entries after the lock was free, want 6", n)
 	}
 }

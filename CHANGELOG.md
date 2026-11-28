@@ -14,7 +14,12 @@
   names lost its whole reading, and the base failed at 2,500 identities); the gate binds the reader to the core it verified; every stamp seen for an advisory
   (batch and pages) stays until the cache decides; a `withdrawn` that is not a timestamp is a malformed record; a stamp is one structured value from the key
   asked to the key stored; the store, its two commands and the reader's reading of the answer are strict (new `project-advisory-check`); the writer makes
-  room before it writes and removes only its own leftovers. `lane_instrument` of the install suite copies the library as a directory of its own.
+  room before it writes and removes only its own leftovers.
+  Review round 2: a withdrawal date must convert back to the text it was given (29 February 2025 withdrew an advisory); the request goes from stdin to a
+  file and no document of the mode rests in a variable, every local is `local +x` (a caller's export no longer fills the environment), a name over 214
+  characters or a version over 256 is malformed input; a stamp that could not be noted leaves the cache alone for the command; one writer at a time on the
+  store (a lock), room for the NEW keys only; stamps are counted in bytes on both sides and a key the store cannot hold is left out of the question; the
+  check command refuses two revisions of one advisory and reads its request under its bound. `lane_instrument` of the install suite copies the library as a directory of its own.
 
 ## 1.76.0 - 2026-11-28
 

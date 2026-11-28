@@ -147,7 +147,20 @@ func ParseAdvisoryGetRequest(raw []byte) (string, []AdvisoryKey, error) {
 		return "", nil, fmt.Errorf("a classifier and a list of keys are required")
 	}
 	keys, err := decodeKeys(request.Keys)
-	return request.Classifier, keys, err
+	if err != nil {
+		return "", nil, err
+	}
+	// two revisions of one advisory for one package are two answers to one question: no reading answers both, so the request is refused (the
+	// planner of the reader never asks two: it asks for an advisory only when the service gave it ONE stamp)
+	revisions := make(map[[2]string]string, len(keys))
+	for _, key := range keys {
+		identity := [2]string{key.ID, key.Package}
+		if stamp, asked := revisions[identity]; asked && stamp != key.Modified {
+			return "", nil, fmt.Errorf("two revisions of one advisory and package are asked")
+		}
+		revisions[identity] = key.Modified
+	}
+	return request.Classifier, keys, nil
 }
 
 // ParseAdvisoryPutRequest reads the request of project-advisory-put: {"classifier": "…", "readings": [{id, modified, package,
@@ -201,6 +214,9 @@ func CheckAdvisoryReply(raw []byte, asked []AdvisoryKey, now time.Time) (map[str
 			return nil, fmt.Errorf("two hits for one key")
 		}
 		seen[hit.AdvisoryKey] = true
+		if _, twice := out[hit.ID+"|"+hit.Package]; twice {
+			return nil, fmt.Errorf("two hits for one advisory and package")
+		}
 		if !validReading(hit) {
 			return nil, fmt.Errorf("a hit that is not a reading safe stores")
 		}
