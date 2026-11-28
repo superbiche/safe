@@ -295,11 +295,11 @@ case_operator_only() {
 }
 
 # ---- 8. the stand-in of the live binding suite is held to the same definition -------------------------------------------------------
-# tests/live/lane_stand_in_auditor.sh is what scenarios A to J give the gate in place of the auditor (a live run has no Socket credential and must
+# tests/lib/lane_stand_in_auditor.sh is what scenarios A to J give the gate in place of the auditor (a live run has no Socket credential and must
 # not depend on OSV). It answers every entry it stands for with the members and types of the real answers, or this case fails.
 case_live_stand_in() {
   prepare_case live-stand-in
-  local stand_in="$ROOT/tests/live/lane_stand_in_auditor.sh" ok=1 problems out="$CASE/answer.json"
+  local stand_in="$ROOT/tests/lib/lane_stand_in_auditor.sh" ok=1 problems out="$CASE/answer.json"
   chk() { if problems="$(lane_shape_check "$2" "$out")"; then :; else printf '%s: %s\n' "$1" "$problems" >&2; ok=0; fi; }
   printf '{"packages":[{"name":"a","version":"1.0.0"},{"name":"b","version":"1.0.0"},{"name":"c","version":"1.0.0"}]}' \
     | LIVE_ADVISORY_NAME=a LIVE_MALWARE_NAME=b bash "$stand_in" scanner-batch --evidence > "$out"

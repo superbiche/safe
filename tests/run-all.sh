@@ -85,7 +85,7 @@ EXCLUDED=(
   tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/lane_shape.sh           # the one definition of the lane's auditor answers (tests/lib/lane_auditor_shapes.json), sourced by suites, not a suite
-  tests/live/lane_stand_in_auditor.sh # the live binding suite's stand-in auditor, run by it and held to the contract by tests/contract/lane_auditor.sh, not a suite
+  tests/lib/lane_stand_in_auditor.sh # the live binding suite's stand-in auditor, run by it and held to the contract by tests/contract/lane_auditor.sh, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
   tests/lib/npm-option-gate-oracle.sh # the gate-level half of tests/live/npm_option_oracle.sh (SAFE_ORACLE_GATE=1), not a suite
   tests/lib/npm-option-judge.sh     # the judge the gate-level oracle sources, not a suite

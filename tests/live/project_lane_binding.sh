@@ -128,9 +128,9 @@ if ! ( cd "${ROOT}" && "${GO_BIN}" build -trimpath -ldflags "-X main.version=$(t
   fail "safe-core builds"
   exit 1
 fi
-# The advisory reader and the operator-side doors are a stand-in written to a file of its own (tests/live/lane_stand_in_auditor.sh): the
+# The advisory reader and the operator-side doors are a stand-in written to a file of its own (tests/lib/lane_stand_in_auditor.sh): the
 # hermetic contract suite holds it to the members of the real auditor's answers. Scenario R below runs the REAL auditor instead.
-cp "${ROOT}/tests/live/lane_stand_in_auditor.sh" "${WORK}/safe/bin/safe-audit"
+cp "${ROOT}/tests/lib/lane_stand_in_auditor.sh" "${WORK}/safe/bin/safe-audit"
 chmod +x "${WORK}/safe/bin/safe-audit"
 # The operator's canonical configuration (the switch is read from there only).
 mkdir -p "${HOME}/.config/safe/run"
