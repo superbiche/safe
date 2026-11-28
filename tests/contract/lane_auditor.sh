@@ -370,6 +370,7 @@ project_ok() { printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE/project/pac
 project_nolock() { printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE/project/package.json"; }
 project_python() { project_ok; printf 'requests==2.0.0\n' > "$CASE/project/requirements.txt"; }
 project_osv_error() { project_ok; STUB_OSV_FAIL=1; export STUB_OSV_FAIL; }
+project_partial() { project_ok; printf 'x' > "$CASE/project/bun.lockb"; }
 project_syft_skipped() { project_ok; STUB_SYFT_NOTE="syft unavailable"; export STUB_SYFT_NOTE; }
 
 # the gate's own handling of the scan: it runs the scan, reads its exit status, and prints what the summary holds
@@ -390,12 +391,13 @@ case_scan() {
   unset STUB_OSV_FAIL
   scan_variant skipped project_python || return
   unset STUB_OSV_FAIL
+  scan_variant partial project_partial || return
   scan_variant syft_skipped project_syft_skipped || return
   unset STUB_SYFT_NOTE
   # the statuses of the scan's own results, taken from the fixtures (no second list), against the summary the core makes of them and the
   # lines the gate prints from the summary: every scanner that is not ok is named, with its status, and none is "other"
   local variant ok=1 gaps summary lines
-  for variant in ok unsupported error skipped syft_skipped; do
+  for variant in ok unsupported error skipped partial syft_skipped; do
     gaps="$(jq -c '[((.tool_status // {}) | to_entries[] | select(.value.status != "ok") | {scanner: .key, status: .value.status}),
                     (.ecosystem_audits[]? | select(.status != "ok") | {scanner, status})] | unique' "$REAL_DIR/scan_result/$variant.json")"
     summary="$("$SAFE_CORE_BIN" project-scan-summary --result "$REAL_DIR/scan_result/$variant.json" 2>/dev/null)" || { printf 'scan %s: the summary failed\n' "$variant" >&2; ok=0; continue; }
@@ -563,7 +565,8 @@ case_shapes_are_the_real_ones() {
   jq '.extra_member = 1' "$REAL_DIR/scan_result/ok.json" > "$probe"; lane_shape_check scan_result "$probe" >/dev/null 2>&1 && refused=0
   jq '.tool_status.grype.status = 7' "$REAL_DIR/scan_result/ok.json" > "$probe"; lane_shape_check scan_result "$probe" >/dev/null 2>&1 && refused=0
   jq 'del(.machine)' "$REAL_DIR/scan_result/ok.json" > "$probe"; lane_shape_check scan_result "$probe" >/dev/null 2>&1 && refused=0
-  (( refused )) && pass "shapes: the checker refuses an empty answer, two documents, a repeated member, a missing, an extra and a mistyped member" || fail "shapes: the checker accepted an answer it must refuse"
+  jq '.tool_status.grype.status = "invented"' "$REAL_DIR/scan_result/ok.json" > "$probe"; lane_shape_check scan_result "$probe" >/dev/null 2>&1 && refused=0
+  (( refused )) && pass "shapes: the checker refuses an empty answer, two documents, a repeated member, a missing, an extra and a mistyped member, and a value no real answer has" || fail "shapes: the checker accepted an answer it must refuse"
 }
 
 # ---- 9. the stand-in of the live suite is held to the same shapes ---------------------------------------------------------------------------------

@@ -781,6 +781,8 @@ if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
     printf 'reflected provider output\n' > "${socket_litter}/socket.json.raw"
   fi
   printf 'SOCKET_REQUEST\t%s\n' "$(jq -c '{roots: ([.roots[] | "\(.name)@\(.version)"] | sort), cached: ([.cached[] | "\(.name)@\(.version)"] | sort)}' <<<"${socket_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  # the members of the request the reader was sent (a file of its own): what it is asked and nothing else
+  jq -c 'keys' <<<"${socket_input}" >> "${SAFE_INSTALL_COMMAND_LOG}.socket-request-keys"
   # what the reader runs with: the core the lane verified and a closed or non-terminal stdin
   printf 'SOCKET_ENV\tSAFE_CORE_BIN=%s\tCONSENT=%s\n' "${SAFE_CORE_BIN:-}" "${SAFE_AUDIT_SOCKET_CONSENT:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   # the cache-only call (no roots) and the roots call are told apart by the status variable that targets each
@@ -8424,6 +8426,22 @@ case_stand_in_auditor_answers_the_contract() {
   : >"${out}"
   if lane_shape_check scan_result "${out}" >/dev/null 2>&1; then printf 'an empty answer was accepted\n' >&2; ok=0; fi
   if (( ok )); then pass "$FUNCNAME"; else fail "$FUNCNAME: the stub auditor differs from the real auditor's answers"; fi
+}
+
+# The request the reader is sent carries what it is asked (the roots and the artifacts whose cached result may block) and nothing else: the gate keeps
+# its own statement of the operands it could not tie, and never sends it (ticket 1884, review round 1).
+case_project_lane_sends_the_socket_reader_only_what_it_asks() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-socket-request" kept@1.0.0
+  rm -f -- "${LOG_FILE}.socket-request-keys"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  [[ -s "${LOG_FILE}.socket-request-keys" ]] || { fail "$FUNCNAME: the reader was never asked about the named root"; return; }
+  if grep -qv '^\["cached","roots"\]$' "${LOG_FILE}.socket-request-keys"; then
+    fail "$FUNCNAME: a request with members other than cached and roots: $(cat "${LOG_FILE}.socket-request-keys")"
+    return
+  fi
+  pass "$FUNCNAME"
 }
 
 # ---- ticket 1638: the lane runs no lifecycle script and says which ones it did not run --------------------------------------------
@@ -18388,6 +18406,7 @@ main() {
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
     case_stand_in_auditor_answers_the_contract \
+    case_project_lane_sends_the_socket_reader_only_what_it_asks \
     case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
     case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
     case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \

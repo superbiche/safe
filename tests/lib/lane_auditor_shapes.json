@@ -123,6 +123,16 @@
       ".schema_version": [
         "number"
       ]
+    },
+    "values": {
+      ".identities[].advisories[].severity": [
+        "critical",
+        "high"
+      ],
+      ".identities[].coverage": [
+        "complete",
+        "missing"
+      ]
     }
   },
   "generated_by": "tests/contract/lane_auditor.sh from the answers of the real entries (LANE_SHAPES_UPDATE=1 rewrites this file; an edit by hand fails the suite)",
@@ -189,6 +199,14 @@
       ],
       ".version": [
         "string"
+      ]
+    },
+    "values": {
+      ".source": [
+        "implicit-default"
+      ],
+      ".verdict": [
+        "GO"
       ]
     }
   },
@@ -262,6 +280,11 @@
       ".schema_version": [
         "number"
       ]
+    },
+    "values": {
+      ".acceptances[].kind": [
+        "local_tolerance"
+      ]
     }
   },
   "lane_revoke": {
@@ -298,7 +321,8 @@
       ".revoked[].version": [
         "string"
       ]
-    }
+    },
+    "values": {}
   },
   "package_audit_json": {
     "allowed": {
@@ -608,6 +632,22 @@
       ],
       ".warn_causes": [
         "array"
+      ]
+    },
+    "values": {
+      ".osv.status": [
+        "ok"
+      ],
+      ".resolution.status": [
+        "ok"
+      ],
+      ".socket.status": [
+        "ok"
+      ],
+      ".verdict": [
+        "BLOCK",
+        "GO",
+        "WARN"
       ]
     }
   },
@@ -1089,6 +1129,35 @@
       ".verdict": [
         "string"
       ]
+    },
+    "values": {
+      ".audit_totals.ecosystem[].status": [
+        "ok"
+      ],
+      ".ecosystem_audits[].status": [
+        "ok",
+        "skipped",
+        "unsupported"
+      ],
+      ".source_scan.status": [
+        "skipped"
+      ],
+      ".tool_status.grype.status": [
+        "ok"
+      ],
+      ".tool_status.osv-scanner.status": [
+        "error",
+        "ok",
+        "partial"
+      ],
+      ".tool_status.syft.status": [
+        "ok",
+        "skipped"
+      ],
+      ".verdict": [
+        "GO",
+        "WARN"
+      ]
     }
   },
   "socket_answer": {
@@ -1199,6 +1268,17 @@
       ],
       ".schema_version": [
         "number"
+      ]
+    },
+    "values": {
+      ".roots[].outcome": [
+        "adverse",
+        "blocked",
+        "clear",
+        "consent_required",
+        "pending",
+        "rate_limited",
+        "unavailable"
       ]
     }
   }
