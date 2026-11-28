@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.76.0 - 2026-11-28
+
 - Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a
   `ci` entry count that cannot be read gives the line without its number. The facts that allow the document are set as soon as the decision
   is validated (a signal during the revocation step leaves a document); the command's status is settled when the document's writing starts
