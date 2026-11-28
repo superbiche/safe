@@ -52,6 +52,9 @@ const (
 	ReadingRead    = "read"
 	ReadingBounded = "bounded"
 	ReadingMissing = "missing"
+	// ReadingSkipped: the reading was not made, because an established block ended the command before the publish times were asked for.
+	// It is not a failed reading and not a judged one.
+	ReadingSkipped = "skipped"
 )
 
 // MaxCooldownDays is the longest window the lane honours (100 years); a longer one
@@ -180,6 +183,9 @@ type CooldownReport struct {
 	// Missing are the identities whose publish time could not be read for any
 	// other reason: missing evidence (also in the report's coverage), exit 102.
 	Missing []CooldownGap `json:"missing"`
+	// Skipped counts the introduced identities whose reading was not made (ReadingSkipped): they were not judged, and are in neither
+	// Checked nor Missing.
+	Skipped int `json:"skipped"`
 }
 
 // CooldownWait is one version inside the cooldown.
@@ -318,6 +324,10 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		switch reading.Status {
 		case ReadingMissing:
 			report.Missing = append(report.Missing, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: reading.Gap})
+			continue
+		case ReadingSkipped:
+			report.Checked--
+			report.Skipped++
 			continue
 		}
 		published, err := time.Parse(time.RFC3339, reading.Published)
@@ -506,7 +516,7 @@ func (r Releases) validate() error {
 			if _, err := time.Parse(time.RFC3339, reading.Published); err != nil || reading.Gap != "" {
 				return fmt.Errorf("identities[%d]: a bounded reading carries the last-modified time and no gap", i)
 			}
-		case ReadingMissing:
+		case ReadingMissing, ReadingSkipped:
 			if reading.Published != "" || reading.Gap == "" {
 				return fmt.Errorf("identities[%d]: a reading without a time carries a gap and no publish time", i)
 			}

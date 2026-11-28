@@ -195,7 +195,18 @@ type CoverageGap struct {
 	Version string   `json:"version"`
 	Sides   []string `json:"sides"`
 	Gap     string   `json:"gap"`
+	// Cause is the closed reason of the gap, set where the gap is made (never read back from Gap, which is text for people).
+	Cause string `json:"cause"`
 }
+
+// Causes of a coverage gap.
+const (
+	GapAdvisoryReading    = "advisory_reading"
+	GapPublishTime        = "publish_time"
+	GapSocketUntied       = "socket_untied"
+	GapSocketCache        = "socket_cache"
+	GapBaselineUnreadable = "baseline_unreadable"
+)
 
 // ClassOutcome is one class of the decision table.
 type ClassOutcome struct {
@@ -290,10 +301,10 @@ func Decide(in Input) Report {
 		report.Socket, socketClass = &socketReport, &class
 		for _, untied := range in.Socket.Untied {
 			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"},
-				Gap: "socket root not tied: " + untied.Name + "@" + untied.Version + " names no package the projected lockfile holds"})
+				Gap: "socket root not tied: " + untied.Name + "@" + untied.Version + " names no package the projected lockfile holds", Cause: GapSocketUntied})
 		}
 		if in.Socket.CacheGap != "" {
-			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"}, Gap: "socket cache not read: " + in.Socket.CacheGap})
+			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"}, Gap: "socket cache not read: " + in.Socket.CacheGap, Cause: GapSocketCache})
 		}
 	}
 
@@ -303,7 +314,7 @@ func Decide(in Input) Report {
 
 	if in.BaselineError != "" {
 		report.Coverage = append(report.Coverage, CoverageGap{
-			Name: "", Version: "", Sides: []string{"baseline"}, Gap: "baseline unreadable: " + in.BaselineError,
+			Name: "", Version: "", Sides: []string{"baseline"}, Gap: "baseline unreadable: " + in.BaselineError, Cause: GapBaselineUnreadable,
 		})
 	} else {
 		differential(&report, baseline, in.Target, evidence, in.Evidence)
@@ -331,7 +342,7 @@ func Decide(in Input) Report {
 		// A publish time that could not be read is missing evidence like an advisory reading that could not be.
 		for _, missing := range cooldown.Missing {
 			report.Coverage = append(report.Coverage, CoverageGap{
-				Name: missing.Name, Version: missing.Version, Sides: []string{"target"}, Gap: "publish time not read: " + missing.Gap,
+				Name: missing.Name, Version: missing.Version, Sides: []string{"target"}, Gap: "publish time not read: " + missing.Gap, Cause: GapPublishTime,
 			})
 		}
 		report.Cooldown = &cooldown
@@ -626,7 +637,7 @@ func coverageGaps(name string, beforeGaps, afterGaps []Identity, evidence eviden
 		if read, ok := evidence[identity]; ok {
 			gap = read.Gap
 		}
-		gaps = append(gaps, CoverageGap{Name: name, Version: identity.Version, Sides: sortedIDs(which), Gap: gap})
+		gaps = append(gaps, CoverageGap{Name: name, Version: identity.Version, Sides: sortedIDs(which), Gap: gap, Cause: GapAdvisoryReading})
 	}
 	return gaps
 }

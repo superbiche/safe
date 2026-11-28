@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -219,11 +218,10 @@ func introduced(lock *judgedLock, previous *judgedLock, key string) bool {
 	return false
 }
 
-var plainVersion = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
-
-// printableVersion keeps a version that reads as one and shows anything else as unreadable: the lockfile is untrusted text.
+// printableVersion keeps a version that reads as one by the lane's own grammar (the one it admits an entry by: a version the lane installed
+// is never shown as unreadable) and shows anything else as unreadable: the lockfile is untrusted text.
 func printableVersion(v string) string {
-	if plainVersion.MatchString(v) {
+	if validVersion(v) {
 		return v
 	}
 	return "?"

@@ -377,3 +377,29 @@ func TestReadReleaseRequestIsStrict(t *testing.T) {
 		}
 	}
 }
+
+// A reading that was not made (an established block ended the command first) is neither judged nor missing evidence.
+func TestCooldownASkippedReadingIsNotJudgedAndNotMissing(t *testing.T) {
+	skipped := reading("young", "1.0.0", 20)
+	skipped.Status, skipped.Published, skipped.Gap = ReadingSkipped, "", "the publish time could not be read (not read)"
+	rel := releasesOf(3, SecurityFixExempt, skipped)
+	if err := rel.validate(); err != nil {
+		t.Fatalf("a skipped reading is a valid reading: %v", err)
+	}
+	report := decideCooldown(t, nil, pkgs("young", "1.0.0"), rel, evidenceOf(read("young", "1.0.0")))
+	c := report.Cooldown
+	if c.Skipped != 1 || c.Checked != 0 || len(c.Missing) != 0 || len(c.Waits) != 0 {
+		t.Fatalf("cooldown %+v", c)
+	}
+	for _, gap := range report.Coverage {
+		if gap.Cause == GapPublishTime {
+			t.Fatalf("a skipped reading is a coverage gap: %+v", gap)
+		}
+	}
+	// the failed reading, by contrast, is missing evidence
+	failed := reading("young", "1.0.0", 20).missing("registry unreachable")
+	report = decideCooldown(t, nil, pkgs("young", "1.0.0"), releasesOf(3, SecurityFixExempt, failed), evidenceOf(read("young", "1.0.0")))
+	if report.Cooldown.Skipped != 0 || len(report.Cooldown.Missing) != 1 || report.Cooldown.Checked != 1 {
+		t.Fatalf("cooldown %+v", report.Cooldown)
+	}
+}

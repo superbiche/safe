@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a
+  `ci` entry count that cannot be read gives the line without its number. The facts that allow the document are set as soon as the decision
+  is validated (a signal during the revocation step leaves a document); the command's status is settled when the document's writing starts
+  and the process ends with the status the document holds, a later signal changing neither; a signal on a dry run after the decision is
+  `interrupted`; a signal during the scan stops the scan and every process of it at once (the scan is recorded as not completed because it
+  was interrupted); the deferral that protects the binder ends when the binder returns, so a signal during the scripts reading is not lost.
+  The Socket scoring answer is recorded as given (a `n` was recorded as accepted). The document: a bundled member's row names the artifact
+  that supplies its bytes, a waiver and a wait keep the advisories they remediate, the dropped artifacts are counted, a piece that could not
+  be read is named (`pieces_unread`) and its count is null, not zero, a binder piece lost after a publication still gives a document, a
+  cooldown reading that was not made is `skipped`, not judged and not missing (line and document). A scan result with no coverage section is
+  unreadable coverage. A writer never removes its own file. The lane lint holds the finishing path to no early end before the document and to
+  one start per caller. From the coordinator's verification: a signal that ends the command after a verified publication says so in one
+  line (the command ended 130/143/129 with the judged tree in the project and nothing said); the writer of a command that ends on a signal
+  noted during the scan is bounded to two seconds, as on the other signal path (it was thirty); and the gate refuses a clear decision that
+  still carries a `skipped` publish time (the reading is neither a wait nor missing evidence in the decision, so nothing else would stop a
+  path that acted on one).
+- Project lane (behind `install.project_lane`): the report document (ticket 1639, 2/2; round two of the review). One document per
+  command, written once by ONE path every end goes through (unlock, scan, document, scratch; a handled signal included, with the write
+  bounded to two seconds and no scan), for every end at or after the decision, by `safe-core project-report write` (new; `check` is for
+  the tests). Schema 1: typed values only, every string from a closed list or a grammar (what is outside is counted, never kept), no
+  location, no free text. It names what was judged: the digests of the judged target and of the baseline (taken while the lane held
+  them), the differential's identities (counts only for `ci`), each decision class, the cooldown's waits and waivers with their dates,
+  the Socket outcome of each named root (a block is a block), the missing evidence per cause, the scripts of ONE reading, the answers
+  by class. Its status is the command's public status; an end that reads as a pass exists only with status 0 (a dry run that ends in a
+  refusal is `refused`). The gate no longer makes or names the reports directory: an unusable one gates nothing (a clean install still
+  exits 0 with one line, a refusal keeps its status and last line); the writer establishes its directories (0700, no link under the data
+  root) and writes `<data>/project-lane/reports/<key>/<time to the microsecond>-<pid>-<random>.json`, 0600, synced and renamed; names sort
+  in the order of the writes, the last 50 per project are kept (own files only, never through a link); past 8 MiB the document is not
+  written and one line says so; every failure to write (a missing writer, an unreadable decision piece included) is one line and
+  changes no status. Lane lint R12/R13 now hold the whole file: the reports directory is named nowhere in the gate, the writer is started
+  once, the scan and the writer are called only from the finishing path.
+- Project lane (behind `install.project_lane`): the whole-project scan becomes a report (ticket 1639, rule 5 of the differential
+  ruling). After a verified publication (lockfile-only included), once the project's lock is released, the lane runs the scan of the
+  project under one deadline that reaches its children and prints at most three lines: the ecosystems with a critical finding (npm
+  included, with the count) and the findings it could not attribute to an ecosystem of its known set; the scanners that gave less than
+  their whole coverage by the producer's own rule (a status that is not `ok`: `partial`, `skipped`, `unavailable`, `error`; no note is
+  read; coverage that cannot be read is said as unreadable, never as zero gaps); a line when the lockfile the scan read is not the one
+  this command published; or one fixed reason when it did not complete. Nothing it wrote is printed, a scanner an environment variable
+  names is never run, and **the scan never changes the command's exit status**. It is not run after a refusal, a dry run, a signal or a
+  hand-over to today's gate. `safe-core project-scan-summary` (new) reads the scan's result document under a bound. `ci` no longer says
+  "N packages added" (it has no differential): it says the lockfile holds N entries and ci installs the ones npm selects; the
+  publish-times line is printed when a reading failed, not when it was skipped because the command was already stopped.
 - Project lane (behind `install.project_lane`): the lane runs no lifecycle script and says which ones it did not run (ticket 1638). A
   separate script step was tried on npm 11.20.0 and 12.2.1 and cannot be shown to run what today's policy runs, so none runs. After a
   verified publication one section says, from the judged lockfile and the published tree only (`safe-core project-scripts`, new), what
