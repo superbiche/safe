@@ -523,10 +523,20 @@ func TestAdvisoryCacheRefreshingEvictsNothing(t *testing.T) {
 			t.Fatalf("a refreshed reading is not there: %+v", got)
 		}
 	}
-	// a mixed request: 100 refreshed and 100 new on a full store: the new ones take room (200 - 100 = the 100 oldest of the others go), the refreshed stay
+	// a mixed request: 100 refreshed and 100 new on a full store: the new ones take room (the 100 oldest of the OTHERS go), the refreshed ones stay even
+	// when they are the oldest of all
+	old := advisoryNow.Add(-time.Hour)
+	for i := 0; i < 100; i++ {
+		_ = os.Chtimes(advPath(state, "c", adv(fmt.Sprintf("GHSA-pre-%06d", i), "s", "p")), old, old)
+	}
 	cache.Put("c", append(refresh[:100:100], fresh(0, 100)...), advisoryNow)
 	if n := countEntries(t, state); n != AdvisoryCap {
 		t.Fatalf("%d entries after 100 refreshed and 100 new, want %d", n, AdvisoryCap)
+	}
+	for _, reading := range refresh[:100] {
+		if got := cache.Get("c", []AdvisoryKey{reading.AdvisoryKey}, advisoryNow); len(got) != 1 {
+			t.Fatalf("a refreshed reading was evicted by the room its own writer made: %+v", reading.AdvisoryKey)
+		}
 	}
 }
 

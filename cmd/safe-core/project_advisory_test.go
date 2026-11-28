@@ -121,16 +121,9 @@ func TestProjectAdvisoryCheckRefusesTwoRevisionsAndAnOversizedRequest(t *testing
 	if code, out, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check", "--request", two); code != 3 || out != "" {
 		t.Fatalf("two revisions: exit %d, output %q", code, out)
 	}
-	// a request file past the bound is refused while it is read (a sparse file: nothing is written)
-	big := filepath.Join(dir, "big.json")
-	f, err := os.Create(big)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(66 << 20); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
+	// a request that never ends (a file that is endless: /dev/zero) is refused when the bound is reached, while it is read: reading it whole first would
+	// never return
+	big := "/dev/zero"
 	if code, out, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check", "--request", big); code != 3 || out != "" {
 		t.Fatalf("an oversized request: exit %d, output %q", code, out)
 	}
