@@ -10,7 +10,11 @@
   now in calls of up to 1,000 identities (it was 100), and the blocklist is read once for all names instead of name by name (the per-name
   reading still decides every name found). A reading is trusted for one day at most, never when dated in the future; 10,000 entries at most; a
   failed, malformed or unclassifiable record stores nothing; without the state-directory argument the gate now passes, there is no cache. The
-  gate names nothing of the cache (lane lint R14). `lane_instrument` of the install suite copies the library as a directory of its own.
+  gate names nothing of the cache (lane lint R14). Review round 1: no bulk value is a process argument in the evidence mode (a request of 1,000 long
+  names lost its whole reading, and the base failed at 2,500 identities); the gate binds the reader to the core it verified; every stamp seen for an advisory
+  (batch and pages) stays until the cache decides; a `withdrawn` that is not a timestamp is a malformed record; a stamp is one structured value from the key
+  asked to the key stored; the store, its two commands and the reader's reading of the answer are strict (new `project-advisory-check`); the writer makes
+  room before it writes and removes only its own leftovers. `lane_instrument` of the install suite copies the library as a directory of its own.
 
 ## 1.76.0 - 2026-11-28
 

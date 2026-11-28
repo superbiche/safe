@@ -823,6 +823,7 @@ if [[ "${1:-}" == "scanner-batch" ]]; then
   printf 'EVIDENCE_NAMES\t%s\n' "$(jq -c '(.blocklist_names // []) | sort' <<<"${evidence_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
   # the arguments the reader was started with, in a file of their own (ticket 1671): the command log's shape is the cases' contract
   printf '%s\n' "$*" >> "${SAFE_INSTALL_COMMAND_LOG}.evidence-args"
+  printf '%s\n' "${SAFE_CORE_BIN:-}" >> "${SAFE_INSTALL_COMMAND_LOG}.evidence-core"
   [[ -z "${SAFE_AUDIT_EVIDENCE_STATUS:-}" ]] || exit "${SAFE_AUDIT_EVIDENCE_STATUS}"
   [[ -z "${SAFE_AUDIT_EVIDENCE_RAW:-}" ]] || { printf '%s' "${SAFE_AUDIT_EVIDENCE_RAW}"; exit 0; }
   ev_hits="${SAFE_AUDIT_EVIDENCE_HITS:-}"; [[ -n "${ev_hits}" ]] || ev_hits='{}'
@@ -8408,6 +8409,26 @@ case_project_lane_hands_the_reader_its_state_directory() {
   [[ -d "${HOME_DIR}/.local/share/safe/project-lane/state" ]] || { fail "$FUNCNAME: the state directory the reader was given does not exist"; return; }
   # the gate itself keeps nothing of the cache: no entry directory beside what the gate made
   [[ ! -e "${HOME_DIR}/.local/share/safe/project-lane/state/advisory-records" ]] || { fail "$FUNCNAME: the gate made the cache's directory"; return; }
+  pass "$FUNCNAME"
+}
+
+# The advisory reader's cache answers through the core the lane verified, never through one the caller's environment names (review of ticket 1671).
+case_project_lane_binds_the_advisory_reader_to_its_verified_core() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-reader-core" kept@1.0.0 vuln@1.0.0
+  local target seen verified
+  target="$(lane_lock kept@1.0.0 vuln@1.0.1)"
+  rm -f -- "${LOG_FILE}.evidence-core"
+  NPM_LOCK_MUTATION_JSON="${target}" SAFE_CORE_BIN="${CASE_DIR}/another-core" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" \
+    lane_run 'npm update'
+  assert_status 0 "$FUNCNAME" || return
+  [[ -f "${LOG_FILE}.evidence-core" && "$(wc -l < "${LOG_FILE}.evidence-core")" == 1 ]] || { fail "$FUNCNAME: the reader was not started exactly once"; return; }
+  seen="$(cat -- "${LOG_FILE}.evidence-core")"
+  # the core the Socket reader of the same command was given is the one the lane verified
+  verified="$(sed -n 's/^SOCKET_ENV\tSAFE_CORE_BIN=\([^\t]*\)\t.*/\1/p' "${LOG_FILE}" | head -n1)"
+  [[ -n "${verified}" && "${verified}" != "${CASE_DIR}/another-core" ]] || { fail "$FUNCNAME: no verified core to compare with (${verified})"; return; }
+  [[ "${seen}" == "${verified}" ]] || { fail "$FUNCNAME: the advisory reader was given '${seen}', the lane verified '${verified}'"; return; }
   pass "$FUNCNAME"
 }
 
@@ -18377,6 +18398,7 @@ main() {
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
     case_project_lane_hands_the_reader_its_state_directory \
+    case_project_lane_binds_the_advisory_reader_to_its_verified_core \
     case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
     case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
     case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \

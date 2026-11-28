@@ -61,6 +61,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "project-advisory-put" {
 		return projectAdvisoryPut(args[1:], stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-advisory-check" {
+		return projectAdvisoryCheck(args[1:], stdin, stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "project-roots" {
 		return projectRoots(args[1:], stdin, stdout, stderr)
 	}
@@ -112,6 +115,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectReleasesUsage)
 		fmt.Fprintln(stderr, projectAdvisoryGetUsage)
 		fmt.Fprintln(stderr, projectAdvisoryPutUsage)
+		fmt.Fprintln(stderr, projectAdvisoryCheckUsage)
 		fmt.Fprintln(stderr, projectRootsUsage)
 		fmt.Fprintln(stderr, projectBindUsage)
 		fmt.Fprintln(stderr, projectBaselineUsage)

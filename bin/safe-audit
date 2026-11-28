@@ -11506,10 +11506,14 @@ scanner_batch_command() {
 }
 
 # --- the advisory-record cache (ticket 1671) ------------------------------------------------------------------
-# One reader and one writer, this mode, through the core's two subcommands (the store's checks are the core's). The
-# classifier names the rules a reading was made under: the version of the label filter in scanner_batch_detail_label
-# (bump it when that filter changes) and the hash of the shared jq definitions it uses, so a change to either makes
-# every earlier entry a miss.
+# One reader and one writer, this mode, through the core's three subcommands (the store's checks, and the strict reading of every
+# document that crosses its boundaries, are the core's: nothing here describes a shape a second time). The classifier names the rules a
+# reading was made under: the version of the label filter in scanner_batch_detail_label (bump it when that filter changes) and the hash of
+# the shared jq definitions it uses, so a change to either makes every earlier entry a miss.
+#
+# No value whose size follows the number of identities, names, hits or advisories travels as a process argument anywhere in the
+# evidence mode (the kernel's limit per argument is about 128 KiB, and past it a program is not started): those values are files,
+# read by `jq --slurpfile`, or standard input. `--arg` and `--argjson` carry names, ids and small counts only.
 SCANNER_BATCH_CLASSIFIER_VERSION=1
 scanner_batch_classifier() {
   local digest
@@ -11518,65 +11522,62 @@ scanner_batch_classifier() {
   printf 'severity-v%s-%s' "$SCANNER_BATCH_CLASSIFIER_VERSION" "$digest"
 }
 
-# The keys that may be asked of the store: one per (advisory, queried package) of the membership answer, for an advisory
-# that carries ONE stamp across the whole answer and whose stamp is a printable line. An advisory with no stamp, or two,
-# is never cached: it is fetched and classified as ever. Reads $1 (paired JSON), prints a JSON array.
-scanner_batch_cache_keys() {
-  jq -c '[ .[] | .pkg.name as $n | .res.vulns[]?
-           | select((.id | type) == "string" and (.id | test("^MAL-") | not))
-           | {id, modified: (.modified // null), package: $n} ]
+# The stamps of the membership answers. EVERY stamp the service gave an advisory stays (the batch's and each page's, an identity's
+# pages being merged by id afterwards), until the cache has decided. An advisory may be cached only when it was given ONE stamp across
+# the whole reading, and that stamp is one line of printable text; with none, two, or a stamp that is not text, it is fetched and
+# classified as ever and nothing is stored. $1 scratch: reads stamps.jsonl, writes plan.json {"<id>": "<the one stamp>"}.
+scanner_batch_cache_plan() {
+  local scratch="$1"
+  jq -s '[ .[] | select((.id | type) == "string" and (.id | test("^MAL-") | not)) ]
          | group_by(.id)
-         | map(select(([.[].modified] | unique | length) == 1
-                      and ((.[0].modified | type) == "string")
-                      and (.[0].modified | test("^[^[:cntrl:]]{1,512}$"))))
-         | (add // []) | unique' <<<"$1"
+         | map({key: .[0].id, value: ([.[].modified] | unique)})
+         | map(select((.value | length) == 1 and (.value[0] | type) == "string" and (.value[0] | test("\\A[^[:cntrl:]]{1,512}\\z"))) | {key, value: .value[0]})
+         | from_entries' "$scratch/stamps.jsonl" >"$scratch/plan.json"
 }
 
-# The stamp of one advisory ("" when it has none that may be used).
-scanner_batch_cache_stamp() {
-  jq -r --arg id "$1" '[.[] | .pkg.name as $n | .res.vulns[]? | select(.id == $id) | .modified]
-    | unique | if length == 1 and (.[0] | type) == "string" and (.[0] | test("^[^[:cntrl:]]{1,512}$")) then .[0] else "" end' <<<"$2"
-}
-
-# Ask the store. Prints a JSON object {"<id>|<package>": "<band>"|"withdrawn"} of the readings it trusts AND this
-# reader can check against what it asked (a hit nobody asked for, a band that is not one of the four, a reading dated in the
-# future or older than a day: ignored). Any failure is a miss and fails the function: the caller reads nothing from the cache.
+# Ask the store. Prints a JSON object {"<id>|<package>": "<band>"|"withdrawn"} of the readings it trusts, after the core has read its
+# own reply strictly against the request (exactly one envelope, whole typed hits, one hit at most per key asked and none that was
+# not, readings safe stores, none from the future or older than a day). Any failure is a miss and fails the function: the caller
+# reads nothing from the cache. $1 scratch, $2 state directory, $3 classifier.
 scanner_batch_cache_get() {
-  local scratch="$1" state="$2" classifier="$3" paired="$4" keys="$scratch/cache-keys.json" request="$scratch/cache-request.json" reply="$scratch/cache-reply.json"
-  scanner_batch_cache_keys "$paired" >"$keys" || return 1
+  local scratch="$1" state="$2" classifier="$3" keys="$scratch/cache-keys.json" request="$scratch/cache-request.json" reply="$scratch/cache-reply.json"
+  jq -c --slurpfile plan "$scratch/plan.json" '[ .[] | .pkg.name as $n | .res.vulns[]? | select((.id | type) == "string") | select($plan[0][.id] != null)
+        | {id, modified: $plan[0][.id], package: $n} ] | unique' "$scratch/paired.json" >"$keys" || return 1
   jq -e 'length > 0' "$keys" >/dev/null 2>&1 || { printf '{}\n'; return 0; }
   jq -cn --arg c "$classifier" --slurpfile k "$keys" '{classifier: $c, keys: $k[0]}' >"$request" || return 1
   "$SCANNER_BATCH_CORE_BIN" project-advisory-get --state-dir "$state" <"$request" >"$reply" 2>/dev/null || return 1
-  jq -ce --slurpfile k "$keys" '
-    ($k[0] | map({key: (.id + "\u0000" + .modified + "\u0000" + .package), value: true}) | from_entries) as $asked
-    | if (type == "object") and (.schema_version == 1) and ((.hits | type) == "array")
-        and ([.hits[] | (type == "object")
-              and ((keys | sort) == ["fetched", "id", "modified", "package", "severity", "withdrawn"])
-              and ((.id | type) == "string") and ((.modified | type) == "string") and ((.package | type) == "string")
-              and ($asked[.id + "\u0000" + .modified + "\u0000" + .package] == true)
-              and ((.fetched | type) == "number") and (.fetched <= now) and ((now - .fetched) < 86400)
-              and ((.withdrawn | type) == "boolean")
-              and (if .withdrawn then .severity == "" else (.severity | IN("critical", "high", "moderate", "low")) end)] | all)
-      then [.hits[] | {key: (.id + "|" + .package), value: (if .withdrawn then "withdrawn" else .severity end)}] | from_entries
-      else error("unreadable") end' "$reply"
+  "$SCANNER_BATCH_CORE_BIN" project-advisory-check --request "$request" <"$reply" 2>/dev/null
 }
 
-# Store what this command fetched and classified. $4 is a JSON array of readings. Failure is the caller's to ignore.
+# Store what this command fetched and classified: facts.jsonl holds one line per (advisory, package) read, and the stamp each is stored
+# under is the plan's, joined here in one pass (the same structured value that built the keys asked: it never passes through the
+# shell). Failure is the caller's to ignore. $1 scratch, $2 state directory, $3 classifier.
 scanner_batch_cache_put() {
-  local scratch="$1" state="$2" classifier="$3" readings="$4" request="$scratch/cache-put.json"
-  jq -e 'length > 0' <<<"$readings" >/dev/null 2>&1 || return 0
-  printf '%s' "$readings" | jq -c --arg c "$classifier" '{classifier: $c, readings: .}' >"$request" || return 1
+  local scratch="$1" state="$2" classifier="$3" request="$scratch/cache-put.json"
+  jq -cs --arg c "$classifier" --slurpfile plan "$scratch/plan.json" \
+    '{classifier: $c, readings: [ .[] | select($plan[0][.id] != null) | {id, modified: $plan[0][.id], package, severity, withdrawn, fetched} ]}' \
+    "$scratch/facts.jsonl" >"$request" || return 1
+  jq -e '.readings | length > 0' "$request" >/dev/null 2>&1 || return 0
   "$SCANNER_BATCH_CORE_BIN" project-advisory-put --state-dir "$state" <"$request" >/dev/null 2>&1
+}
+
+# A withdrawal date is a timestamp (RFC 3339, in UTC, as OSV writes it). $1 file of the record. In the evidence mode a `withdrawn` member
+# that is not one makes the record malformed; the verdict mode keeps its own reading.
+scanner_batch_withdrawal_state() { # prints: absent | withdrawn | malformed
+  jq -r 'if has("withdrawn") | not then "absent"
+         elif (.withdrawn | type) == "string" and (.withdrawn | test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z\\z"))
+              and ((.withdrawn | sub("\\.[0-9]+Z$"; "Z") | try (fromdateiso8601 | true) catch false)) then "withdrawn"
+         else "malformed" end' "$1" 2>/dev/null || printf 'malformed'
 }
 
 # The names (of the request's packages and its blocklist_names) any blocklist store of the authority list holds an entry
 # for: the exact name, or `@scope/*` for a scoped name, as blocked_entry_reason looks them up. Sets
 # SCANNER_BATCH_BLOCK_CANDIDATES (one name per line, sorted, unique). Fails when the stores cannot be read as one
-# pass; the caller refuses then (it never reads that as "nothing is blocked").
+# pass; the caller refuses then (it never reads that as "nothing is blocked"). $1 scratch: reads input.json.
 SCANNER_BATCH_BLOCK_CANDIDATES=""
 SCANNER_BATCH_EVIDENCE_CHUNK=1000
 scanner_batch_blocklist_candidates() {
-  local input="$1" pkgs="$2" f names
+  local scratch="$1" f
   local -a stores=()
   SCANNER_BATCH_BLOCK_CANDIDATES=""
   blocklist_authority_files
@@ -11584,10 +11585,10 @@ scanner_batch_blocklist_candidates() {
     [[ -f "$f" ]] && stores+=("$f")
   done
   (( ${#stores[@]} > 0 )) || return 0
-  names=$(jq -cn --argjson pkgs "$pkgs" --argjson input "$input" '[($pkgs[].name), (($input.blocklist_names // [])[])] | unique') || return 1
-  SCANNER_BATCH_BLOCK_CANDIDATES=$(jq -nr --argjson names "$names" '
+  jq -c '[(.packages[].name), ((.blocklist_names // [])[])] | unique' "$scratch/input.json" >"$scratch/block-names.json" || return 1
+  SCANNER_BATCH_BLOCK_CANDIDATES=$(jq -nr --slurpfile names "$scratch/block-names.json" '
     [inputs | (.packages // {})] as $stores
-    | $names[]
+    | $names[0][]
     | . as $n
     | (if (startswith("@") and (.[1:] | contains("/"))) then (.[:index("/")] + "/*") else null end) as $wild
     | select(any($stores[]; has($n) or ($wild != null and has($wild))))' "${stores[@]}") || return 1
@@ -11642,14 +11643,17 @@ scanner_batch_evidence_command() {
     return 4
   fi
 
-  local pkgs name reason blocklist='[]'
-  pkgs=$(jq -c '[.packages[] | {name, version}] | unique' <<<"$input")
+  # The request and every document that follows its size live in files of the scratch directory, never in an argument of a program
+  # (see the note above the cache's helpers).
+  local pkgs_file="$scratch/pkgs.json" paired_file="$scratch/paired.json" name reason blocklist='[]'
+  printf '%s' "$input" >"$scratch/input.json"
+  jq -c '[.packages[] | {name, version}] | unique' "$scratch/input.json" >"$pkgs_file" || return 4
   # The blocklist is read ONCE for every name: one pass over every store the per-name reading opens finds the names a store
   # holds an entry for (exact, or the scope's wildcard for a scoped name), and only those go through the per-name reading
   # (blocked_entry_reason), which alone decides whether a name is blocked and why. The pass can only over-select (a store
   # entry that is null or false is not a block), never miss a name the per-name reading would find: it is the same lookup
   # without its value test. A store that cannot be read was refused above.
-  scanner_batch_blocklist_candidates "$input" "$pkgs" || { printf 'safe audit: scanner-batch: the blocklist could not be read — local audit-infrastructure breakage, not a package finding\n' >&2; return 4; }
+  scanner_batch_blocklist_candidates "$scratch" || { printf 'safe audit: scanner-batch: the blocklist could not be read — local audit-infrastructure breakage, not a package finding\n' >&2; return 4; }
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     if reason=$(blocked_entry_reason "$name"); then
@@ -11657,22 +11661,24 @@ scanner_batch_evidence_command() {
     fi
   done < <(sort -u <<<"$SCANNER_BATCH_BLOCK_CANDIDATES")
 
-  # paired: one {pkg, res, gaps} per identity, in input order. gaps collects
-  # every reason the identity's reading is incomplete.
+  # paired.json: one {pkg, res, gaps} per identity, in input order. gaps collects every reason the identity's reading is incomplete.
   # The membership question goes in chunks of SCANNER_BATCH_EVIDENCE_CHUNK identities, the service's limit per call
   # (measured: 1,000 answered, 1,001 refused with HTTP 400). The call's time cap is measured for that size
   # (1,000 queries took 1.6 s) with the margin the 100-query call had (0.4 s under a 10 s cap): thirty seconds.
-  local total chunk_start chunk chunk_len body paired='[]' gap validity bad member_rc
-  total=$(jq 'length' <<<"$pkgs")
+  local total chunk_start chunk_len gap validity bad member_rc
+  printf '[]\n' >"$paired_file"
+  : >"$scratch/stamps.jsonl"
+  : >"$scratch/facts.jsonl"
+  total=$(jq 'length' "$pkgs_file")
   chunk_start=0
   while (( chunk_start < total )); do
-    chunk=$(jq -c --argjson s "$chunk_start" --argjson n "$SCANNER_BATCH_EVIDENCE_CHUNK" '.[$s:$s+$n]' <<<"$pkgs")
-    chunk_len=$(jq 'length' <<<"$chunk")
-    body=$(jq -c '{queries: [.[] | {package: {ecosystem: "npm", name: .name}, version: .version}]}' <<<"$chunk")
+    jq -c --argjson s "$chunk_start" --argjson n "$SCANNER_BATCH_EVIDENCE_CHUNK" '.[$s:$s+$n]' "$pkgs_file" >"$scratch/chunk.json"
+    chunk_len=$(jq 'length' "$scratch/chunk.json")
+    jq -c '{queries: [.[] | {package: {ecosystem: "npm", name: .name}, version: .version}]}' "$scratch/chunk.json" >"$scratch/body.json"
     gap=""
     bad='[]'
     if ! curl -fsS --max-time 30 https://api.osv.dev/v1/querybatch \
-      -H 'content-type: application/json' -d "$body" > "$scratch/batch.json"; then
+      -H 'content-type: application/json' -d "@$scratch/body.json" > "$scratch/batch.json"; then
       gap="OSV batch query failed (network/timeout/HTTP error)"
     elif ! scanner_batch_single_document "$scratch/batch.json"; then
       gap="malformed OSV batch response (not a single JSON document)"
@@ -11700,30 +11706,36 @@ scanner_batch_evidence_command() {
       fi
     fi
     if [[ -n "$gap" ]]; then
-      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --arg gap "$gap" \
-        '$acc + ($chunk | map({pkg: ., res: {vulns: []}, gaps: [$gap]}))')
+      jq -cn --slurpfile acc "$paired_file" --slurpfile chunk "$scratch/chunk.json" --arg gap "$gap" \
+        '$acc[0] + ($chunk[0] | map({pkg: ., res: {vulns: []}, gaps: [$gap]}))' >"$paired_file.new" || return 4
     else
       # Positional pairing holds: each result stands or falls on its own.
       validity=$(scanner_batch_result_validity "$scratch/batch.json")
-      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --argjson ok "$validity" --argjson bad "$bad" \
+      jq -cn --slurpfile acc "$paired_file" --slurpfile chunk "$scratch/chunk.json" --argjson ok "$validity" --argjson bad "$bad" \
         --slurpfile b "$scratch/batch.json" '
-        $acc + ([range(0; ($chunk | length))] | map(. as $i |
-          if ($bad | index($i)) != null then {pkg: $chunk[$i], res: {vulns: []}, gaps: ["malformed OSV batch response (repeated member)"]}
-          elif $ok[$i] then {pkg: $chunk[$i], res: $b[0].results[$i], gaps: []}
-          else {pkg: $chunk[$i], res: {vulns: []}, gaps: ["malformed OSV batch response"]} end))')
+        $chunk[0] as $c
+        | $acc[0] + ([range(0; ($c | length))] | map(. as $i |
+          if ($bad | index($i)) != null then {pkg: $c[$i], res: {vulns: []}, gaps: ["malformed OSV batch response (repeated member)"]}
+          elif $ok[$i] then {pkg: $c[$i], res: $b[0].results[$i], gaps: []}
+          else {pkg: $c[$i], res: {vulns: []}, gaps: ["malformed OSV batch response"]} end))' >"$paired_file.new" || return 4
     fi
+    mv -f -- "$paired_file.new" "$paired_file"
     chunk_start=$((chunk_start + SCANNER_BATCH_EVIDENCE_CHUNK))
   done
+
+  # Every stamp the batch answered, before an identity's pages are merged by id (the merge keeps one row for an id).
+  jq -c '.[] | .pkg.name as $n | .res.vulns[]? | select(type == "object" and (.id | type) == "string")
+         | {id, modified: (if has("modified") then .modified else null end), package: $n}' "$paired_file" >>"$scratch/stamps.jsonl" || return 4
 
   # A truncated page is read to the end where it can be. The hits of an
   # identity are the union of the validated hits of the batch answer and of
   # every page the re-query read (the helper keeps what it accumulated when a
   # later page fails); coverage is tracked apart, so a failure on page two
-  # never erases the hit page one carried.
+  # never erases the hit page one carried. The stamps of the pages are kept apart too.
   local idx pkg_name pkg_version pagefile note
   while IFS= read -r idx; do
-    pkg_name=$(jq -r --argjson i "$idx" '.[$i].pkg.name' <<<"$paired")
-    pkg_version=$(jq -r --argjson i "$idx" '.[$i].pkg.version' <<<"$paired")
+    pkg_name=$(jq -r --argjson i "$idx" '.[$i].pkg.name' "$paired_file")
+    pkg_version=$(jq -r --argjson i "$idx" '.[$i].pkg.version' "$paired_file")
     pagefile="$scratch/paged-$idx.json"
     OSV_REJECT_REPEATED_MEMBERS=1 osv_query_package_json npm "$pkg_name" "$pkg_version" "$pagefile"
     note=$(jq -r 'if (type == "object") and (.status == "ok") then "" else "OSV pagination re-query failed" end' "$pagefile" 2>/dev/null) \
@@ -11732,7 +11744,9 @@ scanner_batch_evidence_command() {
       scanner_batch_checker_unusable
       return 4
     fi
-    paired=$(jq -c --argjson i "$idx" --arg note "$note" --slurpfile p "$pagefile" '
+    jq -c --arg n "$pkg_name" 'if type == "object" and ((.vulns? // []) | type) == "array" then (.vulns // [])[] | select(type == "object" and (.id | type) == "string")
+          | {id, modified: (if has("modified") then .modified else null end), package: $n} else empty end' "$pagefile" >>"$scratch/stamps.jsonl" 2>/dev/null || true
+    jq -c --argjson i "$idx" --arg note "$note" --slurpfile p "$pagefile" '
       def wellformed: (type == "object") and ((.id? | type) == "string")
         and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and ((.id | test("[\\n\\r]")) | not);
       (if ($p[0] | type) == "object" and (($p[0].vulns? // []) | type) == "array" then $p[0].vulns // [] else [] end) as $page
@@ -11740,30 +11754,32 @@ scanner_batch_evidence_command() {
       | .[$i].res = {vulns: ((.[$i].res.vulns + $good) | unique_by(.id))}
       | .[$i].gaps += (if $note != "" then [$note]
                        elif ($good | length) != ($page | length) then ["malformed paginated OSV response"]
-                       else [] end)' <<<"$paired")
-  done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' <<<"$paired")
+                       else [] end)' "$paired_file" >"$paired_file.new" || return 4
+    mv -f -- "$paired_file.new" "$paired_file"
+  done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' "$paired_file")
 
   # Severity per (advisory, queried package); an advisory whose record cannot
   # be fetched, validated or classified is recorded in `failed` with the
   # reason, and is neither guessed at nor dropped silently.
   #
-  # What the service just answered (which advisories each identity carries, with the stamp it gave each) is never
+  # What the service just answered (which advisories each identity carries, with the stamps it gave each) is never
   # cached. What may be spared is fetching and classifying the RECORD behind an advisory whose stamp is unchanged
   # (ticket 1671): the core's store answers for (advisory, stamp, package) and holds a reading for one day at most.
   # An advisory is taken from the store only when every package it was asked for is there; otherwise it is fetched
   # as before, for all of them. A reading is stored only after the record was fetched, checked as the advisory it
   # claims to be, and classified; a failed, malformed or unclassifiable record stores nothing.
-  local sev_map='{}' failed_map='{}' label pkg_ref id member_rc
-  local classifier="" cached_map='{}' put_list='[]' cache_mod fetched_at all_cached cached_label
+  local sev_map='{}' failed_map='{}' label pkg_ref id
+  local classifier="" cached_map='{}' fetched_at all_cached cached_label withdrawal
+  scanner_batch_cache_plan "$scratch" || return 4
   if [[ -n "$cache_state" ]] && classifier=$(scanner_batch_classifier); then
-    cached_map=$(scanner_batch_cache_get "$scratch" "$cache_state" "$classifier" "$paired") || cached_map='{}'
+    cached_map=$(scanner_batch_cache_get "$scratch" "$cache_state" "$classifier") || cached_map='{}'
   else
     classifier=""
   fi
   while IFS= read -r id; do
     local -a refs=()
     mapfile -t refs < <(jq -r --arg id "$id" \
-      '[.[] | select([.res.vulns[]? | .id] | index($id)) | .pkg.name] | unique | .[]' <<<"$paired")
+      '[.[] | select([.res.vulns[]? | .id] | index($id)) | .pkg.name] | unique | .[]' "$paired_file")
     all_cached=0
     if (( ${#refs[@]} > 0 )); then
       all_cached=1
@@ -11795,20 +11811,19 @@ scanner_batch_evidence_command() {
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
       continue
     fi
-    # the stamp this advisory was given with the membership answer: stored under, only when there is one (see the keys)
-    cache_mod=""
-    if [[ -n "$classifier" ]]; then
-      cache_mod=$(scanner_batch_cache_stamp "$id" "$paired")
+    # A withdrawal date is a timestamp: a `withdrawn` member that is not one makes the record malformed (missing evidence for the
+    # identities that carry it, nothing stored), never a withdrawal.
+    withdrawal=$(scanner_batch_withdrawal_state "$scratch/vuln.json")
+    if [[ "$withdrawal" == malformed ]]; then
+      failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
+      continue
     fi
     # A withdrawn advisory (the record carries a withdrawal date) is not an advisory of anything: it is removed before
     # it can count as present, introduced or fixed. It gets no severity, so no hit is made of it, and it is not a gap.
-    if jq -e '(.withdrawn? // "") | (type == "string" and length > 0)' "$scratch/vuln.json" >/dev/null 2>&1; then
-      if [[ -n "$cache_mod" ]]; then
-        for pkg_ref in "${refs[@]}"; do
-          put_list=$(jq -c --arg id "$id" --arg m "$cache_mod" --arg p "$pkg_ref" --argjson f "$fetched_at" \
-            '. + [{id: $id, modified: $m, package: $p, severity: "", withdrawn: true, fetched: $f}]' <<<"$put_list")
-        done
-      fi
+    if [[ "$withdrawal" == withdrawn ]]; then
+      for pkg_ref in "${refs[@]}"; do
+        jq -nc --arg id "$id" --arg p "$pkg_ref" --argjson f "$fetched_at" '{id: $id, package: $p, severity: "", withdrawn: true, fetched: $f}' >>"$scratch/facts.jsonl"
+      done
       continue
     fi
     for pkg_ref in "${refs[@]}"; do
@@ -11816,27 +11831,28 @@ scanner_batch_evidence_command() {
         sev_map=$(jq -c --arg k "${id}|${pkg_ref}" --arg l "$label" '. + {($k): $l}' <<<"$sev_map")
         case "$label" in
           critical|high|moderate|low)
-            if [[ -n "$cache_mod" ]]; then
-              put_list=$(jq -c --arg id "$id" --arg m "$cache_mod" --arg p "$pkg_ref" --arg l "$label" --argjson f "$fetched_at" \
-                '. + [{id: $id, modified: $m, package: $p, severity: $l, withdrawn: false, fetched: $f}]' <<<"$put_list")
-            fi ;;
+            jq -nc --arg id "$id" --arg p "$pkg_ref" --arg l "$label" --argjson f "$fetched_at" '{id: $id, package: $p, severity: $l, withdrawn: false, fetched: $f}' >>"$scratch/facts.jsonl" ;;
         esac
       else
         failed_map=$(jq -c --arg k "${id}|${pkg_ref}" '. + {($k): "OSV advisory severity unreadable"}' <<<"$failed_map")
       fi
     done
-  done < <(jq -r '[.[].res.vulns[]? | .id | strings | select(test("^MAL-") | not)] | unique | .[]' <<<"$paired")
+  done < <(jq -r '[.[].res.vulns[]? | .id | strings | select(test("^MAL-") | not)] | unique | .[]' "$paired_file")
   # Storing never fails the command: what was not stored is fetched again next time.
   if [[ -n "$classifier" ]]; then
-    scanner_batch_cache_put "$scratch" "$cache_state" "$classifier" "$put_list" || true
+    scanner_batch_cache_put "$scratch" "$cache_state" "$classifier" || true
   fi
 
   local block_severities document
   block_severities=$(scanner_batch_block_severities)
+  printf '%s' "$sev_map" >"$scratch/sev.json"
+  printf '%s' "$failed_map" >"$scratch/failed.json"
+  printf '%s' "$blocklist" >"$scratch/blocklist.json"
   if ! document=$(jq -cn \
-    --argjson paired "$paired" --argjson sev "$sev_map" --argjson failed "$failed_map" \
-    --argjson block "$block_severities" --argjson blocklist "$blocklist" '
-    def hit($p):
+    --slurpfile paired_doc "$paired_file" --slurpfile sev_doc "$scratch/sev.json" --slurpfile failed_doc "$scratch/failed.json" \
+    --slurpfile blocklist_doc "$scratch/blocklist.json" --argjson block "$block_severities" '
+    $paired_doc[0] as $paired | $sev_doc[0] as $sev | $failed_doc[0] as $failed | $blocklist_doc[0] as $blocklist
+    | def hit($p):
       .id as $id
       | if ($id | test("^MAL-")) then {id: $id, severity: "critical", malware: true}
         elif $sev[$id + "|" + $p.name] then {id: $id, severity: $sev[$id + "|" + $p.name], malware: false}

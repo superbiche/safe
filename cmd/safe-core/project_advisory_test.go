@@ -62,7 +62,11 @@ func TestProjectAdvisoryWithoutAStateDirectoryThereIsNoCache(t *testing.T) {
 
 func TestProjectAdvisoryUnreadableRequestsAreErrorsAndAMissingStoreIsAMiss(t *testing.T) {
 	state := advisoryState(t)
-	for _, in := range []string{"", "{", `{"keys":[]}`, `{"classifier":"c","keys":[],"x":1}`, `{"classifier":"c","keys":[]} {}`} {
+	// what the reviewer got through (round 1): an absent or null keys, a case variant, a repeated member, a stray closing delimiter, two documents
+	for _, in := range []string{"", "{", `{"keys":[]}`, `{"classifier":"c","keys":[],"x":1}`, `{"classifier":"c","keys":[]} {}`,
+		`{"classifier":"c"}`, `{"classifier":"c","keys":null}`, `{"classifier":"c","Keys":[]}`, `{"classifier":"c","classifier":"c","keys":[]}`,
+		`{"classifier":"c","keys":[]}}`, `{"classifier":"c","keys":[]}{"classifier":"c","keys":[]}`,
+		`{"classifier":"c","readings":null}`, `{"classifier":"c","readings":[{"id":"a","modified":"s","package":"p","severity":"low","fetched":1}]}`} {
 		if code, _, _ := runWithStdin(in, "project-advisory-get", "--state-dir", state); code != 3 {
 			t.Fatalf("get %q: exit %d, want 3", in, code)
 		}
@@ -78,5 +82,32 @@ func TestProjectAdvisoryUnreadableRequestsAreErrorsAndAMissingStoreIsAMiss(t *te
 	// a put that cannot store anything does not fail
 	if code, _, _ := runWithStdin(`{"classifier":"c","readings":[{"id":"a","modified":"s","package":"p","severity":"low","withdrawn":false,"fetched":1}]}`, "project-advisory-put", "--state-dir", filepath.Join(state, "missing")); code != 0 {
 		t.Fatalf("put into a missing state directory: exit %d", code)
+	}
+}
+
+func TestProjectAdvisoryCheckReadsAReplyStrictly(t *testing.T) {
+	dir := t.TempDir()
+	request := filepath.Join(dir, "request.json")
+	if err := os.WriteFile(request, []byte(`{"classifier":"c","keys":[{"id":"GHSA-a","modified":"s","package":"p"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	hit := fmt.Sprintf(`{"id":"GHSA-a","modified":"s","package":"p","severity":"high","withdrawn":false,"fetched":%d}`, now)
+	code, out, _ := runWithStdin(`{"schema_version":1,"hits":[`+hit+`]}`, "project-advisory-check", "--request", request)
+	if code != 0 || out != "{\"GHSA-a|p\":\"high\"}\n" {
+		t.Fatalf("a whole reply: %d %q", code, out)
+	}
+	for name, reply := range map[string]string{
+		"two envelopes":        `{"schema_version":1,"hits":[]}{"schema_version":1,"hits":[]}`,
+		"an extended envelope": `{"schema_version":1,"hits":[],"x":1}`,
+		"two hits for one key": `{"schema_version":1,"hits":[` + hit + `,` + hit + `]}`,
+		"not a document":       `{`,
+	} {
+		if code, out, _ := runWithStdin(reply, "project-advisory-check", "--request", request); code != 3 || out != "" {
+			t.Fatalf("%s: exit %d, output %q", name, code, out)
+		}
+	}
+	if code, _, _ := runWithStdin(`{"schema_version":1,"hits":[]}`, "project-advisory-check"); code != 2 {
+		t.Fatalf("no request argument: exit %d", code)
 	}
 }

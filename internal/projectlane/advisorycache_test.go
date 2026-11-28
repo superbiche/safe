@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -301,7 +302,7 @@ func TestAdvisoryCacheIsBoundedAndPruned(t *testing.T) {
 	}
 }
 
-func TestAdvisoryCachePrunesWhatCanNeverBeTrustedAgain(t *testing.T) {
+func TestAdvisoryCacheRemovesOnlyWhatItWrote(t *testing.T) {
 	state := privateState(t)
 	cache := AdvisoryCache{StateDir: state}
 	dir := filepath.Join(state, advisoryDir)
@@ -309,20 +310,140 @@ func TestAdvisoryCachePrunesWhatCanNeverBeTrustedAgain(t *testing.T) {
 	cache.Put("c", []AdvisoryReading{advReading(stale, "low", advisoryNow)}, advisoryNow)
 	long := advisoryNow.Add(-2 * AdvisoryMaxAge)
 	_ = os.Chtimes(advPath(state, "c", stale), long, long)
-	leftover := filepath.Join(dir, ".new-abandoned")
-	_ = os.WriteFile(leftover, []byte("x"), 0o600)
-	_ = os.Chtimes(leftover, advisoryNow.Add(-time.Hour), advisoryNow.Add(-time.Hour))
-	fresh := filepath.Join(dir, ".new-inflight")
-	_ = os.WriteFile(fresh, []byte("x"), 0o600)
-	_ = os.Chtimes(fresh, advisoryNow, advisoryNow)
-	foreign := filepath.Join(dir, "README")
-	_ = os.WriteFile(foreign, []byte("not ours"), 0o600)
-	_ = os.Chtimes(foreign, long, long)
+	// the writer's own leftover (".new-" and 32 lowercase hexadecimal digits), aged
+	ours := filepath.Join(dir, ".new-0123456789abcdef0123456789abcdef")
+	_ = os.WriteFile(ours, []byte("x"), 0o600)
+	_ = os.Chtimes(ours, advisoryNow.Add(-time.Hour), advisoryNow.Add(-time.Hour))
+	// the writer's own leftover, not aged: an interrupted write that may still be running
+	inflight := filepath.Join(dir, ".new-fedcba9876543210fedcba9876543210")
+	_ = os.WriteFile(inflight, []byte("x"), 0o600)
+	_ = os.Chtimes(inflight, advisoryNow, advisoryNow)
+	// names that are not the writer's: a prefix alone, a longer or shorter digest, upper case, a name of another kind, a file that is not ours
+	var foreign []string
+	for _, name := range []string{".new-abandoned", ".new-0123456789abcdef0123456789abcde", ".new-0123456789abcdef0123456789abcdef0", ".new-0123456789ABCDEF0123456789abcdef", "README", ".new-", "0123456789abcdef"} {
+		path := filepath.Join(dir, name)
+		_ = os.WriteFile(path, []byte("not ours"), 0o600)
+		_ = os.Chtimes(path, long, long)
+		foreign = append(foreign, path)
+	}
 	cache.Put("c", []AdvisoryReading{advReading(adv("GHSA-new", "s", "p"), "low", advisoryNow)}, advisoryNow)
-	for path, want := range map[string]bool{advPath(state, "c", stale): false, leftover: false, fresh: true, foreign: true} {
+	for path, want := range map[string]bool{advPath(state, "c", stale): false, ours: false, inflight: true} {
 		_, err := os.Lstat(path)
 		if (err == nil) != want {
 			t.Fatalf("%s: present=%v, want %v", filepath.Base(path), err == nil, want)
 		}
+	}
+	for _, path := range foreign {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("%s was removed, it is not the writer's", filepath.Base(path))
+		}
+	}
+}
+
+func TestAdvisoryCacheMakesRoomBeforeItWrites(t *testing.T) {
+	state := privateState(t)
+	cache := AdvisoryCache{StateDir: state}
+	dir := filepath.Join(state, advisoryDir)
+	var first []AdvisoryReading
+	for i := 0; i < AdvisoryCap; i++ {
+		first = append(first, advReading(adv(fmt.Sprintf("GHSA-%05d", i), "s", "p"), "low", advisoryNow))
+	}
+	cache.Put("c", first, advisoryNow)
+	handle, err := cache.dir(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	// the room is made by the step before the writes: with the store full and three readings to come, three entries are gone already
+	cache.makeRoom(handle, 3, advisoryNow)
+	if names, _ := os.ReadDir(dir); len(names) != AdvisoryCap-3 {
+		t.Fatalf("%d entries after making room for three, want %d", len(names), AdvisoryCap-3)
+	}
+	// a request that alone is larger than the cap stores the cap's worth and no more
+	var many []AdvisoryReading
+	for i := 0; i < AdvisoryCap+5; i++ {
+		many = append(many, advReading(adv(fmt.Sprintf("GHSA-many-%05d", i), "s", "p"), "low", advisoryNow))
+	}
+	cache.Put("c", many, advisoryNow)
+	if names, _ := os.ReadDir(dir); len(names) > AdvisoryCap {
+		t.Fatalf("%d entries, past the cap", len(names))
+	}
+}
+
+func TestAdvisoryCacheIgnoresAnEntryThatIsNotWholeOrNotTyped(t *testing.T) {
+	key := adv("GHSA-aaaa", "stamp", "pkg")
+	now := advisoryNow.Unix()
+	doc := func(withdrawn, severity string) string {
+		parts := []string{`"schema_version":1`, `"classifier":"c"`, `"id":"GHSA-aaaa"`, `"modified":"stamp"`, `"package":"pkg"`, fmt.Sprintf(`"fetched":%d`, now)}
+		if withdrawn != "-" {
+			parts = append(parts, `"withdrawn":`+withdrawn)
+		}
+		if severity != "-" {
+			parts = append(parts, `"severity":`+severity)
+		}
+		return "{" + joinComma(parts) + "}"
+	}
+	for name, tc := range map[string]struct {
+		content string
+		hit     bool
+	}{
+		"whole, banded":                       {doc("false", `"high"`), true},
+		"whole, withdrawn":                    {doc("true", `""`), true},
+		"no withdrawn member":                 {doc("-", `"high"`), false},
+		"a null withdrawn":                    {doc("null", `"high"`), false},
+		"a withdrawn entry with no severity":  {doc("true", "-"), false},
+		"a null severity":                     {doc("false", "null"), false},
+		"a string withdrawn":                  {doc(`"false"`, `"high"`), false},
+		"a case variant of a required member": {`{"schema_version":1,"classifier":"c","id":"GHSA-aaaa","modified":"stamp","package":"pkg","Severity":"high","withdrawn":false,"fetched":` + fmt.Sprint(now) + `}`, false},
+		"a stray closing delimiter":           {doc("false", `"high"`) + "}", false},
+		"a float fetch time":                  {strings.Replace(doc("false", `"high"`), fmt.Sprint(now), fmt.Sprint(now)+".5", 1), false},
+	} {
+		state := privateState(t)
+		AdvisoryCache{StateDir: state}.Put("c", []AdvisoryReading{advReading(key, "high", advisoryNow)}, advisoryNow)
+		if err := os.WriteFile(advPath(state, "c", key), []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := len((AdvisoryCache{StateDir: state}).Get("c", []AdvisoryKey{key}, advisoryNow)) == 1; got != tc.hit {
+			t.Fatalf("%s: hit=%v, want %v", name, got, tc.hit)
+		}
+	}
+}
+
+func joinComma(parts []string) string {
+	out := ""
+	for i, part := range parts {
+		if i > 0 {
+			out += ","
+		}
+		out += part
+	}
+	return out
+}
+
+func TestAdvisoryCachePutNeverWritesPastTheCap(t *testing.T) {
+	state := privateState(t)
+	cache := AdvisoryCache{StateDir: state}
+	dir := filepath.Join(state, advisoryDir)
+	var first []AdvisoryReading
+	for i := 0; i < AdvisoryCap; i++ {
+		first = append(first, advReading(adv(fmt.Sprintf("GHSA-%05d", i), "s", "p"), "low", advisoryNow))
+	}
+	cache.Put("c", first, advisoryNow)
+	// at every moment a write begins (an interruption there leaves exactly what is on disk), the store holds no more than the cap
+	var worst int
+	advisoryHook = func(stage string) {
+		if stage == "write" {
+			if names, _ := os.ReadDir(dir); len(names) > worst {
+				worst = len(names)
+			}
+		}
+	}
+	defer func() { advisoryHook = func(string) {} }()
+	cache.Put("c", []AdvisoryReading{advReading(adv("GHSA-x1", "s", "p"), "low", advisoryNow), advReading(adv("GHSA-x2", "s", "p"), "low", advisoryNow), advReading(adv("GHSA-x3", "s", "p"), "low", advisoryNow)}, advisoryNow)
+	if worst > AdvisoryCap {
+		t.Fatalf("a write began with %d entries on disk, past the cap of %d", worst, AdvisoryCap)
+	}
+	if names, _ := os.ReadDir(dir); len(names) != AdvisoryCap {
+		t.Fatalf("%d entries at the end, want %d", len(names), AdvisoryCap)
 	}
 }
