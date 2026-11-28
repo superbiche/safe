@@ -52,7 +52,7 @@ url="" body=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[$i]}" in
-    -d) body="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+    -d) body="${args[$((i + 1))]}"; [[ "$body" != @* ]] || body="$(cat -- "${body#@}")"; i=$((i + 1)) ;;
     http*://*) url="${args[$i]}" ;;
   esac
 done
