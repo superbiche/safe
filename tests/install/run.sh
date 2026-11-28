@@ -7,6 +7,8 @@ REAL_NODE_BIN="$(node -p process.execPath 2>/dev/null || true)"
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
 # shellcheck source=tests/lib/test-isolation.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+# shellcheck source=tests/lib/lane_shape.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/lane_shape.sh"
 safe_test_setup_isolation || exit 1
 # These cases assert install defaults relative to each case's HOME and set
 # explicit SAFE_* paths only where a case is testing an override.
@@ -809,7 +811,7 @@ if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
             line: (if $o == "clear" then "PASS (score=95)" elif $o == "adverse" then "WARN (score=40)" elif $o == "blocked" then "BLOCK (critical supply-chain-risk alert)" else "WARN (\($o))" end),
             causes: (if $o == "adverse" then ["socket_low_score"] elif $o == "blocked" then ["socket_malware"] elif $o == "rate_limited" then ["socket_rate_limited"] else [] end), cached: false}],
        cached_blocks: [$in.cached[] | . as $c | select($blocks | index("\($c.name)@\($c.version)")) | {name: $c.name, version: $c.version, line: "BLOCK (critical supply-chain-risk alert)"}],
-       cache_gap: $gap, untied: []}'
+       cache_gap: $gap}'
   exit 0
 fi
 
@@ -8385,6 +8387,34 @@ case_project_lane_update_that_fixes_a_critical_passes() {
   pass "$FUNCNAME"
 }
 
+# ---- ticket 1884: the stand-in auditor answers what the real auditor answers ------------------------------------------------------------
+# Every lane case here drives the gate with this suite's stub auditor. The stub writes what the real entries write, member for member and type
+# for type, from ONE definition (tests/lib/lane_auditor_shapes.json), which tests/contract/lane_auditor.sh holds the real entries to: a stub
+# that writes a member the real entry does not (it once wrote `untied`, and the gate then required it of the real reader), or misses one, fails here.
+case_stand_in_auditor_answers_the_contract() {
+  prepare_case "stand-in-contract"
+  local stub="${BIN_DIR}/safe-audit" out="${CASE_DIR}/answer.json" ok=1 problems label
+  local -a base=(env SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}")
+  shape() { # <label> <entry>: the answer in ${out} conforms
+    if problems="$(lane_shape_check "$2" "${out}")"; then :; else printf '%s: %s\n' "$1" "${problems}" >&2; ok=0; fi
+  }
+  "${base[@]}" SAFE_AUDIT_EVIDENCE_HITS="{\"kept@1.0.0\":${LANE_HIT_CRITICAL}}" SAFE_AUDIT_EVIDENCE_MISSING='["gone@1.0.0"]' \
+    SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"evil","reason":"operator blocklist"}]' "${stub}" scanner-batch --evidence \
+    <<<'{"packages":[{"name":"kept","version":"1.0.0"},{"name":"gone","version":"1.0.0"}],"blocklist_names":["evil"]}' >"${out}"
+  shape "the advisory evidence" evidence
+  "${base[@]}" SAFE_AUDIT_SOCKET_OUTCOMES='{"a@1.0.0":"blocked","b@1.0.0":"adverse"}' SAFE_AUDIT_SOCKET_CACHED_BLOCKS='["c@1.0.0"]' SAFE_AUDIT_SOCKET_CACHE_GAP="" \
+    "${stub}" package-audit --ecosystem npm --evidence-only <<<'{"roots":[{"name":"a","version":"1.0.0"},{"name":"b","version":"1.0.0"}],"cached":[{"name":"c","version":"1.0.0"}]}' >"${out}"
+  shape "the Socket evidence of named roots" socket_answer
+  "${base[@]}" "${stub}" package-audit --ecosystem npm --evidence-only <<<'{"roots":[],"cached":[]}' >"${out}"
+  shape "the Socket cache alone" socket_answer
+  ( cd "${WORK_DIR}" && "${base[@]}" SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":0,"high":0,"medium":0,"low":0,"unknown":0}}' \
+      "${stub}" repo-audit . --deps-only --allow-missing-tools --result-out "${out}" ) >/dev/null
+  shape "the project scan" scan_result
+  ( cd "${WORK_DIR}" && "${base[@]}" "${stub}" repo-audit . --deps-only --allow-missing-tools --result-out "${out}" ) >/dev/null
+  shape "the project scan without a breakdown" scan_result
+  if (( ok )); then pass "$FUNCNAME"; else fail "$FUNCNAME: the stub auditor differs from the real auditor's answers"; fi
+}
+
 # ---- ticket 1638: the lane runs no lifecycle script and says which ones it did not run --------------------------------------------
 # The report reads the judged lockfile and the published tree (safe-core project-scripts), never npm's messages. The stub's `ci` writes
 # what NPM_CI_PKG_EXTRA (members of a package's package.json, by install path) and NPM_CI_PKG_FILES (files, by install path) ask for.
@@ -15369,7 +15399,7 @@ case_project_lane_socket_is_read_by_the_reader_beside_the_dispatcher() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-socket-reader-beside" kept@1.0.0
   mkdir -p "${CASE_DIR}/fake-bin"
-  printf '#!/bin/sh\ncat >/dev/null\nprintf %%s '"'"'{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}'"'"'\n' > "${CASE_DIR}/fake-bin/safe-audit"
+  printf '#!/bin/sh\ncat >/dev/null\nprintf %%s '"'"'{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}'"'"'\n' > "${CASE_DIR}/fake-bin/safe-audit"
   chmod +x "${CASE_DIR}/fake-bin/safe-audit"
   SAFE_AUDIT_BIN="${CASE_DIR}/fake-bin/safe-audit" SAFE_AUDIT_PATH="${CASE_DIR}/fake-bin/safe-audit" SAFE_TEST_PATH_MID="${CASE_DIR}/fake-bin" \
     SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"adverse"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -15481,11 +15511,11 @@ case_project_lane_socket_an_incomplete_or_contradictory_answer_is_missing_eviden
   local label raw
   for label in empty-roots another-version clear-with-malware duplicate-rows bad-exit; do
     case "${label}" in
-      empty-roots) raw='{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
-      another-version) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.1","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
-      clear-with-malware) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
-      duplicate-rows) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false},{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
-      bad-exit) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":10,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
+      empty-roots) raw='{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}' ;;
+      another-version) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.1","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      clear-with-malware) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      duplicate-rows) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false},{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      bad-exit) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":10,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
     esac
     lane_prepare "lane-socket-answer-${label}" kept@1.0.0
     SAFE_AUDIT_SOCKET_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -15495,7 +15525,7 @@ case_project_lane_socket_an_incomplete_or_contradictory_answer_is_missing_eviden
   done
   # a row that is whole is kept beside one that is not: a valid block among the roots still decides (104)
   lane_prepare "lane-socket-answer-block-beside-gap" kept@1.0.0
-  raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"blocked","gate_exit":20,"line":"BLOCK (critical supply-chain-risk alert)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}'
+  raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"blocked","gate_exit":20,"line":"BLOCK (critical supply-chain-risk alert)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":""}'
   SAFE_AUDIT_SOCKET_RAW="${raw}" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" lane_run 'npm install clean@2.0.0 other@1.0.0'
   assert_status 104 "$FUNCNAME: a valid block beside a missing row" || return
   assert_err_contains_fragment 'Socket BLOCK on clean@2.0.0' "$FUNCNAME: block" || return
@@ -15563,10 +15593,10 @@ case_project_lane_socket_the_readers_original_bytes_are_validated() {
   local label raw
   for label in repeated-schema no-envelope two-documents repeated-in-row; do
     case "${label}" in
-      repeated-schema) raw='{"schema_version":1,"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
+      repeated-schema) raw='{"schema_version":1,"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":""}' ;;
       no-envelope) raw='{"schema_version":1,"roots":['"${row}"']}' ;;
-      two-documents) raw='{"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":"","untied":[]}{"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
-      repeated-in-row) raw='{"schema_version":1,"roots":[{"name":"clean","name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
+      two-documents) raw='{"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":""}{"schema_version":1,"roots":['"${row}"'],"cached_blocks":[],"cache_gap":""}' ;;
+      repeated-in-row) raw='{"schema_version":1,"roots":[{"name":"clean","name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
     esac
     lane_prepare "lane-socket-bytes-${label}" kept@1.0.0
     SAFE_AUDIT_SOCKET_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -15576,9 +15606,9 @@ case_project_lane_socket_the_readers_original_bytes_are_validated() {
   # the cache answer: the same shapes are a gap (102), never an empty cache
   for label in repeated-schema no-envelope two-documents; do
     case "${label}" in
-      repeated-schema) raw='{"schema_version":1,"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
+      repeated-schema) raw='{"schema_version":1,"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}' ;;
       no-envelope) raw='{"schema_version":1,"roots":[]}' ;;
-      two-documents) raw='{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}' ;;
+      two-documents) raw='{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}' ;;
     esac
     lane_prepare "lane-socket-bytes-cache-${label}" kept@1.0.0
     SAFE_AUDIT_SOCKET_CACHE_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -15587,11 +15617,11 @@ case_project_lane_socket_the_readers_original_bytes_are_validated() {
   done
   # a malformed block row is a gap, and the whole block beside it is kept (104)
   lane_prepare "lane-socket-bytes-bad-block-row" kept@1.0.0
-  raw='{"schema_version":1,"roots":[],"cached_blocks":[{"name":"kept","version":"1.0.0"}],"cache_gap":"","untied":[]}'
+  raw='{"schema_version":1,"roots":[],"cached_blocks":[{"name":"kept","version":"1.0.0"}],"cache_gap":""}'
   SAFE_AUDIT_SOCKET_CACHE_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   assert_status 102 "$FUNCNAME: a malformed block row alone" || return
   lane_prepare "lane-socket-bytes-bad-and-good-row" kept@1.0.0
-  raw='{"schema_version":1,"roots":[],"cached_blocks":[{"name":"kept","version":"1.0.0"},{"name":"clean","version":"2.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":"","untied":[]}'
+  raw='{"schema_version":1,"roots":[],"cached_blocks":[{"name":"kept","version":"1.0.0"},{"name":"clean","version":"2.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":""}'
   SAFE_AUDIT_SOCKET_CACHE_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   assert_status 104 "$FUNCNAME: a whole block beside a malformed row" || return
   assert_err_contains_fragment 'Socket BLOCK on clean@2.0.0' "$FUNCNAME: the whole block" || return
@@ -18346,6 +18376,7 @@ main() {
     case_project_lane_switch_off_keeps_todays_gate \
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
+    case_stand_in_auditor_answers_the_contract \
     case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
     case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
     case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \

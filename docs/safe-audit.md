@@ -674,7 +674,7 @@ future is a `cache_gap`, and the blocks already read are kept. Only a path shown
 The credential helper (`bw-env-run`) is resolved like the Socket tool, from the operator's locations only; when
 injection is needed and it is not there, the reading is `unavailable`. `--evidence-progress <file>` (with the batch)
 appends each root's document as it completes, so a supervising process keeps what was classified before it stopped the
-batch. The mode is set by the parsed flag alone: a value of its internal variable in the environment is overwritten at
+batch. The answer of the batch has `schema_version`, `roots`, `cached_blocks` and `cache_gap` and no other member (what the gate could not tie to its plan is the gate's own statement, never asked of this reader). The mode is set by the parsed flag alone: a value of its internal variable in the environment is overwritten at
 start-up and reaches nothing. The normal paths of `package-audit` are unchanged.
 
 ### Project lane doors: `lane-acceptances` and `lane-revoke`

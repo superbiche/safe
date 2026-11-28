@@ -4739,7 +4739,7 @@ safe_gate_project_lane_socket_cache_doc() {
   jq -c --slurpfile q "${request}" --arg why "${why}" '
     ($q[0].cached) as $asked
     | (type == "object" and .schema_version == 1 and (.roots | type == "array") and (.cached_blocks | type == "array")
-       and (.cache_gap | type == "string") and (.untied | type == "array")) as $whole
+       and (.cache_gap | type == "string")) as $whole
     | (if $whole then [.cached_blocks[]
          | select(type == "object" and (.name | type == "string") and (.version | type == "string") and (.line | type == "string")
                   and (.line | length > 0) and (.line | test("[\n\r]") | not))
@@ -4759,7 +4759,9 @@ safe_gate_project_lane_socket_cache_doc() {
 # not (each line one document). Exactly one consistent row per identity asked: a row that is missing, repeated, for another
 # version, or contradicting itself becomes an unavailable result for the root asked, never a clear one; the whole rows
 # are kept. Operands that could not be tied travel apart (`untied`): they are not asked and are missing evidence of the
-# command. $1 request, $2 raw answer, $3 output, $4 why the call failed, $5 progress file (may be absent), $6 untied
+# command. That statement is the GATE's own (the reader is never given them and cannot know them): the reader's answer carries
+# `schema_version`, `roots`, `cached_blocks` and `cache_gap` and nothing more is required of it.
+# $1 request, $2 raw answer, $3 output, $4 why the call failed, $5 progress file (may be absent), $6 untied
 # file, $7 core.
 safe_gate_project_lane_socket_roots_doc() {
   local request="$1" raw="$2" out="$3" why="$4" progress="$5" untied="$6" core="$7" src="$2" kept="${3}.kept" line
@@ -4767,7 +4769,7 @@ safe_gate_project_lane_socket_roots_doc() {
   if [[ -z "${why}" ]]; then
     if ! safe_gate_project_lane_socket_framed "${raw}" "${core}" \
         || ! jq -e 'type == "object" and .schema_version == 1 and (.roots | type == "array") and (.cached_blocks | type == "array")
-                    and (.cache_gap | type == "string") and (.untied | type == "array")' "${raw}" >/dev/null 2>&1; then
+                    and (.cache_gap | type == "string")' "${raw}" >/dev/null 2>&1; then
       why="the Socket evidence reader's answer is not one well-formed document"
     fi
   fi
@@ -5016,7 +5018,7 @@ safe_gate_project_lane_late_evidence() {
       "$(safe_gate_project_lane_socket_deadline roots "$(jq -r '.roots | length' "${scratch}/socket-roots-request.json")")" "${scratch}" "${scratch}/socket-roots.progress" || rc=$?
     socket_why="$(safe_gate_project_lane_socket_why 'Socket evidence reader' "${rc}")"
   else
-    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}\n' >"${scratch}/socket-roots.raw"
+    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}\n' >"${scratch}/socket-roots.raw"
   fi
   if jq -e '(.roots | length > 0) or (.untied | length > 0)' "${scratch}/socket-roots-request.json" >/dev/null 2>&1; then
     if ! safe_gate_project_lane_socket_roots_doc "${scratch}/socket-roots-request.json" "${scratch}/socket-roots.raw" "${socket_roots}" "${socket_why}" \
@@ -7255,7 +7257,7 @@ safe_gate_project_lane_run() {
   else
     : >"${scratch}/socket-cache.raw"
     socket_why=""
-    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}\n' >"${scratch}/socket-cache.raw"
+    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}\n' >"${scratch}/socket-cache.raw"
   fi
   if ! safe_gate_project_lane_socket_cache_doc "${scratch}/socket-cache-request.json" "${scratch}/socket-cache.raw" "${socket_cache}" "${socket_why}" "${safe_core}" \
       || ! jq -e '.schema_version == 1' "${socket_cache}" >/dev/null 2>&1; then

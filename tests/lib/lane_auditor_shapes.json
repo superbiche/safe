@@ -1,0 +1,30 @@
+{
+  "evidence": {
+    "schema_version": "number",
+    "policy": {"block_severities": ["string"]},
+    "identities": [{"name": "string", "version": "string", "coverage": "string", "gap": "string",
+                    "advisories": [{"id": "string", "severity": "string", "malware": "boolean"}]}],
+    "blocklist": [{"name": "string", "reason": "string"}]
+  },
+  "socket_answer": {
+    "schema_version": "number",
+    "roots": [{"name": "string", "version": "string", "outcome": "string", "gate_exit": "number", "line": "string",
+               "causes": ["string"], "cached": "boolean"}],
+    "cached_blocks": [{"name": "string", "version": "string", "line": "string"}],
+    "cache_gap": "string"
+  },
+  "lane_acceptances": {
+    "schema_version": "number",
+    "acceptances": [{"kind": "string", "name": "string", "version": "string", "host": "string", "advisories": ["string"], "causes": ["string"]}]
+  },
+  "lane_revoke": {"revoked": [{"name": "string", "version": "string"}]},
+  "install_receipt": {"version": "string", "verdict": "string", "source": "string", "*": "any"},
+  "scan_result": {
+    "verdict": "string",
+    "cve_scan": {"critical": "number", "*": "any"},
+    "audit_totals": {"critical": "number", "by_ecosystem?": {"*": {"critical": "number", "*": "any"}}, "*": "any"},
+    "tool_status": {"*": {"status?": "string", "*": "any"}},
+    "ecosystem_audits": [{"scanner": "string", "status": "string", "*": "any"}],
+    "*": "any"
+  }
+}

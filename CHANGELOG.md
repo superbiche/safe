@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): the lane and the real auditor (ticket 1884). The gate required of the Socket cache reader's and the Socket
+  roots reader's answer a member (`untied`) that the real reader never writes, so with the real auditor every lane command whose graph held a public
+  identity ended 102 ("the Socket cache could not be read"); every suite drove the lane with a stand-in that wrote the member. The gate no longer requires
+  it (the operands the gate could not tie are its own statement, not the reader's). A joint contract suite (`tests/contract/lane_auditor.sh`) runs every
+  entry of the auditor the lane calls, for real and in an isolated home, and gives its answer to the gate's own consumer; the members and types of each
+  answer are defined once (`tests/lib/lane_auditor_shapes.json`) and the stand-ins of the install suite and of the live binding suite are held to the
+  same definition (the live stand-in lacked `cve_scan`). A live scenario runs the real auditor end to end.
 ## 1.76.0 - 2026-11-28
 
 - Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a
