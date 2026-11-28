@@ -614,6 +614,9 @@ write("a-listing-of-the-reports-in-the-runner", src[:fo.end()] + '  ls -- "${lan
 write("the-runner-makes-the-reports-directory", src[:fo.end()] + '  safe_gate_lane_private_dir "${lane_dir}/reports" || return 1\n' + src[fo.end():])
 sd = find(r'(safe_gate_project_lane_scan_digest\(\) \{\n)')
 write("a-reader-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  ls -- "${SAFE_DATA_DIR}/project-lane/reports" >/dev/null 2>&1\n' + src[sd.end():])
+# R14 (ticket 1671): the advisory reading's cache is the reader's alone
+write("the-advisory-cache-directory-named-in-the-runner", src[:fo.end()] + '  ls -- "${state_dir}/advisory-records" >/dev/null 2>&1\n' + src[fo.end():])
+write("the-advisory-cache-command-started-in-a-shared-helper", src[:sd.end()] + '  "${SAFE_CORE}" project-advisory-get --state-dir "${SAFE_DATA_DIR}" </dev/null\n' + src[sd.end():])
 write("a-copy-of-the-reports-in-the-shared-scan-helper", src[:sd.end()] + '  cp -r -- "${SAFE_DATA_DIR}/project-lane/reports" "${TMPDIR}" 2>/dev/null\n' + src[sd.end():])
 sg = find(r'(safe_gate_scan_project\(\) \{\n)')
 write("a-second-scan-call-in-the-shared-project-scan-helper", src[:sg.end()] + '  safe_gate_project_lane_scan_report || true\n' + src[sg.end():])
@@ -651,7 +654,7 @@ PY
       bad="${bad} ${name%.sh}"
     fi
   done
-  (( count >= 77 )) || bad="${bad} (only ${count} fixtures were written)"
+  (( count >= 79 )) || bad="${bad} (only ${count} fixtures were written)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

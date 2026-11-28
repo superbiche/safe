@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): a cache of the advisory reading (ticket 1671). The reader (`safe audit scanner-batch --evidence`,
+  the evidence mode only; the mode today's gate uses is unchanged) keeps the classified reading of one advisory record, per advisory, the
+  modification stamp the service gave with the membership answer, and the package, in the lane's state directory (`advisory-records/`, the
+  checks of the publish-time store, one writer: two new core commands, `project-advisory-get` and `project-advisory-put`). Which advisories
+  each identity carries is still asked of the service on every command (a known-malware record or a new advisory is seen by the next command),
+  now in calls of up to 1,000 identities (it was 100), and the blocklist is read once for all names instead of name by name (the per-name
+  reading still decides every name found). A reading is trusted for one day at most, never when dated in the future; 10,000 entries at most; a
+  failed, malformed or unclassifiable record stores nothing; without the state-directory argument the gate now passes, there is no cache. The
+  gate names nothing of the cache (lane lint R14). Review round 1: no bulk value is a process argument in the evidence mode (a request of 1,000 long
+  names lost its whole reading, and the base failed at 2,500 identities); the gate binds the reader to the core it verified; every stamp seen for an advisory
+  (batch and pages) stays until the cache decides; a `withdrawn` that is not a timestamp is a malformed record; a stamp is one structured value from the key
+  asked to the key stored; the store, its two commands and the reader's reading of the answer are strict (new `project-advisory-check`); the writer makes
+  room before it writes and removes only its own leftovers.
+  Review round 2: a withdrawal date must convert back to the text it was given (29 February 2025 withdrew an advisory); the request goes from stdin to a
+  file and no document of the mode rests in a variable, every local is `local +x` (a caller's export no longer fills the environment), a name over 214
+  characters or a version over 256 is malformed input; a stamp that could not be noted leaves the cache alone for the command; one writer at a time on the
+  store (a lock), room for the NEW keys only; stamps are counted in bytes on both sides and a key the store cannot hold is left out of the question; the
+  check command refuses two revisions of one advisory and reads its request under its bound. `lane_instrument` of the install suite copies the library as a directory of its own.
+
 ## 1.76.0 - 2026-11-28
 
 - Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a

@@ -328,7 +328,21 @@ pass and warnings under `environment.release_follow`.
   recorded lockfiles get (a chain of private directories held by descriptor, entries that are regular files of mode
   0600 owned by the user, opened without following a link, and read with the repository's exact-object validator:
   repeated members, a second spelling of a field or trailing data make the entry ignored); an entry that fails a check
-  is ignored and read again, and a reading bounded by the last-modified time is never cached. A version the caller
+  is ignored and read again, and a reading bounded by the last-modified time is never cached. **The advisory reading
+  keeps one thing between two commands** (ticket 1671): which advisories each identity carries is asked of the service
+  on EVERY command, in calls of at most 1,000 identities (the service's limit; 1,000 queries took 1.6 s, the cap is 30 s),
+  so a known-malware record or a new advisory on a version already read is seen by the next command; the blocklist is
+  read on every command, once for all names. What is kept is the classified reading of one advisory record, per
+  (advisory, the modification stamp the service gave with that answer, the package it was read for), under
+  `project-lane/state/advisory-records/` with the same checks as the publish times; nothing else, in particular no
+  decision, no label the policy gave, no coverage and no hit list. A stamp is one line of printable text of at most 512 bytes (the core's unit, the reader's too: a key the store cannot hold is left out of the question, it does not void it), and a withdrawal date is a timestamp that existed (29 February 2025 is not one). A package name longer than 214 characters or a version longer than 256, the bounds of the registry (validate-npm-package-name, node-semver), is malformed input. A reading is trusted for one day at most whatever its
+  stamp (a constant: 86,400 s, the bound the scan cache sets for a reading) and never when it is dated in the future; the
+  store holds 10,000 entries: the writers of every project share it, so a writer takes the store's lock (the lane's way: a non-blocking flock of the directory it holds, tried for at most ten seconds; one that cannot take it writes nothing and the command does not fail) for the count, the room and the writes; room is made BEFORE it writes (the oldest go), for the keys that are NEW (a refresh takes none, and is never the one evicted), and only leftovers of its own name pattern are removed; a hit writes nothing. Every document at its boundaries (an entry, the two commands' input, the reader's reading of the store's answer) is read strictly: one document, every member present and typed, nothing null, no member twice, one hit at most per key asked. What the store's checks hold, and what they do not: an entry is the local user's (owner, mode, no link, a document naming its own key), not proven to be the lane's; a process of the same user can write a reading for a non-malware advisory, as it can write a publish time; the store can neither create nor hide a membership, a known-malware record or a blocklist entry, which are asked of the service and read from the blocklist on every command. The gate binds the reader to the core it verified (never one the caller's environment names). Nothing is stored for a record
+  that could not be fetched, read or classified. The reader is given the state directory as an argument by the gate
+  and has no cache without it. Measured (1,291 identities of a public lockfile, 117 advisories): the reading took 40 s cold
+  of which 24 s were the record fetches and 11 s local work (7 s of it the blocklist read name by name). A second command
+  fetches no record. A new advisory on the same version is therefore never delayed, and the cost of the bound
+  is that a record re-scored without a new stamp is read again within a day. A version the caller
   named exactly is waived under `exempt` (and waits under `enforce`, which says so) only when it REPLACES, at the same
   place in the graph, a baseline version of the same package that an advisory affects and that advisory is gone from
   the result, as the lane's own advisory evidence shows (aliases are matched by registry identity); when several

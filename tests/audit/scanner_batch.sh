@@ -918,7 +918,7 @@ case_evidence_a_withdrawn_advisory_is_removed() {
   MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-withdrawn.json"
   printf '%s\n' '{"results": [{"vulns": [{"id": "GHSA-wd-0001"}, {"id": "GHSA-wd-0002"}]}]}' > "$MOCK_BATCH_FIXTURE"
   printf '{"id": "GHSA-wd-0001", "withdrawn": "2026-10-01T00:00:00Z", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-wd-0001.json"
-  printf '{"id": "GHSA-wd-0002", "withdrawn": "", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-wd-0002.json"
+  printf '{"id": "GHSA-wd-0002", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-wd-0002.json"
   local out rc=0
   out=$(printf '{"packages":[{"name":"wdp","version":"1.0.0"}]}' | run_evidence) || rc=$?
   if [[ "$rc" == "0" ]] && evidence_identity "$out" wdp 1.0.0 '.coverage == "complete" and .advisories == [{id:"GHSA-wd-0002",severity:"high",malware:false}]'; then
@@ -948,23 +948,24 @@ case_evidence_same_name_versions_stay_apart() {
 }
 
 case_evidence_later_chunk_failure_keeps_earlier_hits() {
-  # 150 identities → two querybatch calls. The first answers with a validated
-  # critical on its first identity; the second fails in transport. The batch
-  # aborts with nothing; the evidence keeps the hit and marks only the second
-  # chunk's identities missing.
+  # 1,050 identities → two querybatch calls (the evidence mode asks 1,000 at a
+  # time). The first answers with a validated critical on its first identity;
+  # the second fails in transport. The evidence keeps the hit and marks only the
+  # second chunk's identities missing; the batch (chunks of 100) over 150
+  # identities aborts with nothing on the same kind of failure.
   setup_case ev-chunk-fail
   local batchdir="$FIXDIR/ev-chunk-fail"
   mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
-  jq -n '{results: ([{vulns: [{id: "GHSA-evk-0005"}]}] + [range(99) | {}])}' > "$batchdir/batch1.json"
+  jq -n '{results: ([{vulns: [{id: "GHSA-evk-0005"}]}] + [range(999) | {}])}' > "$batchdir/batch1.json"
   : > "$batchdir/batch2.fail"
   printf '{"id": "GHSA-evk-0005", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evk-0005.json"
   local input out rc=0 first last
-  input=$(jq -n '{packages: [range(150) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  input=$(jq -n '{packages: [range(1050) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
   first=$(jq -r '[.packages[].name] | sort | .[0]' <<<"$input")
-  last=$(jq -r '[.packages[].name] | sort | .[149]' <<<"$input")
+  last=$(jq -r '[.packages[].name] | sort | .[1049]' <<<"$input")
   out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
   if [[ "$rc" == "0" ]] \
-    && jq -e '[.identities[] | select(.coverage == "complete")] | length == 100' <<<"$out" >/dev/null \
+    && jq -e '[.identities[] | select(.coverage == "complete")] | length == 1000' <<<"$out" >/dev/null \
     && jq -e '[.identities[] | select(.coverage == "missing")] | length == 50' <<<"$out" >/dev/null \
     && evidence_identity "$out" "$first" 1.0.0 '.advisories[0].id == "GHSA-evk-0005" and .advisories[0].severity == "critical"' \
     && evidence_identity "$out" "$last" 1.0.0 '.coverage == "missing" and (.gap | contains("OSV batch query failed")) and .advisories == []'; then
@@ -973,10 +974,14 @@ case_evidence_later_chunk_failure_keeps_earlier_hits() {
     printf 'rc=%s out=%s\n' "$rc" "$out" >&2
     fail "evidence: a later chunk's failure keeps the earlier validated hit and marks only its own identities"
   fi
-  # The batch over the same fixtures still aborts on that failure.
-  rm -f "$batchdir/.count"
+  # The batch (chunks of 100, 150 identities) still aborts on a chunk's failure.
+  local batchdir2="$FIXDIR/ev-chunk-fail-batch"
+  mkdir -p "$batchdir2"; rm -f "$batchdir2/.count" "$batchdir2"/batch2.*
+  jq -n '{results: [range(100) | {}]}' > "$batchdir2/batch1.json"
+  : > "$batchdir2/batch2.fail"
+  input=$(jq -n '{packages: [range(150) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
   rc=0
-  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_batch 2>/dev/null) || rc=$?
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir2" MOCK_BATCH_FIXTURE= run_batch 2>/dev/null) || rc=$?
   if [[ "$rc" == "4" && -z "$out" ]]; then
     pass "evidence: the batch itself still fails closed on the same chunk failure"
   else
@@ -992,14 +997,14 @@ case_evidence_malformed_result_loses_only_itself() {
   setup_case ev-chunk-malformed
   local batchdir="$FIXDIR/ev-chunk-malformed"
   mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
-  jq -n '{results: [range(100) | {}]}' > "$batchdir/batch1.json"
+  jq -n '{results: [range(1000) | {}]}' > "$batchdir/batch1.json"
   printf '{"results": [{"vulns": [{"id": "GHSA-evm-0013"}]}, "oops", null]}\n' > "$batchdir/batch2.json"
   printf '{"id": "GHSA-evm-0013", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evm-0013.json"
   local input out rc=0 first second third
-  input=$(jq -n '{packages: [range(103) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
-  first=$(jq -r '[.packages[].name] | sort | .[100]' <<<"$input")
-  second=$(jq -r '[.packages[].name] | sort | .[101]' <<<"$input")
-  third=$(jq -r '[.packages[].name] | sort | .[102]' <<<"$input")
+  input=$(jq -n '{packages: [range(1003) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  first=$(jq -r '[.packages[].name] | sort | .[1000]' <<<"$input")
+  second=$(jq -r '[.packages[].name] | sort | .[1001]' <<<"$input")
+  third=$(jq -r '[.packages[].name] | sort | .[1002]' <<<"$input")
   out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
   if [[ "$rc" == "0" ]] \
     && jq -e '[.identities[] | select(.coverage == "missing")] | length == 2' <<<"$out" >/dev/null \
@@ -1388,6 +1393,626 @@ case_evidence_page_and_detail_answers_are_checked_too() {
   fi
 }
 
+# --- cases: the advisory-record cache, the chunks of 1,000 and the blocklist read once (ticket 1671) --------------------------------------
+# The mock below answers by what it is asked (the identities of the querybatch body, the id of a record) from one database file, enforces the
+# service's limit (1,000 queries per call, a refusal above), and logs every call: the cases count calls and compare documents, never a duration.
+#   OSV_DB   {"adv": {"name@version": [{"id","modified"}]}, "records": {"<id>": <record>}, "fail": ["<id>"], "raw": {"<id>": "<text>"}}
+#   OSV_LOG  one line per call: "batch <queries> <max-time>", "detail <id>", "query"
+MOCK2BIN="$TEST_ROOT/mockbin2"
+mkdir -p "$MOCK2BIN"
+cat > "$MOCK2BIN/curl" <<'MOCK'
+#!/usr/bin/env bash
+url="" body="" maxtime=""
+args=("$@")
+i=0
+while (( i < ${#args[@]} )); do
+  a="${args[$i]}"
+  case "$a" in
+    --max-time) maxtime="${args[$((i + 1))]}"; i=$((i + 2)); continue ;;
+    -H) i=$((i + 2)); continue ;;
+    -d) body="${args[$((i + 1))]}"; [[ "$body" != @* ]] || body="$(cat -- "${body#@}")"; i=$((i + 2)); continue ;;
+    http*://*) url="$a" ;;
+  esac
+  i=$((i + 1))
+done
+case "$url" in
+  *api.osv.dev/v1/querybatch*)
+    n=$(jq '.queries | length' <<<"$body")
+    printf 'batch %s %s\n' "$n" "$maxtime" >> "${OSV_LOG:?}"
+    (( n <= 1000 )) || exit 22
+    jq -c --slurpfile db "${OSV_DB:?}" '{results: [.queries[] | (.package.name + "@" + .version) as $k | ($db[0].adv[$k] // null)
+      | if . then ({vulns: .} + (if (($db[0].tokens // []) | index($k)) != null then {next_page_token: "t1"} else {} end)) else {} end]}' <<<"$body"
+    ;;
+  *api.osv.dev/v1/query*)
+    # a page of one identity's advisories, from the database (pages["name@version"]); a single page, no further token
+    printf 'query\n' >> "${OSV_LOG:?}"
+    jq -c --slurpfile db "${OSV_DB:?}" '{vulns: ($db[0].pages[.package.name + "@" + .version] // [])}' <<<"$body"
+    ;;
+  *api.osv.dev/v1/vulns/*)
+    id="${url##*/}"
+    printf 'detail %s\n' "$id" >> "${OSV_LOG:?}"
+    jq -e --arg id "$id" '(.fail // []) | index($id) | not' "${OSV_DB:?}" >/dev/null || exit 22
+    if jq -e --arg id "$id" '(.raw // {}) | has($id)' "${OSV_DB:?}" >/dev/null; then
+      jq -r --arg id "$id" '.raw[$id]' "${OSV_DB:?}"
+    else
+      jq -c --arg id "$id" '.records[$id]' "${OSV_DB:?}"
+    fi
+    ;;
+  *) printf 'other %s\n' "$url" >> "${OSV_LOG:?}"; exit 22 ;;
+esac
+exit 0
+MOCK
+chmod +x "$MOCK2BIN/curl"
+
+# A database: GHSA-c-1 (critical) on a@1, GHSA-m-2 (moderate) and GHSA-c-1 on b@1, c@1 clean, d@1 withdrawn advisory.
+cache_db() {
+  jq -n '{adv: {"a@1.0.0": [{id: "GHSA-c-1", modified: "2026-01-01T00:00:00.000001Z"}],
+             "b@1.0.0": [{id: "GHSA-c-1", modified: "2026-01-01T00:00:00.000001Z"}, {id: "GHSA-m-2", modified: "2026-02-02T00:00:00.000002Z"}],
+             "d@1.0.0": [{id: "GHSA-w-3", modified: "2026-03-03T00:00:00.000003Z"}]},
+          records: {"GHSA-c-1": {id: "GHSA-c-1", database_specific: {severity: "CRITICAL"}, affected: [{package: {ecosystem: "npm", name: "a"}}, {package: {ecosystem: "npm", name: "b"}}]},
+                    "GHSA-m-2": {id: "GHSA-m-2", database_specific: {severity: "MODERATE"}, affected: [{package: {ecosystem: "npm", name: "b"}}]},
+                    "GHSA-w-3": {id: "GHSA-w-3", withdrawn: "2026-03-04T00:00:00Z", database_specific: {severity: "HIGH"}}},
+          fail: [], raw: {}}'
+}
+CACHE_REQUEST='{"packages":[{"name":"a","version":"1.0.0"},{"name":"b","version":"1.0.0"},{"name":"c","version":"1.0.0"},{"name":"d","version":"1.0.0"}]}'
+
+# <state-args...> -- runs the evidence reader against the mock database of the case (OSV_DB), the call log in OSV_LOG
+run_ev2() {
+  env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" \
+    OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence "$@"
+}
+setup_cache_case() { # <name>: sets CASE_HOME RUN_DIR OSV_DB OSV_LOG STATE
+  setup_case "$1"
+  OSV_DB="$CASE_HOME/osv-db.json"; OSV_LOG="$CASE_HOME/osv.log"; STATE="$CASE_HOME/state"
+  cache_db > "$OSV_DB"; : > "$OSV_LOG"
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+}
+log_count() { grep -c "^$1" "$OSV_LOG" 2>/dev/null || true; }
+store_count() { find "$STATE/advisory-records" -maxdepth 1 -type f 2>/dev/null | wc -l; }
+cache_doc() { printf '%s' "${2:-$CACHE_REQUEST}" | run_ev2 --state-dir "$STATE" 2>/dev/null; }
+
+case_cache_second_run_fetches_no_record() {
+  setup_cache_case cache-second
+  local out1 out2 d1 b1 d2 b2
+  out1=$(cache_doc) || { fail "cache: the first run failed"; return; }
+  d1=$(log_count detail); b1=$(log_count batch)
+  # three distinct advisories, one of them fetched once for its two packages; the withdrawn record is read too
+  if [[ "$d1" == 3 && "$b1" == 1 && "$(store_count)" == 4 ]] \
+    && jq -e '[.identities[] | select(.name == "a") | .advisories[0] | .id == "GHSA-c-1" and .severity == "critical"] | length == 1 and all' <<<"$out1" >/dev/null; then
+    pass "cache: a first run fetches each advisory record once and stores what it classified (4 readings: 3 classified, 1 withdrawn)"
+  else
+    printf 'details=%s batches=%s stored=%s\n' "$d1" "$b1" "$(store_count)" >&2
+    fail "cache: a first run fetches each advisory record once and stores what it classified"
+  fi
+  : > "$OSV_LOG"
+  out2=$(cache_doc) || { fail "cache: the second run failed"; return; }
+  d2=$(log_count detail); b2=$(log_count batch)
+  if [[ "$d2" == 0 && "$b2" == 1 ]] && [[ "$(jq -S . <<<"$out1")" == "$(jq -S . <<<"$out2")" ]]; then
+    pass "cache: a second run fetches no record, asks the service which advisories each identity carries, and the document is identical"
+  else
+    printf 'details=%s batches=%s\n' "$d2" "$b2" >&2
+    fail "cache: a second run fetches no record, asks the service which advisories each identity carries, and the document is identical"
+  fi
+}
+
+case_cache_a_changed_stamp_is_fetched_again() {
+  setup_cache_case cache-stamp
+  local out
+  cache_doc >/dev/null
+  # the service now says GHSA-c-1 changed (new stamp) and the record now reads LOW; GHSA-m-2 is untouched
+  jq '.adv["a@1.0.0"][0].modified = "2026-06-06T00:00:00.000009Z" | .adv["b@1.0.0"][0].modified = "2026-06-06T00:00:00.000009Z"
+      | .records["GHSA-c-1"].database_specific.severity = "LOW"' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  : > "$OSV_LOG"
+  out=$(cache_doc)
+  if [[ "$(log_count detail)" == 1 ]] && grep -qx 'detail GHSA-c-1' "$OSV_LOG" \
+    && jq -e '[.identities[] | select(.name == "a" or .name == "b") | .advisories[] | select(.id == "GHSA-c-1") | .severity] == ["low", "low"]' <<<"$out" >/dev/null; then
+    pass "cache: an advisory whose stamp changed is fetched again and read as it now is; the others stay cached"
+  else
+    cat "$OSV_LOG" >&2
+    fail "cache: an advisory whose stamp changed is fetched again and read as it now is; the others stay cached"
+  fi
+  # the earlier reading under the old stamp is still stored, and never answers for the new one
+  : > "$OSV_LOG"
+  cache_doc >/dev/null
+  if [[ "$(log_count detail)" == 0 ]]; then pass "cache: the new stamp's reading is stored"; else fail "cache: the new stamp's reading is stored"; fi
+}
+
+case_cache_ignores_a_corrupt_foreign_or_other_mode_entry() {
+  setup_cache_case cache-corrupt
+  local out ref mutation ok=1 first
+  ref=$(cache_doc)
+  for mutation in corrupt mode link foreign unknown-member directory-owned; do
+    rm -rf "$STATE/advisory-records"; : > "$OSV_LOG"
+    cache_doc >/dev/null
+    first=$(find "$STATE/advisory-records" -maxdepth 1 -type f | sort | head -1)
+    case "$mutation" in
+      corrupt) for f in "$STATE/advisory-records"/*; do printf '{not json' > "$f"; done ;;
+      mode) chmod 644 "$STATE/advisory-records"/* ;;
+      link) for f in "$STATE/advisory-records"/*; do cp "$f" "$f.real"; rm "$f"; ln -s "$(basename "$f").real" "$f"; done ;;
+      foreign) # every entry holds the content of one other entry
+        for f in "$STATE/advisory-records"/*; do [[ "$f" == "$first" ]] || cp "$first" "$f"; done ;;
+      unknown-member) for f in "$STATE/advisory-records"/*; do jq -c '. + {extra: 1}' "$f" > "$f.n" && mv "$f.n" "$f" && chmod 600 "$f"; done ;;
+      directory-owned) chmod 770 "$STATE/advisory-records" ;;
+    esac
+    : > "$OSV_LOG"
+    out=$(cache_doc)
+    # a foreign entry for ONE key still answers for that one: the case is that nothing it holds answers for another key
+    if [[ "$mutation" == foreign ]]; then
+      (( $(log_count detail) >= 2 )) || { printf 'foreign: %s details\n' "$(log_count detail)" >&2; ok=0; }
+    else
+      [[ "$(log_count detail)" == 3 ]] || { printf '%s: %s details, want 3\n' "$mutation" "$(log_count detail)" >&2; ok=0; }
+    fi
+    [[ "$(jq -S . <<<"$out")" == "$(jq -S . <<<"$ref")" ]] || { printf '%s: the document differs\n' "$mutation" >&2; ok=0; }
+  done
+  if (( ok )); then pass "cache: a corrupt, linked, wrong-mode, foreign or extended entry, or an open directory, is ignored and the record fetched again (same document)"; else fail "cache: a corrupt, linked, wrong-mode, foreign or extended entry, or an open directory, is ignored"; fi
+}
+
+case_cache_stores_nothing_for_a_failed_malformed_or_unclassifiable_record() {
+  setup_cache_case cache-failed
+  local out ok=1
+  # GHSA-c-1: transport failure; GHSA-m-2: not a record; GHSA-w-3 (d): a record that cannot be classified (no severity) is "unknown"
+  jq '.fail = ["GHSA-c-1"] | .raw["GHSA-m-2"] = "{not json" | .records["GHSA-w-3"] = {id: "GHSA-w-3", affected: [{package: {ecosystem: "npm", name: "d"}}]}' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  out=$(cache_doc)
+  [[ "$(store_count)" == 0 ]] || { printf 'stored %s entries\n' "$(store_count)" >&2; ok=0; }
+  jq -e '(.identities | map(select(.coverage == "missing") | .name) | sort) == ["a", "b"]' <<<"$out" >/dev/null || { printf 'coverage: %s\n' "$(jq -c '[.identities[] | {name, coverage}]' <<<"$out")" >&2; ok=0; }
+  jq -e '.identities[] | select(.name == "d") | .advisories[0].severity == "unknown"' <<<"$out" >/dev/null || ok=0
+  # nothing was stored, so the next run fetches all three again; once the service answers, only then are they stored
+  : > "$OSV_LOG"
+  out=$(cache_doc)
+  [[ "$(log_count detail)" == 3 ]] || { printf 'second run fetched %s\n' "$(log_count detail)" >&2; ok=0; }
+  jq '.fail = [] | del(.raw["GHSA-m-2"])' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  : > "$OSV_LOG"
+  out=$(cache_doc)
+  jq -e '(.identities | length == 4) and ([.identities[] | .coverage] | all(. == "complete"))' <<<"$out" >/dev/null || ok=0
+  [[ "$(store_count)" == 3 ]] || { printf 'stored %s after recovery, want 3 (GHSA-c-1 for two packages, GHSA-m-2; the unclassifiable one is never stored)\n' "$(store_count)" >&2; ok=0; }
+  if (( ok )); then pass "cache: a failed, malformed or unclassifiable record stores nothing, and a gap stays a gap"; else fail "cache: a failed, malformed or unclassifiable record stores nothing, and a gap stays a gap"; fi
+}
+
+case_cache_never_delays_a_malware_record_or_a_new_advisory() {
+  setup_cache_case cache-malware
+  local out ok=1
+  cache_doc >/dev/null
+  # between two commands the service adds a known-malware record and a new advisory to versions already read
+  jq '.adv["a@1.0.0"] += [{id: "MAL-2026-1", modified: "2026-07-07T00:00:00.000001Z"}]
+      | .adv["c@1.0.0"] = [{id: "GHSA-n-9", modified: "2026-07-07T00:00:00.000002Z"}]
+      | .records["GHSA-n-9"] = {id: "GHSA-n-9", database_specific: {severity: "HIGH"}, affected: [{package: {ecosystem: "npm", name: "c"}}]}' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  : > "$OSV_LOG"
+  out=$(cache_doc)
+  jq -e '.identities[] | select(.name == "a") | [.advisories[] | select(.malware == true) | .id] == ["MAL-2026-1"]' <<<"$out" >/dev/null || ok=0
+  jq -e '.identities[] | select(.name == "c") | .advisories | map({id, severity}) == [{id: "GHSA-n-9", severity: "high"}]' <<<"$out" >/dev/null || ok=0
+  [[ "$(log_count batch)" == 1 && "$(log_count detail)" == 1 ]] || { printf 'calls: %s\n' "$(tr '\n' ';' < "$OSV_LOG")" >&2; ok=0; }
+  # and a malware record is never read from, nor written to, the store
+  grep -q 'MAL-' "$STATE"/advisory-records/* 2>/dev/null && ok=0
+  if (( ok )); then pass "cache: a malware record or a new advisory on a version already read is seen by the next command"; else fail "cache: a malware record or a new advisory on a version already read is seen by the next command"; fi
+}
+
+case_cache_a_reading_is_trusted_for_a_day_at_most() {
+  setup_cache_case cache-day
+  local out ok=1 now f
+  cache_doc >/dev/null
+  now=$(date +%s)
+  age_entries() { # <seconds of age>: every entry's fetch time is moved
+    for f in "$STATE/advisory-records"/*; do jq -c --argjson t "$(( now - $1 ))" '.fetched = $t' "$f" > "$f.n" && mv "$f.n" "$f" && chmod 600 "$f"; done
+  }
+  age_entries 86300; : > "$OSV_LOG"; cache_doc >/dev/null
+  [[ "$(log_count detail)" == 0 ]] || { printf 'inside the day: %s details\n' "$(log_count detail)" >&2; ok=0; }
+  age_entries 86401; : > "$OSV_LOG"; cache_doc >/dev/null
+  [[ "$(log_count detail)" == 3 ]] || { printf 'older than a day: %s details\n' "$(log_count detail)" >&2; ok=0; }
+  [[ "$(store_count)" == 4 ]] || { printf 'stored %s\n' "$(store_count)" >&2; ok=0; }
+  : > "$OSV_LOG"; cache_doc >/dev/null
+  [[ "$(log_count detail)" == 0 ]] || { printf 'after the refetch: %s details\n' "$(log_count detail)" >&2; ok=0; }
+  age_entries -3600; : > "$OSV_LOG"; cache_doc >/dev/null
+  [[ "$(log_count detail)" == 3 ]] || { printf 'dated in the future: %s details\n' "$(log_count detail)" >&2; ok=0; }
+  if (( ok )); then pass "cache: a reading is trusted for a day at most, and never when it is dated in the future"; else fail "cache: a reading is trusted for a day at most, and never when it is dated in the future"; fi
+}
+
+case_cache_the_reader_checks_what_the_core_answers() {
+  setup_cache_case cache-liar
+  local liar="$CASE_HOME/liar-core" ref out ok=1 mode
+  ref=$(cache_doc); rm -rf "$STATE/advisory-records"
+  # A core that answers the question wrongly, one way at a time, with every other hit honest and fresh. The reader's reading of a reply is the
+  # core's own strict check (project-advisory-check), which the liar leaves alone: a hit nobody asked for (another stamp, another package), a band
+  # that is not one of the four, a reading dated in the future or older than a day, a withdrawn record that carries a band, a hit with a member
+  # too many, an envelope of another schema, an envelope with a member too many, two envelopes, two hits for one key (alike and conflicting). None
+  # may be taken: all three records are fetched and the document is the honest one.
+  cat > "$liar" <<'LIAR'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "project-advisory-get" ]]; then
+  cat >/dev/null
+  doc=$(jq -cn --argjson now "$(date +%s)" --arg mode "${LIAR_MODE:?}" '
+    def hit($id; $m; $p; $sev): {id: $id, modified: $m, package: $p, severity: $sev, withdrawn: false, fetched: $now};
+    def honest: [hit("GHSA-c-1"; "2026-01-01T00:00:00.000001Z"; "a"; "critical"), hit("GHSA-c-1"; "2026-01-01T00:00:00.000001Z"; "b"; "critical"),
+                 hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "moderate")];
+    {schema_version: 1, hits: (honest + (
+      if $mode == "unasked-stamp" then [hit("GHSA-c-1"; "WRONG"; "a"; "low")]
+      elif $mode == "unasked-package" then [hit("GHSA-c-1"; "2026-01-01T00:00:00.000001Z"; "zzz"; "low")]
+      elif $mode == "unknown-band" then [hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "bogus")]
+      elif $mode == "future" then [(hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "low") | .fetched = $now + 3600)]
+      elif $mode == "stale" then [(hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "low") | .fetched = $now - 90000)]
+      elif $mode == "withdrawn-with-band" then [(hit("GHSA-w-3"; "2026-03-03T00:00:00.000003Z"; "d"; "high") | .withdrawn = true)]
+      elif $mode == "extra-member" then [(hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "low") | .extra = 1)]
+      elif $mode == "same-hit-twice" then [hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "moderate")]
+      elif $mode == "conflicting-hits" then [hit("GHSA-m-2"; "2026-02-02T00:00:00.000002Z"; "b"; "low")]
+      else [] end)) }
+    | if $mode == "schema" then .schema_version = 2
+      elif $mode == "extended-envelope" then . + {extra: 1}
+      else . end')
+  if [[ "$LIAR_MODE" == two-envelopes ]]; then printf '%s\n%s\n' "$doc" "$doc"; else printf '%s\n' "$doc"; fi
+  exit 0
+fi
+exec "${REAL_CORE:?}" "$@"
+LIAR
+  chmod +x "$liar"
+  # the honest hits alone are taken (control): nothing is fetched for them
+  for mode in honest unasked-stamp unasked-package unknown-band future stale withdrawn-with-band extra-member same-hit-twice conflicting-hits schema extended-envelope two-envelopes; do
+    : > "$OSV_LOG"
+    out=$(printf '%s' "$CACHE_REQUEST" | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="$liar" REAL_CORE="$SAFE_CORE_BIN" LIAR_MODE="$mode" \
+      OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence --state-dir "$STATE" 2>/dev/null) || ok=0
+    if [[ "$mode" == honest ]]; then
+      # GHSA-c-1 (both packages) and GHSA-m-2 come from the answer; only the withdrawn GHSA-w-3 is fetched
+      [[ "$(log_count detail)" == 1 ]] || { printf 'honest: details fetched %s, want 1\n' "$(log_count detail)" >&2; ok=0; }
+    else
+      [[ "$(log_count detail)" == 3 ]] || { printf '%s: details fetched %s, want 3\n' "$mode" "$(log_count detail)" >&2; ok=0; }
+    fi
+    [[ "$(jq -S . <<<"$out")" == "$(jq -S . <<<"$ref")" ]] || { printf '%s: the document differs from the honest one\n' "$mode" >&2; ok=0; }
+  done
+  if (( ok )); then pass "cache: the reader takes nothing the core answers that it did not ask for or cannot check (unasked, unknown band, future, stale, withdrawn with a band, extra member, two hits for one key, other schema, extended or doubled envelope)"; else fail "cache: the reader takes nothing the core answers that it did not ask for or cannot check"; fi
+}
+
+case_cache_without_the_argument_there_is_no_cache() {
+  setup_cache_case cache-noarg
+  local out ok=1 other
+  # a store planted where an environment variable could point the reader (SAFE_DATA_DIR, XDG_STATE_HOME, the state directory of the case)
+  cache_doc >/dev/null
+  : > "$OSV_LOG"
+  out=$(printf '%s' "$CACHE_REQUEST" | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" \
+    SAFE_DATA_DIR="$STATE" XDG_STATE_HOME="$STATE" XDG_DATA_HOME="$STATE" SAFE_STATE_DIR="$STATE" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence 2>/dev/null)
+  [[ "$(log_count detail)" == 3 ]] || { printf 'no argument: %s details\n' "$(log_count detail)" >&2; ok=0; }
+  for other in "--state-dir" "--state-dir relative/dir" "--state-dirs $STATE"; do
+    : > "$OSV_LOG"
+    # shellcheck disable=SC2086
+    out=$(printf '%s' "$CACHE_REQUEST" | run_ev2 $other 2>/dev/null) || true
+    [[ "$(log_count detail)" == 3 ]] || { printf '%s: %s details\n' "$other" "$(log_count detail)" >&2; ok=0; }
+  done
+  # an empty database state directory is not created by a run without the argument
+  rm -rf "$STATE/advisory-records"
+  printf '%s' "$CACHE_REQUEST" | run_ev2 >/dev/null 2>&1 || true
+  [[ ! -e "$STATE/advisory-records" ]] || ok=0
+  if (( ok )); then pass "cache: without the state-directory argument (or with one that is not an absolute path) there is no cache, whatever the environment holds"; else fail "cache: without the state-directory argument there is no cache"; fi
+}
+
+case_cache_is_bounded_at_ten_thousand_entries() {
+  setup_cache_case cache-cap
+  local f readings now
+  now=$(date +%s)
+  jq -cn --argjson now "$now" '{classifier: "c", readings: [range(10000) | {id: ("GHSA-" + tostring), modified: "s", package: "p", severity: "low", withdrawn: false, fetched: $now}]}' \
+    | "$SAFE_CORE_BIN" project-advisory-put --state-dir "$STATE"
+  [[ "$(store_count)" == 10000 ]] || { fail "cache: 10,000 readings were not all stored ($(store_count))"; return; }
+  jq -cn --argjson now "$now" '{classifier: "c", readings: [{id: "GHSA-extra", modified: "s", package: "p", severity: "low", withdrawn: false, fetched: $now}]}' \
+    | "$SAFE_CORE_BIN" project-advisory-put --state-dir "$STATE"
+  if [[ "$(store_count)" == 10000 ]]; then pass "cache: the 10,001st entry does not grow the store beyond its bound"; else fail "cache: the 10,001st entry does not grow the store beyond its bound ($(store_count))"; fi
+}
+
+case_chunks_of_a_thousand_read_what_chunks_of_a_hundred_read() {
+  setup_cache_case chunks-1000
+  # 1,001 identities; an advisory on every 37th, a malware record on every 211th. The batch (chunks of 100, the verdict mode) and the evidence
+  # (chunks of 1,000) must report the same advisories for the same identities.
+  jq -n '{adv: ([range(0; 1001; 37)] | map({key: ("p\(.)@1.0.0"), value: [{id: ("GHSA-x-\(.)"), modified: "2026-01-01T00:00:00.000001Z"}]}) | from_entries)
+              + ([range(0; 1001; 211)] | map({key: ("p\(.)@1.0.0"), value: [{id: ("MAL-2026-\(.)"), modified: "2026-01-01T00:00:00.000001Z"}]}) | from_entries),
+         records: ([range(0; 1001; 37)] | map({key: ("GHSA-x-\(.)"), value: {id: ("GHSA-x-\(.)"), database_specific: {severity: "HIGH"}, affected: [{package: {ecosystem: "npm", name: "p\(.)"}}]}}) | from_entries), fail: [], raw: {}}' > "$OSV_DB"
+  local input ev bt ok=1
+  input=$(jq -cn '{packages: [range(1001) | {name: ("p\(.)"), version: "1.0.0"}]}')
+  ev=$(printf '%s' "$input" | run_ev2 2>/dev/null) || ok=0
+  [[ "$(grep -c '^batch' "$OSV_LOG")" == 2 ]] && grep -qx 'batch 1000 30' "$OSV_LOG" && grep -qx 'batch 1 30' "$OSV_LOG" || { printf 'evidence calls: %s\n' "$(grep '^batch' "$OSV_LOG" | tr '\n' ';')" >&2; ok=0; }
+  : > "$OSV_LOG"
+  bt=$(printf '%s' "$input" | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch 2>/dev/null) || ok=0
+  [[ "$(grep -c '^batch' "$OSV_LOG")" == 11 ]] || { printf 'batch calls: %s\n' "$(grep -c '^batch' "$OSV_LOG")" >&2; ok=0; }
+  # the same (package, advisory) pairs, severities as the verdict mode levels them (critical → fatal) are not compared: the ids are
+  if [[ "$(jq -r '[.identities[] | .name as $n | .advisories[] | "\($n) \(.id)"] | sort | .[]' <<<"$ev")" == "$(jq -r '[.[] | "\(.package) \(.url | sub("^.*/"; ""))"] | sort | .[]' <<<"$bt")" ]] \
+    && [[ "$(jq '[.identities[] | .advisories[]] | length' <<<"$ev")" -gt 25 ]]; then
+    :
+  else
+    printf 'evidence: %s pairs, batch: %s\n' "$(jq '[.identities[] | .advisories[]] | length' <<<"$ev")" "$(jq length <<<"$bt")" >&2; ok=0
+  fi
+  if (( ok )); then pass "chunks: 1,001 identities are asked in two calls of 1,000 and 1 (30 s cap), and report the same advisories as chunks of 100"; else fail "chunks: 1,001 identities are asked in two calls of 1,000 and 1, and report the same advisories as chunks of 100"; fi
+}
+
+# The blocklist, once or name by name. Both stores the per-name reading opens (the canonical one and a redirected, blessed one), scoped names,
+# scope wildcards, case variants, entries of every shape the validator accepts, names that are in no store.
+BLOCK_NAMES='["evil","Evil","EVIL","evil2","@scope/a","@scope/b","@Scope/a","@other/x","@other","@","@/x","@@/y","scope/a","left-pad","@wild/anything","@wild/","@wild//x","a/b","x@y"]'
+blocklist_corpus() { # <canonical blocked.json> <redirected blocked.json>
+  cat > "$1" <<'JSON'
+{"packages": {"evil": {"reason": "canonical evil"}, "@scope/a": {"reason": "canonical scoped"}, "@wild/*": {"reason": "canonical wildcard"}, "Evil": {}, "@/*": {"reason": "odd wildcard"}}}
+JSON
+  cat > "$2" <<'JSON'
+{"packages": {"evil": {"reason": "redirected evil"}, "EVIL": {"reason": 5}, "@scope/*": {"reason": "redirected scope"}, "@other/x": {"reason": {"a": "b"}}, "@@/y": {"reason": null}, "evil2": {"reason": ["x"]}, "x@y": {"note": "no reason"}}}
+JSON
+}
+blocklist_both() { # <names json> → "verdict|evidence" normalised block lists on two lines
+  local names="$1" half
+  half=$(jq -c '.[:10]' <<<"$names")
+  local rest
+  rest=$(jq -c '.[10:]' <<<"$names")
+  local bt ev
+  bt=$(jq -cn --argjson n "$names" '{packages: [$n[] | {name: ., version: "1.0.0"}]}' \
+    | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_RUN_TRUST_OVERRIDE=1 OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch 2>/dev/null) || { printf 'BATCH-EXIT-%s' "$?"; return 0; }
+  ev=$(jq -cn --argjson a "$half" --argjson b "$rest" '{packages: [$a[] | {name: ., version: "1.0.0"}], blocklist_names: $b}' \
+    | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_RUN_TRUST_OVERRIDE=1 SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence 2>/dev/null) || { printf 'EVIDENCE-EXIT-%s' "$?"; return 0; }
+  printf '%s\n' "$(jq -c '[.[] | select((.description // "") | startswith("blocklisted on this host: ")) | {name: .package, reason: (.description | ltrimstr("blocklisted on this host: "))}] | sort_by(.name)' <<<"$bt")"
+  printf '%s\n' "$(jq -c '.blocklist | sort_by(.name)' <<<"$ev")"
+}
+
+blocklist_exits() { # <names json> → "batch=<rc>:<empty|out> evidence=<rc>:<empty|out>": each mode run on its own, whatever the other did
+  local names="$1" half rest out brc=0 erc=0
+  half=$(jq -c '.[:10]' <<<"$names"); rest=$(jq -c '.[10:]' <<<"$names")
+  out=$(jq -cn --argjson n "$names" '{packages: [$n[] | {name: ., version: "1.0.0"}]}' \
+    | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_RUN_TRUST_OVERRIDE=1 OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch 2>/dev/null) || brc=$?
+  printf 'batch=%s:%s ' "$brc" "$([[ -z "$out" ]] && echo empty || echo out)"
+  out=$(jq -cn --argjson a "$half" --argjson b "$rest" '{packages: [$a[] | {name: ., version: "1.0.0"}], blocklist_names: $b}' \
+    | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_RUN_TRUST_OVERRIDE=1 SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence 2>/dev/null) || erc=$?
+  printf 'evidence=%s:%s' "$erc" "$([[ -z "$out" ]] && echo empty || echo out)"
+}
+
+case_blocklist_read_once_agrees_with_the_per_name_reading() {
+  setup_cache_case blocklist-diff
+  local got ok=1 redirect="$CASE_HOME/redirected" expected_order ev_order out
+  mkdir -p "$redirect"
+  # 1. both stores, the redirected one blessed (the suite exports the token): every name agrees, reasons included
+  blocklist_corpus "$RUN_DIR/blocked.json" "$redirect/blocked.json"
+  RUN_DIR="$redirect"
+  got=$(blocklist_both "$BLOCK_NAMES")
+  if [[ "$(sed -n 1p <<<"$got")" == "$(sed -n 2p <<<"$got")" ]] && [[ "$(sed -n 2p <<<"$got" | jq 'length')" -ge 9 ]]; then
+    pass "blocklist: read once, it agrees with the per-name reading on every name of the corpus (both stores, scopes, wildcards, case variants)"
+  else
+    printf 'verdict:  %s\nevidence: %s\n' "$(sed -n 1p <<<"$got")" "$(sed -n 2p <<<"$got")" >&2
+    fail "blocklist: read once, it agrees with the per-name reading on every name of the corpus"
+  fi
+  # the document keeps the order the per-name reading produced: the names sorted as `sort -u` sorts them
+  out=$(jq -cn --argjson n "$BLOCK_NAMES" '{packages: [$n[] | {name: ., version: "1.0.0"}]}' \
+    | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_RUN_TRUST_OVERRIDE=1 SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" bash "$SAFE_AUDIT" scanner-batch --evidence 2>/dev/null)
+  ev_order=$(jq -r '.blocklist[].name' <<<"$out")
+  expected_order=$(printf '%s\n' "$ev_order" | LC_ALL=C sort -u)
+  [[ "$ev_order" == "$expected_order" ]] || { printf 'order: %s\n' "$ev_order" >&2; ok=0; }
+  # 2. an unreadable store, whichever of the two (and an entry that is not an object): the batch (the verdict mode) and the evidence mode are each
+  # run, each on its own, and each ends as it did, exit 4 with nothing on stdout
+  local variant want
+  for variant in redirected canonical null-entry; do
+    blocklist_corpus "$CASE_HOME/.config/safe/run/blocked.json" "$redirect/blocked.json"
+    case "$variant" in
+      redirected) printf 'not-json{' > "$redirect/blocked.json" ;;
+      canonical) printf 'not-json{' > "$CASE_HOME/.config/safe/run/blocked.json" ;;
+      null-entry) printf '{"packages": {"evil": null}}' > "$redirect/blocked.json" ;;
+    esac
+    got=$(blocklist_exits "$BLOCK_NAMES")
+    want="batch=4:empty evidence=4:empty"
+    [[ "$got" == "$want" ]] || { printf '%s store: got "%s", want "%s"\n' "$variant" "$got" "$want" >&2; ok=0; }
+  done
+  if (( ok )); then pass "blocklist: an unreadable store ends the evidence mode as it ends the batch (exit 4, no document), and the order of the hits is the per-name reading's"; else fail "blocklist: an unreadable store ends the evidence mode as it ends the batch, and the order of the hits is the per-name reading's"; fi
+}
+
+# --- ticket 1671, round 1 of the review ------------------------------------------------------------------------------------------------
+case_evidence_reads_five_thousand_identities_with_long_names() {
+  # F1. A request of 5,000 identities whose names are long, the same names in blocklist_names as the gate sends them (a request of a few
+  # hundred KiB), is read in five calls of at most 1,000, and every identity comes back: no value of the evidence mode travels as a process
+  # argument (past about 128 KiB a program is not started, and the base failed at 2,500 identities in its accumulator). Run cold and warm.
+  setup_cache_case scale
+  local request db_ok=1 out1 out2 size
+  request=$(jq -cn '[range(5000) | ("p" + tostring + "-" + ("x" * 70))] as $names
+    | {packages: [$names[] | {name: ., version: "1.0.0"}], blocklist_names: $names}')
+  size=${#request}
+  jq -n '{adv: ([range(200)] | map({key: ("p\(.)-" + ("x" * 70) + "@1.0.0"), value: [{id: "GHSA-big-\(.)", modified: "2026-01-01T00:00:00.000001Z"}]}) | from_entries),
+          records: ([range(200)] | map({key: "GHSA-big-\(.)", value: {id: "GHSA-big-\(.)", database_specific: {severity: "HIGH"},
+                    affected: [{package: {ecosystem: "npm", name: ("p\(.)-" + ("x" * 70))}}]}}) | from_entries)}' > "$OSV_DB"
+  : > "$OSV_LOG"
+  out1=$(printf '%s' "$request" | run_ev2 --state-dir "$STATE" 2>"$CASE_HOME/scale.err") || { head -3 "$CASE_HOME/scale.err" >&2; fail "scale: 5,000 identities were not read (the reader failed)"; return; }
+  jq -e '(.identities | length) == 5000 and ([.identities[] | .coverage] | all(. == "complete")) and ([.identities[] | select(.advisories | length > 0)] | length) == 200' <<<"$out1" >/dev/null || db_ok=0
+  [[ "$(grep -c '^batch' "$OSV_LOG")" == 5 ]] && ! grep -qE '^batch (100[1-9]|10[1-9][0-9]|1[1-9][0-9][0-9]|[2-9][0-9][0-9][0-9]) ' "$OSV_LOG" || { printf 'calls: %s\n' "$(grep '^batch' "$OSV_LOG" | tr '\n' ';')" >&2; db_ok=0; }
+  [[ "$(log_count detail)" == 200 ]] || { printf 'details: %s\n' "$(log_count detail)" >&2; db_ok=0; }
+  : > "$OSV_LOG"
+  out2=$(printf '%s' "$request" | run_ev2 --state-dir "$STATE" 2>/dev/null) || db_ok=0
+  [[ "$(log_count detail)" == 0 && "$(store_count)" == 200 ]] || { printf 'warm: details %s, stored %s\n' "$(log_count detail)" "$(store_count)" >&2; db_ok=0; }
+  [[ "$(jq -S . <<<"$out1")" == "$(jq -S . <<<"$out2")" ]] || db_ok=0
+  if (( db_ok && size > 400000 )); then pass "evidence: 5,000 identities with long names (a request of $size bytes, the names also in blocklist_names) are read in five calls, cold and warm, and all come back"; else fail "evidence: 5,000 identities with long names are read (request $size bytes)"; fi
+}
+
+case_cache_a_second_stamp_from_a_page_is_no_hit() {
+  # F3. The batch gives the stamp that is warm in the store; the identity's page gives another. Every stamp seen for an advisory stays until the
+  # cache has decided: more than one is no hit and no store, and the record is fetched and read as it now is.
+  setup_cache_case cache-page-stamp
+  local out ok=1
+  printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+  out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(store_count)" == 1 ]] || { printf 'warm-up stored %s\n' "$(store_count)" >&2; ok=0; }
+  local before_entry
+  before_entry="$(sha256sum "$STATE"/advisory-records/* | cut -d' ' -f1)"
+  # the service now pages a@1.0.0; the page names GHSA-c-1 with another stamp and the record reads LOW
+  jq '.tokens = ["a@1.0.0"] | .pages = {"a@1.0.0": [{id: "GHSA-c-1", modified: "2026-06-06T00:00:00.000009Z"}]}
+      | .records["GHSA-c-1"].database_specific.severity = "LOW"' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  : > "$OSV_LOG"
+  out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(log_count query)" == 1 && "$(log_count detail)" == 1 ]] || { printf 'calls: %s\n' "$(tr '\n' ';' < "$OSV_LOG")" >&2; ok=0; }
+  jq -e '.identities[0].advisories | length == 1 and .[0].id == "GHSA-c-1" and .[0].severity == "low"' <<<"$out" >/dev/null || { printf 'document: %s\n' "$out" >&2; ok=0; }
+  [[ "$(store_count)" == 1 ]] || { printf 'stored %s after the paged run, want the one entry of before\n' "$(store_count)" >&2; ok=0; }
+  [[ "$(sha256sum "$STATE"/advisory-records/* | cut -d' ' -f1)" == "$before_entry" ]] || { printf 'the entry that existed was changed\n' >&2; ok=0; }
+  if (( ok )); then pass "cache: a stamp a page gives that differs from the batch's is no hit and no store (the record is fetched and read as it now is, the entry that existed is as it was)"; else fail "cache: a stamp a page gives that differs from the batch's is no hit and no store"; fi
+}
+
+case_cache_a_stamp_that_could_not_be_noted_leaves_the_cache_alone() {
+  # A page's stamps are appended to a file of the scratch directory; when one cannot be noted, the cache is neither read nor written for the command:
+  # the warm entry is not taken (the record is fetched and read as it now is), and nothing is stored or changed. The failure is made by a `jq` first on
+  # the PATH that fails the one call that appends a page's stamps (and nothing else).
+  setup_cache_case cache-stamp-unnoted
+  local out ok=1 shim="$CASE_HOME/shim" before_entry
+  printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+  out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  before_entry="$(sha256sum "$STATE"/advisory-records/* | cut -d' ' -f1)"
+  mkdir -p "$shim"
+  printf '#!/usr/bin/env bash\nif [[ "$*" == *"then (.vulns // [])[] | select(type"* ]]; then exit 5; fi\nexec /usr/bin/jq "$@"\n' > "$shim/jq"
+  chmod +x "$shim/jq"
+  # the same warm store, the page now present with the batch's own stamp (so the cache would take the warm entry if it were consulted), and the record changed
+  jq '.tokens = ["a@1.0.0"] | .pages = {"a@1.0.0": [{id: "GHSA-c-1", modified: "2026-01-01T00:00:00.000001Z"}]} | .records["GHSA-c-1"].database_specific.severity = "LOW"' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  : > "$OSV_LOG"
+  out=$(env -i PATH="$shim:$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" \
+    bash "$SAFE_AUDIT" scanner-batch --evidence --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(log_count detail)" == 1 ]] || { printf 'the warm entry was taken (details %s)\n' "$(log_count detail)" >&2; ok=0; }
+  jq -e '.identities[0].advisories[0].severity == "low"' <<<"$out" >/dev/null || { printf 'document: %s\n' "$out" >&2; ok=0; }
+  [[ "$(store_count)" == 1 && "$(sha256sum "$STATE"/advisory-records/* | cut -d' ' -f1)" == "$before_entry" ]] || { printf 'the store changed\n' >&2; ok=0; }
+  # control: the same run without the failure takes the warm entry (so the case above is about the failure and nothing else)
+  : > "$OSV_LOG"
+  out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(log_count detail)" == 0 ]] || { printf 'the control did not take the warm entry\n' >&2; ok=0; }
+  if (( ok )); then pass "cache: a stamp that could not be noted leaves the cache neither read nor written for the command"; else fail "cache: a stamp that could not be noted leaves the cache neither read nor written for the command"; fi
+}
+
+case_cache_a_withdrawal_that_is_not_a_timestamp_is_not_a_fact() {
+  # F4. In the evidence mode a `withdrawn` member that is not a timestamp makes the record malformed: missing evidence for the identity and
+  # nothing stored; once the service repairs the record under the same stamp the next command reads it as it is. A timestamp (with a fraction
+  # of a second) still withdraws it.
+  local value out ok=1
+  # (and the dates that never existed, which a conversion alone takes for dates: jq turns 29 February 2025 into 1 March and 31 April into 1 May)
+  for value in '""' '"garbage"' '5' 'null' '{"a":1}' '"2026-13-45T00:00:00Z"' '"2026-10-01 00:00:00"' '"2026-10-01T00:00:00+02:00"' \
+      '"2025-02-29T00:00:00Z"' '"2026-04-31T12:00:00Z"' '"2026-02-30T01:02:03.123Z"' '"2026-01-32T00:00:00Z"' '"2026-00-10T00:00:00Z"' \
+      '"2026-01-01T24:00:00Z"' '"2026-01-01T25:00:00Z"' '"2026-01-01T00:60:00Z"' '"2026-01-01T00:00:61Z"'; do
+    setup_cache_case "cache-withdrawn-$RANDOM"
+    printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+    jq --argjson w "$value" '.records["GHSA-c-1"].withdrawn = $w' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+    out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+    jq -e '.identities[0].coverage == "missing" and (.identities[0].gap | contains("OSV advisory record malformed")) and .identities[0].advisories == []' <<<"$out" >/dev/null || { printf '%s: not malformed: %s\n' "$value" "$out" >&2; ok=0; }
+    [[ "$(store_count)" == 0 ]] || { printf '%s: stored %s\n' "$value" "$(store_count)" >&2; ok=0; }
+    jq 'del(.records["GHSA-c-1"].withdrawn)' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+    : > "$OSV_LOG"
+    out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+    jq -e '.identities[0].coverage == "complete" and .identities[0].advisories[0].severity == "critical"' <<<"$out" >/dev/null || { printf '%s: not repaired: %s\n' "$value" "$out" >&2; ok=0; }
+    [[ "$(log_count detail)" == 1 ]] || { printf '%s: details %s after the repair\n' "$value" "$(log_count detail)" >&2; ok=0; }
+  done
+  setup_cache_case cache-withdrawn-ok
+  printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+  local real
+  for real in "2026-10-01T00:00:00.123Z" "2024-02-29T00:00:00Z" "2026-12-31T23:59:59Z"; do
+    setup_cache_case cache-withdrawn-real
+    printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+    jq --arg w "$real" '.records["GHSA-c-1"].withdrawn = $w' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+    out=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+    jq -e '.identities[0].coverage == "complete" and .identities[0].advisories == []' <<<"$out" >/dev/null || { printf 'a real withdrawal (%s): %s\n' "$real" "$out" >&2; ok=0; }
+    [[ "$(store_count)" == 1 ]] || { printf 'a real withdrawal (%s): stored %s\n' "$real" "$(store_count)" >&2; ok=0; }
+  done
+  if (( ok )); then pass "cache: a withdrawn member that is not a timestamp is a malformed record, not a withdrawal, and nothing is stored; a timestamp still withdraws"; else fail "cache: a withdrawn member that is not a timestamp is a malformed record"; fi
+}
+
+case_cache_the_reader_and_the_writer_name_a_stamp_alike() {
+  # F4. A stamp ending in a newline is not a key: it is never asked of the store (a request the core refuses would lose every other hit of the
+  # command) and never stored, and the advisory with a good stamp beside it is still taken from the store on the second run.
+  setup_cache_case cache-newline-stamp
+  local out1 out2 ok=1
+  jq '.adv["b@1.0.0"] = [{id: "GHSA-m-2", modified: "2026-02-02T00:00:00.000002Z\n"}]
+      | .records["GHSA-m-2"] = {id: "GHSA-m-2", database_specific: {severity: "MODERATE"}, affected: [{package: {ecosystem: "npm", name: "b"}}]}' "$OSV_DB" > "$OSV_DB.new" && mv "$OSV_DB.new" "$OSV_DB"
+  printf '%s' '{"packages":[{"name":"a","version":"1.0.0"},{"name":"b","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+  out1=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(store_count)" == 1 ]] || { printf 'stored %s, want only GHSA-c-1\n' "$(store_count)" >&2; ok=0; }
+  : > "$OSV_LOG"
+  out2=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(log_count detail)" == 1 ]] && grep -qx 'detail GHSA-m-2' "$OSV_LOG" || { printf 'second run: %s\n' "$(tr '\n' ';' < "$OSV_LOG")" >&2; ok=0; }
+  [[ "$(jq -S . <<<"$out1")" == "$(jq -S . <<<"$out2")" ]] || ok=0
+  if (( ok )); then pass "cache: a stamp that ends in a newline gives no key (not asked, not stored) and does not cost the other advisories their hits"; else fail "cache: a stamp that ends in a newline gives no key"; fi
+}
+
+
+case_evidence_names_longer_than_a_registry_accepts_are_malformed_input() {
+  # A package name is at most 214 characters (validate-npm-package-name) and a version at most 256 (node-semver): longer is not a package, and is said
+  # as malformed input before anything is asked. Exactly at the bound is read.
+  setup_cache_case bounds
+  local long out rc ok=1 label request
+  for label in "name:215" "version:257" "blocklist:215"; do
+    case "${label%%:*}" in
+      name) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: ("n" * $n), version: "1.0.0"}]}') ;;
+      version) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: "n", version: ("1" * $n)}]}') ;;
+      blocklist) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: "n", version: "1.0.0"}], blocklist_names: [("b" * $n)]}') ;;
+    esac
+    rc=0; out=$(printf '%s' "$request" | run_ev2 2>"$CASE_HOME/bounds.err") || rc=$?
+    [[ "$rc" == 2 && -z "$out" ]] && grep -q 'longer than' "$CASE_HOME/bounds.err" && ! grep -q 'expected {"packages"' "$CASE_HOME/bounds.err" || { printf '%s: rc=%s %s\n' "$label" "$rc" "$(cat "$CASE_HOME/bounds.err")" >&2; ok=0; }
+  done
+  # 140,000 bytes in a name: refused as such, and nothing is asked
+  long=$(jq -cn '{packages: [{name: ("n" * 140000), version: "1.0.0"}]}')
+  : > "$OSV_LOG"; rc=0; out=$(printf '%s' "$long" | run_ev2 2>"$CASE_HOME/bounds.err") || rc=$?
+  [[ "$rc" == 2 && -z "$out" && ! -s "$OSV_LOG" ]] || { printf '140,000 bytes: rc=%s calls %s\n' "$rc" "$(wc -c < "$OSV_LOG")" >&2; ok=0; }
+  for label in "name:214" "version:256" "blocklist:214"; do
+    case "${label%%:*}" in
+      name) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: ("n" * $n), version: "1.0.0"}]}') ;;
+      version) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: "n", version: ("1" * $n)}]}') ;;
+      blocklist) request=$(jq -cn --argjson n "${label##*:}" '{packages: [{name: "n", version: "1.0.0"}], blocklist_names: [("b" * $n)]}') ;;
+    esac
+    rc=0; out=$(printf '%s' "$request" | run_ev2 2>/dev/null) || rc=$?
+    [[ "$rc" == 0 ]] && jq -e '.identities | length == 1 and .[0].coverage == "complete"' <<<"$out" >/dev/null || { printf 'at the bound %s: rc=%s\n' "$label" "$rc" >&2; ok=0; }
+  done
+  if (( ok )); then pass "evidence: a name over 214 characters, a version over 256 (the registry's own bounds), or a 140,000-byte name is malformed input, said as such before anything is asked; the bounds themselves are read"; else fail "evidence: names and versions longer than a registry accepts are malformed input"; fi
+}
+
+case_evidence_input_validity_is_the_verdict_modes() {
+  # The evidence mode validates its request from a file with its own predicate (the bounds apart); the verdict mode's validator is the base's. They
+  # must give the same verdict on the same malformed input.
+  setup_cache_case input-differential
+  local input rc_v rc_e ok=1
+  for input in '{"packages":[{"name":"a b","version":"1.0.0"}]}' '{"packages":[{"name":"a\tb","version":"1.0.0"}]}' '{"packages":[{"name":"","version":"1.0.0"}]}' \
+      '{"packages":[{"name":"a","version":""}]}' '{"packages":[{"name":"a","version":1}]}' '{"packages":[{"name":1,"version":"1"}]}' '{"packages":[{"version":"1"}]}' \
+      '{"packages":[{"name":"a"}]}' '{"packages":"a"}' '{"packages":[1]}' '[]' '{}' '' 'not json' '{"packages":[{"name":"a\nb","version":"1"}]}' '{"packages":[{"name":"a","version":"1"}]}'; do
+    rc_v=0; printf '%s' "$input" | run_batch >/dev/null 2>&1 || rc_v=$?
+    rc_e=0; printf '%s' "$input" | run_ev2 >/dev/null 2>&1 || rc_e=$?
+    # the verdict mode reaches the network for a valid input (its own mock answers differently): only "refused as malformed (2)" is compared
+    [[ "$([[ $rc_v == 2 ]] && echo m || echo ok)" == "$([[ $rc_e == 2 ]] && echo m || echo ok)" ]] || { printf 'input %s: verdict rc=%s evidence rc=%s\n' "$input" "$rc_v" "$rc_e" >&2; ok=0; }
+  done
+  if (( ok )); then pass "evidence: its request is judged malformed exactly when the verdict mode's validator judges it so"; else fail "evidence: its request validity differs from the verdict mode's"; fi
+}
+
+case_evidence_locals_are_never_exported_and_a_callers_export_changes_nothing() {
+  # A local keeps the export attribute of a caller's variable of the same name, and a document in it would travel in the environment of every program
+  # the mode starts (5,000 short names return nothing then). Every local of the mode is declared `local +x` (static: derived from the source of the
+  # mode and its helpers, so a new local that forgets it fails here), and the reader, with EVERY name the mode declares exported by the caller (the
+  # names are taken from the source too), still reads 5,000 identities.
+  setup_cache_case exports
+  local names source ok=1 request out
+  source=$(awk '/^scanner_batch_(evidence_command|cache_plan|cache_get|cache_put|withdrawal_state|blocklist_candidates|classifier|evidence_input_check)\(\) \{/{f=1} f{print} f&&/^\}/{f=0}' "$SAFE_AUDIT")
+  # every `local` (not an array) carries +x
+  if grep -E '^[[:space:]]*local [^-+]' <<<"$source" | grep -q .; then
+    printf 'a local without +x: %s\n' "$(grep -E '^[[:space:]]*local [^-+]' <<<"$source" | head -3)" >&2; ok=0
+  fi
+  names=$(grep -E '^[[:space:]]*local \+x ' <<<"$source" | sed -E 's/^[[:space:]]*local \+x //' | tr ' ' '\n' | sed -E 's/=.*$//' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u)
+  [[ "$(wc -l <<<"$names")" -ge 20 ]] || { printf 'too few locals found (%s)\n' "$(wc -l <<<"$names")" >&2; ok=0; }
+  request=$(jq -cn '{packages: [range(5000) | {name: ("p" + tostring), version: "1.0.0"}]}')
+  local -a exported=()
+  while IFS= read -r name; do [[ -z "$name" ]] || exported+=("$name="); done <<<"$names"
+  exported+=(SCANNER_BATCH_PATHS= SCANNER_BATCH_BLOCK_CANDIDATES= SCANNER_BATCH_CORE_BIN=)
+  out=$(printf '%s' "$request" | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" \
+    "${exported[@]}" bash "$SAFE_AUDIT" scanner-batch --evidence 2>"$CASE_HOME/exports.err") || { head -3 "$CASE_HOME/exports.err" >&2; ok=0; }
+  jq -e '(.identities | length) == 5000 and ([.identities[] | .coverage] | all(. == "complete"))' <<<"$out" >/dev/null || { printf 'the reading with every local name exported by the caller did not return 5,000 complete identities\n' >&2; ok=0; }
+  # the names a reviewer found (the request's and the document's variables of the first version)
+  for name in input document cached_map pkgs advisories; do
+    out=$(printf '%s' "$request" | env -i PATH="$MOCK2BIN:/usr/bin:/bin" HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$RUN_DIR" SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" OSV_DB="$OSV_DB" OSV_LOG="$OSV_LOG" \
+      "$name=" bash "$SAFE_AUDIT" scanner-batch --evidence 2>/dev/null) || ok=0
+    jq -e '.identities | length == 5000' <<<"$out" >/dev/null || { printf 'with %s exported by the caller: not 5,000 identities\n' "$name" >&2; ok=0; }
+  done
+  if (( ok )); then pass "evidence: every local of the mode is un-exported, and a caller that exported every one of their names (and the reviewer's) changes nothing of a 5,000-identity reading"; else fail "evidence: the caller's exports change the reading, or a local lacks +x"; fi
+}
+
+case_cache_one_stamp_too_long_for_the_core_costs_no_other_hit() {
+  # The shell counts bytes as the core does (one unit), and a key the store cannot hold is left out of the question: a stamp of 257 two-byte characters
+  # (514 bytes, 257 characters) beside an ordinary one: the second command fetches only the record with the long stamp, the ordinary one is a hit.
+  setup_cache_case mixed
+  local out1 out2 ok=1 long
+  long=$(jq -rn '"é" * 257')
+  jq -n --arg long "$long" '{adv: {"a@1.0.0": [{id: "A-ordinary", modified: "v1"}, {id: "B-longstamp", modified: $long}]},
+      records: {"A-ordinary": {id: "A-ordinary", database_specific: {severity: "MODERATE"}, affected: [{package: {ecosystem: "npm", name: "a"}}]},
+                "B-longstamp": {id: "B-longstamp", database_specific: {severity: "HIGH"}, affected: [{package: {ecosystem: "npm", name: "a"}}]}}}' > "$OSV_DB"
+  printf '%s' '{"packages":[{"name":"a","version":"1.0.0"}]}' > "$CASE_HOME/req.json"
+  out1=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(store_count)" == 1 ]] || { printf 'stored %s, want only the ordinary one\n' "$(store_count)" >&2; ok=0; }
+  : > "$OSV_LOG"
+  out2=$(run_ev2 --state-dir "$STATE" < "$CASE_HOME/req.json" 2>/dev/null) || ok=0
+  [[ "$(log_count detail)" == 1 ]] && grep -qx 'detail B-longstamp' "$OSV_LOG" || { printf 'second run: %s\n' "$(tr '\n' ';' < "$OSV_LOG")" >&2; ok=0; }
+  [[ "$(jq -S . <<<"$out1")" == "$(jq -S . <<<"$out2")" ]] || ok=0
+  jq -e '[.identities[0].advisories[] | .id] == ["A-ordinary", "B-longstamp"]' <<<"$out2" >/dev/null || ok=0
+  if (( ok )); then pass "cache: a stamp too long for the core (counted in bytes on both sides) is left out of the question, and the ordinary record stays a hit"; else fail "cache: a stamp too long for the core costs the other hits of the command"; fi
+}
+
 # --- run ---------------------------------------------------------------------
 
 case_clean_tree_returns_empty_array
@@ -1443,6 +2068,26 @@ if (( SC_OK )); then
   case_evidence_duplicate_in_one_result_keeps_its_neighbour
   case_evidence_checker_does_not_fail_open
   case_evidence_page_and_detail_answers_are_checked_too
+  case_cache_second_run_fetches_no_record
+  case_cache_a_changed_stamp_is_fetched_again
+  case_cache_ignores_a_corrupt_foreign_or_other_mode_entry
+  case_cache_stores_nothing_for_a_failed_malformed_or_unclassifiable_record
+  case_cache_never_delays_a_malware_record_or_a_new_advisory
+  case_cache_a_reading_is_trusted_for_a_day_at_most
+  case_cache_the_reader_checks_what_the_core_answers
+  case_cache_without_the_argument_there_is_no_cache
+  case_evidence_reads_five_thousand_identities_with_long_names
+  case_cache_a_second_stamp_from_a_page_is_no_hit
+  case_cache_a_withdrawal_that_is_not_a_timestamp_is_not_a_fact
+  case_cache_a_stamp_that_could_not_be_noted_leaves_the_cache_alone
+  case_evidence_names_longer_than_a_registry_accepts_are_malformed_input
+  case_evidence_input_validity_is_the_verdict_modes
+  case_evidence_locals_are_never_exported_and_a_callers_export_changes_nothing
+  case_cache_one_stamp_too_long_for_the_core_costs_no_other_hit
+  case_cache_the_reader_and_the_writer_name_a_stamp_alike
+  case_cache_is_bounded_at_ten_thousand_entries
+  case_chunks_of_a_thousand_read_what_chunks_of_a_hundred_read
+  case_blocklist_read_once_agrees_with_the_per_name_reading
 else
   pass "evidence cases (SKIPPED: safe-core not buildable here)"
 fi
