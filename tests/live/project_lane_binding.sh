@@ -41,6 +41,9 @@
 # Only the npm registry is live. The advisory reader is a local stand-in that
 # reports every identity as read completely with no advisory: the judging core
 # is covered by the hermetic suite, and OSV must not make this probe flaky.
+# Scenario R is the exception, on purpose (ticket 1884): it runs the REAL auditor of the checkout, end to end, with the real advisory reading over
+# the network and no Socket credential, in an environment built from nothing and with no Socket program reachable (a `ci`, an install that names no root,
+# a named root, and a named root in a home where Socket is not set up). THE MACHINE'S OWN `socket` TOOL IS NEVER RUN BY THIS SUITE.
 #
 # Run it explicitly: SAFE_LIVE_NETWORK=1 bash tests/live/project_lane_binding.sh
 # (excluded from tests/run-all.sh because it makes real network calls).
@@ -126,40 +129,9 @@ if ! ( cd "${ROOT}" && "${GO_BIN}" build -trimpath -ldflags "-X main.version=$(t
   fail "safe-core builds"
   exit 1
 fi
-cat > "${WORK}/safe/bin/safe-audit" <<'AUDIT'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "scanner-batch" ]]; then
-  jq -c --arg adv "${LIVE_ADVISORY_NAME:-}" --arg mal "${LIVE_MALWARE_NAME:-}" '{schema_version: 1, policy: {block_severities: ["critical"]},
-          identities: [.packages[] | {name, version, coverage: "complete", gap: "",
-            advisories: (if .name == $mal then [{id: "MAL-live-0001", severity: "critical", malware: true}]
-                         elif .name == $adv then [{id: "GHSA-live-0001", severity: "critical", malware: false}] else [] end)}],
-          blocklist: []}'
-  exit 0
-fi
-# The lane's read-only door into the operator's stores: no standing acceptance applies.
-if [[ "${1:-}" == "lane-revoke" ]]; then cat >/dev/null; printf '{"revoked":[]}\n'; exit 0; fi
-if [[ "${1:-}" == "lane-acceptances" ]]; then cat >/dev/null; printf '{"schema_version":1,"acceptances":[]}\n'; exit 0; fi
-# Socket's facts on the named roots (package-audit --evidence-only): a fixture, because no Socket credential is
-# available to a live run; every named root scores clear and no block is cached.
-if [[ "${1:-}" == "package-audit" && "$*" == *"--evidence-only"* ]]; then
-  jq -c '{schema_version: 1, roots: [.roots[] | {name, version, outcome: "clear", gate_exit: 0, line: "PASS (score=95)", causes: [], cached: false}], cached_blocks: [], cache_gap: "", untied: []}'
-  exit 0
-fi
-# The whole-project scan, as the lane runs it after a publication (`repo-audit . --deps-only --result-out <file>`): it writes a result
-# document like the real auditor's, with what the scenario asks for (a critical finding in another ecosystem, scanners that are not ok, a
-# failing scan); without a result file asked for it writes none.
-if [[ "${1:-}" == "repo-audit" ]]; then
-  result_out=""; prev=""
-  for arg in "$@"; do [[ "${prev}" == "--result-out" ]] && result_out="${arg}"; prev="${arg}"; done
-  [[ "${LIVE_SCAN_EXIT:-0}" == 0 ]] || exit "${LIVE_SCAN_EXIT}"
-  [[ -z "${result_out}" ]] || jq -n --argjson py "${LIVE_SCAN_PYTHON_CRITICAL:-0}" --argjson partial "${LIVE_SCAN_PARTIAL:-0}" \
-    '{verdict: "GO", audit_totals: {critical: $py, by_ecosystem: (if $py > 0 then {python: {critical: $py}} else {} end)},
-      tool_status: (if $partial == 1 then {"osv-scanner": {status: "partial", note: "could not read a lockfile"}, syft: {status: "skipped", note: "unavailable"}, grype: {status: "ok", note: null}} else {grype: {status: "ok", note: null}} end),
-      ecosystem_audits: []}' > "${result_out}"
-  exit 0
-fi
-exit 0
-AUDIT
+# The advisory reader and the operator-side doors are a stand-in written to a file of its own (tests/lib/lane_stand_in_auditor.sh): the
+# hermetic contract suite holds it to the members of the real auditor's answers. Scenario R below runs the REAL auditor instead.
+cp "${ROOT}/tests/lib/lane_stand_in_auditor.sh" "${WORK}/safe/bin/safe-audit"
 chmod +x "${WORK}/safe/bin/safe-audit"
 # The operator's canonical configuration (the switch is read from there only).
 mkdir -p "${HOME}/.config/safe/run"
@@ -884,6 +856,117 @@ if curl -fsS --max-time 60 https://registry.npmjs.org/semver -o "${sem_times}" \
 else
   fail "J (the cooldown): the registry's semver packument is not what the scenario needs (7.7.1 older and 7.8.6 younger than the ${WINDOW}-day window)"
 fi
+
+# --- scenario R: the REAL auditor, end to end (ticket 1884) ---------------------------------------------------------------------------
+# A to J give the gate a stand-in for the auditor. R gives it the auditor of this checkout, installed beside the dispatcher the way install.sh
+# lays it out: the real advisory reading (OSV, over the network), the real Socket reader in a home where Socket is not set up, the real
+# operator-store doors, the real project scan after a publication. The lane installs with scripts off (`--ignore-scripts` on every command).
+#
+# The scenario ESTABLISHES its own premise, because the auditor discovers a `socket` program on the PATH the first time it scans a project and
+# writes it into the home's tool cache, from where the Socket reader runs it: a scenario that kept the machine's PATH would run the MACHINE'S
+# Socket tool, with whatever credential the caller's environment holds. THE MACHINE'S OWN `socket` TOOL IS NEVER RUN BY THIS SUITE. So:
+#   - an environment built from nothing (`env -i`), with what the commands need named one by one: HOME, a PATH constructed from the directories of
+#     the tools the scenario needs minus any `socket`, the locale, a temporary directory, git's two configuration variables. No `SOCKET_*`, no
+#     `SAFE_*`, no proxy or endpoint variable of the caller reaches it; the audit log and every store derive from the case's home alone;
+#   - stdin closed (`</dev/null`): no case can ask a question;
+#   - each case in a home of its own: none inherits what another discovered;
+#   - before and after each case, `lane_no_socket_check` (tests/lib/lane_no_socket.sh, itself held by a hermetic case that fails when a Socket
+#     program is on the PATH or in the tool cache) says that none is reachable and that the home's tool cache names none; a case that finds one FAILS.
+# shellcheck source=tests/lib/lane_no_socket.sh
+. "${ROOT}/tests/lib/lane_no_socket.sh"
+REAL="${WORK}/real"
+mkdir -p "${REAL}/bin" "${WORK}/rbin"
+cp "${ROOT}/bin/safe" "${REAL}/bin/safe"
+cp "${ROOT}/bin/safe-audit" "${REAL}/bin/safe-audit"
+cp "${WORK}/safe/bin/safe-core" "${REAL}/bin/safe-core"
+ln -s "${ROOT}/bin/safe-run" "${REAL}/bin/safe-run"
+ln -s "${ROOT}/lib" "${REAL}/lib"
+# the PATH of the scenario, built from the tools the commands need and nothing else: the Node and the npm the suite found (npm's own CLI file, linked
+# beside a link to the Node, the form the lane follows), then a directory of its own that links the tools of /usr/bin and /bin with no program
+# named `socket` among them; neither of those directories, nor the machine's PATH, is on it
+mkdir -p "${WORK}/rnode/bin"
+ln -s "${real_node_bin}" "${WORK}/rnode/bin/node"
+ln -s "${npm_cli}" "${WORK}/rnode/bin/npm"
+for r_dir in /usr/bin /bin; do
+  [[ -d "${r_dir}" ]] || continue
+  for r_tool in "${r_dir}"/*; do
+    [[ -f "${r_tool}" && -x "${r_tool}" && "${r_tool##*/}" != socket ]] || continue
+    [[ -e "${WORK}/rbin/${r_tool##*/}" ]] || ln -s "${r_tool}" "${WORK}/rbin/${r_tool##*/}"
+  done
+done
+R_PATH="${WORK}/rnode/bin:${WORK}/rbin"
+r_case() { # <name> <config json>: a home of its own for the case; fails the case when a Socket program is reachable
+  R_HOME="${WORK}/${1}-home"
+  mkdir -p "${R_HOME}/.config/safe/run" "${R_HOME}/tmp"
+  printf '%s\n' "$2" > "${R_HOME}/.config/safe/run/config.json"
+  lane_no_socket_check "${R_PATH}" "${R_HOME}" || { fail "$1: a Socket program is reachable before the case (the premise does not hold)"; return 1; }
+}
+gate_real() { # <dir> <args...>: the checkout's gate with the real auditor beside it, in <dir>, in the case's home, with nothing of the caller's
+  local dir="$1"
+  shift
+  ( cd "${dir}" && env -i HOME="${R_HOME}" PATH="${R_PATH}" LANG=C.UTF-8 LC_ALL=C TMPDIR="${R_HOME}/tmp" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+      "${REAL}/bin/safe" gate npm "$@" </dev/null >"${dir}.out" 2>"${dir}.err" )
+}
+r_after() { # <name>: the premise still holds after the case
+  lane_no_socket_check "${R_PATH}" "${R_HOME}" || { fail "$1: a Socket program was reachable or discovered during the case"; return 1; }
+}
+R_DEPS='{"ms":"2.1.3","is-number":"7.0.0"}'
+R_ENTRIES="${MS_213},${ISNUMBER_700}"
+R_LANE='{"install":{"project_lane":true}}'
+
+r_case r1 "${R_LANE}" && {
+fixture_project "${WORK}/r1" "${R_DEPS}" "${R_ENTRIES}"
+gate_real "${WORK}/r1" ci --ignore-scripts
+status=$?
+sed 's/^/# R1 gate: /' "${WORK}/r1.err" | tail -n 6
+if (( status == 0 )) && [[ -d "${WORK}/r1/node_modules/ms" && -d "${WORK}/r1/node_modules/is-number" ]] \
+    && grep -qE 'evidence: [0-9]+ of [0-9]+ identities read completely' "${WORK}/r1.err" \
+    && ! grep -q 'could not be read' "${WORK}/r1.err"; then
+  r_after r1 && pass "R1 (real auditor, npm ci): the lane completes, the advisory reading and the Socket cache are read, the tree is installed, no Socket program was reachable"
+else
+  fail "R1 (real auditor, npm ci): exit ${status}; $(tail -n 3 "${WORK}/r1.err")"
+fi
+}
+
+r_case r2 "${R_LANE}" && {
+fixture_project "${WORK}/r2" "${R_DEPS}" "${R_ENTRIES}"
+gate_real "${WORK}/r2" install --ignore-scripts
+status=$?
+sed 's/^/# R2 gate: /' "${WORK}/r2.err" | tail -n 6
+if (( status == 0 )) && [[ -d "${WORK}/r2/node_modules/ms" ]] && ! grep -q 'could not be read' "${WORK}/r2.err"; then
+  r_after r2 && pass "R2 (real auditor, an install that names no root): the lane completes and installs the tree"
+else
+  fail "R2 (real auditor, an install that names no root): exit ${status}; $(tail -n 3 "${WORK}/r2.err")"
+fi
+}
+
+r_case r3 "${R_LANE}" && {
+fixture_project "${WORK}/r3" "${R_DEPS}" "${R_ENTRIES}"
+gate_real "${WORK}/r3" install semver@7.5.4 --ignore-scripts
+status=$?
+sed 's/^/# R3 gate: /' "${WORK}/r3.err" | tail -n 4
+if (( status == 0 )) && [[ -d "${WORK}/r3/node_modules/semver" ]] && grep -q 'semver@7.5.4: clear' "${WORK}/r3.err"; then
+  r_after r3 && pass "R3 (real auditor, a named root, Socket's mode auto): a version older than Socket's window is installed, its Socket reading is clear without a Socket call"
+else
+  fail "R3 (real auditor, a named root, Socket's mode auto): exit ${status}; $(tail -n 3 "${WORK}/r3.err")"
+fi
+}
+
+# A named root with Socket asked for every named root (mode always) in a home where Socket is not set up: the refusal and its way out, as they are.
+r_case r4 '{"install":{"project_lane":true,"socket":{"mode":"always"}}}' && {
+fixture_project "${WORK}/r4" "${R_DEPS}" "${R_ENTRIES}"
+r4_before="$(sha256sum "${WORK}/r4/package.json" "${WORK}/r4/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
+gate_real "${WORK}/r4" install semver@7.5.4 --ignore-scripts
+status=$?
+sed 's/^/# R4 gate: /' "${WORK}/r4.err" | tail -n 2
+if (( status == 102 )) && tail -n 1 "${WORK}/r4.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.5\.4: audit infrastructure is unavailable \(not a package finding\); fix the infra \(socket login / wait / safe doctor\), then retry' \
+    && [[ ! -e "${WORK}/r4/node_modules" ]] \
+    && [[ "$(sha256sum "${WORK}/r4/package.json" "${WORK}/r4/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')" == "${r4_before}" ]]; then
+  r_after r4 && pass "R4 (real auditor, a named root, no Socket tool anywhere): refused 102 as audit-infrastructure breakage with its way out (socket login / wait / safe doctor); nothing installed, nothing written"
+else
+  fail "R4 (real auditor, a named root, no Socket tool anywhere): exit ${status}; $(tail -n 2 "${WORK}/r4.err")"
+fi
+}
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"
 (( FAIL == 0 ))
