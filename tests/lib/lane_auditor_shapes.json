@@ -1,30 +1,1205 @@
 {
   "evidence": {
-    "schema_version": "number",
-    "policy": {"block_severities": ["string"]},
-    "identities": [{"name": "string", "version": "string", "coverage": "string", "gap": "string",
-                    "advisories": [{"id": "string", "severity": "string", "malware": "boolean"}]}],
-    "blocklist": [{"name": "string", "reason": "string"}]
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".blocklist": [
+        "array"
+      ],
+      ".blocklist[]": [
+        "object"
+      ],
+      ".blocklist[].name": [
+        "string"
+      ],
+      ".blocklist[].reason": [
+        "string"
+      ],
+      ".identities": [
+        "array"
+      ],
+      ".identities[]": [
+        "object"
+      ],
+      ".identities[].advisories": [
+        "array"
+      ],
+      ".identities[].advisories[]": [
+        "object"
+      ],
+      ".identities[].advisories[].id": [
+        "string"
+      ],
+      ".identities[].advisories[].malware": [
+        "boolean"
+      ],
+      ".identities[].advisories[].severity": [
+        "string"
+      ],
+      ".identities[].coverage": [
+        "string"
+      ],
+      ".identities[].gap": [
+        "string"
+      ],
+      ".identities[].name": [
+        "string"
+      ],
+      ".identities[].version": [
+        "string"
+      ],
+      ".policy": [
+        "object"
+      ],
+      ".policy.block_severities": [
+        "array"
+      ],
+      ".policy.block_severities[]": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".blocklist": [
+        "array"
+      ],
+      ".blocklist[]": [
+        "object"
+      ],
+      ".blocklist[].name": [
+        "string"
+      ],
+      ".blocklist[].reason": [
+        "string"
+      ],
+      ".identities": [
+        "array"
+      ],
+      ".identities[]": [
+        "object"
+      ],
+      ".identities[].advisories": [
+        "array"
+      ],
+      ".identities[].advisories[]": [
+        "object"
+      ],
+      ".identities[].advisories[].id": [
+        "string"
+      ],
+      ".identities[].advisories[].malware": [
+        "boolean"
+      ],
+      ".identities[].advisories[].severity": [
+        "string"
+      ],
+      ".identities[].coverage": [
+        "string"
+      ],
+      ".identities[].gap": [
+        "string"
+      ],
+      ".identities[].name": [
+        "string"
+      ],
+      ".identities[].version": [
+        "string"
+      ],
+      ".policy": [
+        "object"
+      ],
+      ".policy.block_severities": [
+        "array"
+      ],
+      ".policy.block_severities[]": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    }
   },
-  "socket_answer": {
-    "schema_version": "number",
-    "roots": [{"name": "string", "version": "string", "outcome": "string", "gate_exit": "number", "line": "string",
-               "causes": ["string"], "cached": "boolean"}],
-    "cached_blocks": [{"name": "string", "version": "string", "line": "string"}],
-    "cache_gap": "string"
+  "generated_by": "tests/contract/lane_auditor.sh from the answers of the real entries (LANE_SHAPES_UPDATE=1 rewrites this file; an edit by hand fails the suite)",
+  "install_receipt": {
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".evidence": [
+        "string"
+      ],
+      ".first_allowed": [
+        "string"
+      ],
+      ".last_used": [
+        "string"
+      ],
+      ".reasons": [
+        "array"
+      ],
+      ".reasons[]": [
+        "string"
+      ],
+      ".source": [
+        "string"
+      ],
+      ".times_used": [
+        "number"
+      ],
+      ".verdict": [
+        "string"
+      ],
+      ".version": [
+        "string"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".evidence": [
+        "string"
+      ],
+      ".first_allowed": [
+        "string"
+      ],
+      ".last_used": [
+        "string"
+      ],
+      ".reasons": [
+        "array"
+      ],
+      ".reasons[]": [
+        "string"
+      ],
+      ".source": [
+        "string"
+      ],
+      ".times_used": [
+        "number"
+      ],
+      ".verdict": [
+        "string"
+      ],
+      ".version": [
+        "string"
+      ]
+    }
   },
   "lane_acceptances": {
-    "schema_version": "number",
-    "acceptances": [{"kind": "string", "name": "string", "version": "string", "host": "string", "advisories": ["string"], "causes": ["string"]}]
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".acceptances": [
+        "array"
+      ],
+      ".acceptances[]": [
+        "object"
+      ],
+      ".acceptances[].advisories": [
+        "array"
+      ],
+      ".acceptances[].causes": [
+        "array"
+      ],
+      ".acceptances[].causes[]": [
+        "string"
+      ],
+      ".acceptances[].host": [
+        "string"
+      ],
+      ".acceptances[].kind": [
+        "string"
+      ],
+      ".acceptances[].name": [
+        "string"
+      ],
+      ".acceptances[].version": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".acceptances": [
+        "array"
+      ],
+      ".acceptances[]": [
+        "object"
+      ],
+      ".acceptances[].advisories": [
+        "array"
+      ],
+      ".acceptances[].causes": [
+        "array"
+      ],
+      ".acceptances[].causes[]": [
+        "string"
+      ],
+      ".acceptances[].host": [
+        "string"
+      ],
+      ".acceptances[].kind": [
+        "string"
+      ],
+      ".acceptances[].name": [
+        "string"
+      ],
+      ".acceptances[].version": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    }
   },
-  "lane_revoke": {"revoked": [{"name": "string", "version": "string"}]},
-  "install_receipt": {"version": "string", "verdict": "string", "source": "string", "*": "any"},
+  "lane_revoke": {
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".revoked": [
+        "array"
+      ],
+      ".revoked[]": [
+        "object"
+      ],
+      ".revoked[].name": [
+        "string"
+      ],
+      ".revoked[].version": [
+        "string"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".revoked": [
+        "array"
+      ],
+      ".revoked[]": [
+        "object"
+      ],
+      ".revoked[].name": [
+        "string"
+      ],
+      ".revoked[].version": [
+        "string"
+      ]
+    }
+  },
+  "package_audit_json": {
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".block": [
+        "null",
+        "object"
+      ],
+      ".block.advisories": [
+        "array"
+      ],
+      ".block.class": [
+        "string"
+      ],
+      ".checks": [
+        "object"
+      ],
+      ".checks.blocklist": [
+        "string"
+      ],
+      ".checks.osv": [
+        "string"
+      ],
+      ".checks.release_age": [
+        "null"
+      ],
+      ".checks.socket": [
+        "string"
+      ],
+      ".ecosystem": [
+        "string"
+      ],
+      ".has_install_script": [
+        "null"
+      ],
+      ".installer": [
+        "string"
+      ],
+      ".op": [
+        "string"
+      ],
+      ".osv": [
+        "object"
+      ],
+      ".osv.classification": [
+        "object"
+      ],
+      ".osv.classification.affecting": [
+        "array"
+      ],
+      ".osv.classification.ambiguous": [
+        "array"
+      ],
+      ".osv.classification.remediated": [
+        "array"
+      ],
+      ".osv.classification.unaffected": [
+        "array"
+      ],
+      ".osv.note": [
+        "null"
+      ],
+      ".osv.status": [
+        "string"
+      ],
+      ".osv.versions": [
+        "array"
+      ],
+      ".osv.versions[]": [
+        "object"
+      ],
+      ".osv.versions[].classification": [
+        "object"
+      ],
+      ".osv.versions[].classification.affecting": [
+        "array"
+      ],
+      ".osv.versions[].classification.ambiguous": [
+        "array"
+      ],
+      ".osv.versions[].classification.remediated": [
+        "array"
+      ],
+      ".osv.versions[].classification.unaffected": [
+        "array"
+      ],
+      ".osv.versions[].version": [
+        "string"
+      ],
+      ".osv.vulns": [
+        "array"
+      ],
+      ".package": [
+        "string"
+      ],
+      ".release": [
+        "null"
+      ],
+      ".resolution": [
+        "object"
+      ],
+      ".resolution.method": [
+        "string"
+      ],
+      ".resolution.range": [
+        "string"
+      ],
+      ".resolution.source": [
+        "string"
+      ],
+      ".resolution.status": [
+        "string"
+      ],
+      ".resolved_versions": [
+        "array"
+      ],
+      ".resolved_versions[]": [
+        "string"
+      ],
+      ".socket": [
+        "object"
+      ],
+      ".socket.available": [
+        "boolean"
+      ],
+      ".socket.cache_age_seconds": [
+        "null"
+      ],
+      ".socket.cached": [
+        "boolean"
+      ],
+      ".socket.note": [
+        "null"
+      ],
+      ".socket.raw": [
+        "object"
+      ],
+      ".socket.status": [
+        "string"
+      ],
+      ".source_identity": [
+        "string"
+      ],
+      ".spec": [
+        "string"
+      ],
+      ".timestamp": [
+        "string"
+      ],
+      ".verdict": [
+        "string"
+      ],
+      ".warn_causes": [
+        "array"
+      ],
+      ".warn_causes[]": [
+        "string"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".block": [
+        "null",
+        "object"
+      ],
+      ".checks": [
+        "object"
+      ],
+      ".checks.blocklist": [
+        "string"
+      ],
+      ".checks.osv": [
+        "string"
+      ],
+      ".checks.release_age": [
+        "null"
+      ],
+      ".checks.socket": [
+        "string"
+      ],
+      ".ecosystem": [
+        "string"
+      ],
+      ".has_install_script": [
+        "null"
+      ],
+      ".installer": [
+        "string"
+      ],
+      ".op": [
+        "string"
+      ],
+      ".osv": [
+        "object"
+      ],
+      ".osv.classification": [
+        "object"
+      ],
+      ".osv.classification.affecting": [
+        "array"
+      ],
+      ".osv.classification.ambiguous": [
+        "array"
+      ],
+      ".osv.classification.remediated": [
+        "array"
+      ],
+      ".osv.classification.unaffected": [
+        "array"
+      ],
+      ".osv.note": [
+        "null"
+      ],
+      ".osv.status": [
+        "string"
+      ],
+      ".osv.versions": [
+        "array"
+      ],
+      ".osv.versions[]": [
+        "object"
+      ],
+      ".osv.versions[].classification": [
+        "object"
+      ],
+      ".osv.versions[].classification.affecting": [
+        "array"
+      ],
+      ".osv.versions[].classification.ambiguous": [
+        "array"
+      ],
+      ".osv.versions[].classification.remediated": [
+        "array"
+      ],
+      ".osv.versions[].classification.unaffected": [
+        "array"
+      ],
+      ".osv.versions[].version": [
+        "string"
+      ],
+      ".osv.vulns": [
+        "array"
+      ],
+      ".package": [
+        "string"
+      ],
+      ".release": [
+        "null"
+      ],
+      ".resolution": [
+        "object"
+      ],
+      ".resolution.method": [
+        "string"
+      ],
+      ".resolution.range": [
+        "string"
+      ],
+      ".resolution.source": [
+        "string"
+      ],
+      ".resolution.status": [
+        "string"
+      ],
+      ".resolved_versions": [
+        "array"
+      ],
+      ".resolved_versions[]": [
+        "string"
+      ],
+      ".socket": [
+        "object"
+      ],
+      ".socket.available": [
+        "boolean"
+      ],
+      ".socket.cache_age_seconds": [
+        "null"
+      ],
+      ".socket.cached": [
+        "boolean"
+      ],
+      ".socket.note": [
+        "null"
+      ],
+      ".socket.raw": [
+        "object"
+      ],
+      ".socket.status": [
+        "string"
+      ],
+      ".source_identity": [
+        "string"
+      ],
+      ".spec": [
+        "string"
+      ],
+      ".timestamp": [
+        "string"
+      ],
+      ".verdict": [
+        "string"
+      ],
+      ".warn_causes": [
+        "array"
+      ]
+    }
+  },
   "scan_result": {
-    "verdict": "string",
-    "cve_scan": {"critical": "number", "*": "any"},
-    "audit_totals": {"critical": "number", "by_ecosystem?": {"*": {"critical": "number", "*": "any"}}, "*": "any"},
-    "tool_status": {"*": {"status?": "string", "*": "any"}},
-    "ecosystem_audits": [{"scanner": "string", "status": "string", "*": "any"}],
-    "*": "any"
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".audit_totals": [
+        "object"
+      ],
+      ".audit_totals.by_ecosystem": [
+        "object"
+      ],
+      ".audit_totals.by_ecosystem.*": [
+        "object"
+      ],
+      ".audit_totals.by_ecosystem.*.critical": [
+        "number"
+      ],
+      ".audit_totals.by_ecosystem.*.high": [
+        "number"
+      ],
+      ".audit_totals.by_ecosystem.*.low": [
+        "number"
+      ],
+      ".audit_totals.by_ecosystem.*.medium": [
+        "number"
+      ],
+      ".audit_totals.by_ecosystem.*.unknown": [
+        "number"
+      ],
+      ".audit_totals.critical": [
+        "number"
+      ],
+      ".audit_totals.cve_scan": [
+        "object"
+      ],
+      ".audit_totals.cve_scan.critical": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.high": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.low": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.medium": [
+        "number"
+      ],
+      ".audit_totals.deduplicated": [
+        "boolean"
+      ],
+      ".audit_totals.ecosystem": [
+        "array"
+      ],
+      ".audit_totals.ecosystem[]": [
+        "object"
+      ],
+      ".audit_totals.ecosystem[].critical": [
+        "number"
+      ],
+      ".audit_totals.ecosystem[].high": [
+        "number"
+      ],
+      ".audit_totals.ecosystem[].low": [
+        "number"
+      ],
+      ".audit_totals.ecosystem[].medium": [
+        "number"
+      ],
+      ".audit_totals.ecosystem[].root": [
+        "string"
+      ],
+      ".audit_totals.ecosystem[].scanner": [
+        "string"
+      ],
+      ".audit_totals.ecosystem[].status": [
+        "string"
+      ],
+      ".audit_totals.ecosystem[].total": [
+        "number"
+      ],
+      ".audit_totals.ecosystem[].unknown": [
+        "number"
+      ],
+      ".audit_totals.high": [
+        "number"
+      ],
+      ".audit_totals.low": [
+        "number"
+      ],
+      ".audit_totals.medium": [
+        "number"
+      ],
+      ".audit_totals.unknown": [
+        "number"
+      ],
+      ".cve_scan": [
+        "object"
+      ],
+      ".cve_scan.critical": [
+        "number"
+      ],
+      ".cve_scan.findings": [
+        "array"
+      ],
+      ".cve_scan.high": [
+        "number"
+      ],
+      ".cve_scan.low": [
+        "number"
+      ],
+      ".cve_scan.medium": [
+        "number"
+      ],
+      ".date": [
+        "string"
+      ],
+      ".delta": [
+        "object"
+      ],
+      ".delta.new_cves": [
+        "array"
+      ],
+      ".delta.packages_added": [
+        "number"
+      ],
+      ".delta.packages_removed": [
+        "number"
+      ],
+      ".delta.previous_scan": [
+        "null"
+      ],
+      ".ecosystem_audits": [
+        "array"
+      ],
+      ".ecosystem_audits[]": [
+        "object"
+      ],
+      ".ecosystem_audits[].critical": [
+        "number"
+      ],
+      ".ecosystem_audits[].high": [
+        "number"
+      ],
+      ".ecosystem_audits[].low": [
+        "number"
+      ],
+      ".ecosystem_audits[].medium": [
+        "number"
+      ],
+      ".ecosystem_audits[].note": [
+        "null",
+        "string"
+      ],
+      ".ecosystem_audits[].root": [
+        "string"
+      ],
+      ".ecosystem_audits[].scanner": [
+        "string"
+      ],
+      ".ecosystem_audits[].status": [
+        "string"
+      ],
+      ".ecosystem_audits[].total": [
+        "number"
+      ],
+      ".ecosystem_audits[].unknown": [
+        "number"
+      ],
+      ".machine": [
+        "string"
+      ],
+      ".sbom": [
+        "string"
+      ],
+      ".scan_mode": [
+        "string"
+      ],
+      ".source_scan": [
+        "object"
+      ],
+      ".source_scan.findings": [
+        "array"
+      ],
+      ".source_scan.note": [
+        "string"
+      ],
+      ".source_scan.scanned_files": [
+        "number"
+      ],
+      ".source_scan.status": [
+        "string"
+      ],
+      ".source_scan.total": [
+        "number"
+      ],
+      ".strategy": [
+        "string"
+      ],
+      ".summary": [
+        "object"
+      ],
+      ".summary.ecosystems": [
+        "object"
+      ],
+      ".summary.ecosystems.go": [
+        "number"
+      ],
+      ".summary.ecosystems.npm": [
+        "number"
+      ],
+      ".summary.ecosystems.php": [
+        "number"
+      ],
+      ".summary.ecosystems.python": [
+        "number"
+      ],
+      ".summary.ecosystems.rust": [
+        "number"
+      ],
+      ".summary.packages_total": [
+        "number"
+      ],
+      ".target": [
+        "string"
+      ],
+      ".timestamp": [
+        "string"
+      ],
+      ".tool_status": [
+        "object"
+      ],
+      ".tool_status.grype": [
+        "object"
+      ],
+      ".tool_status.grype.note": [
+        "null"
+      ],
+      ".tool_status.grype.status": [
+        "string"
+      ],
+      ".tool_status.osv-scanner": [
+        "object"
+      ],
+      ".tool_status.osv-scanner.note": [
+        "null",
+        "string"
+      ],
+      ".tool_status.osv-scanner.status": [
+        "string"
+      ],
+      ".tool_status.syft": [
+        "object"
+      ],
+      ".tool_status.syft.note": [
+        "null",
+        "string"
+      ],
+      ".tool_status.syft.status": [
+        "string"
+      ],
+      ".verdict": [
+        "string"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".audit_totals": [
+        "object"
+      ],
+      ".audit_totals.by_ecosystem": [
+        "object"
+      ],
+      ".audit_totals.critical": [
+        "number"
+      ],
+      ".audit_totals.cve_scan": [
+        "object"
+      ],
+      ".audit_totals.cve_scan.critical": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.high": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.low": [
+        "number"
+      ],
+      ".audit_totals.cve_scan.medium": [
+        "number"
+      ],
+      ".audit_totals.deduplicated": [
+        "boolean"
+      ],
+      ".audit_totals.ecosystem": [
+        "array"
+      ],
+      ".audit_totals.high": [
+        "number"
+      ],
+      ".audit_totals.low": [
+        "number"
+      ],
+      ".audit_totals.medium": [
+        "number"
+      ],
+      ".audit_totals.unknown": [
+        "number"
+      ],
+      ".cve_scan": [
+        "object"
+      ],
+      ".cve_scan.critical": [
+        "number"
+      ],
+      ".cve_scan.findings": [
+        "array"
+      ],
+      ".cve_scan.high": [
+        "number"
+      ],
+      ".cve_scan.low": [
+        "number"
+      ],
+      ".cve_scan.medium": [
+        "number"
+      ],
+      ".date": [
+        "string"
+      ],
+      ".delta": [
+        "object"
+      ],
+      ".delta.new_cves": [
+        "array"
+      ],
+      ".delta.packages_added": [
+        "number"
+      ],
+      ".delta.packages_removed": [
+        "number"
+      ],
+      ".delta.previous_scan": [
+        "null"
+      ],
+      ".ecosystem_audits": [
+        "array"
+      ],
+      ".ecosystem_audits[]": [
+        "object"
+      ],
+      ".ecosystem_audits[].critical": [
+        "number"
+      ],
+      ".ecosystem_audits[].high": [
+        "number"
+      ],
+      ".ecosystem_audits[].low": [
+        "number"
+      ],
+      ".ecosystem_audits[].medium": [
+        "number"
+      ],
+      ".ecosystem_audits[].note": [
+        "null",
+        "string"
+      ],
+      ".ecosystem_audits[].root": [
+        "string"
+      ],
+      ".ecosystem_audits[].scanner": [
+        "string"
+      ],
+      ".ecosystem_audits[].status": [
+        "string"
+      ],
+      ".ecosystem_audits[].total": [
+        "number"
+      ],
+      ".ecosystem_audits[].unknown": [
+        "number"
+      ],
+      ".machine": [
+        "string"
+      ],
+      ".sbom": [
+        "string"
+      ],
+      ".scan_mode": [
+        "string"
+      ],
+      ".source_scan": [
+        "object"
+      ],
+      ".source_scan.findings": [
+        "array"
+      ],
+      ".source_scan.note": [
+        "string"
+      ],
+      ".source_scan.scanned_files": [
+        "number"
+      ],
+      ".source_scan.status": [
+        "string"
+      ],
+      ".source_scan.total": [
+        "number"
+      ],
+      ".strategy": [
+        "string"
+      ],
+      ".summary": [
+        "object"
+      ],
+      ".summary.ecosystems": [
+        "object"
+      ],
+      ".summary.ecosystems.go": [
+        "number"
+      ],
+      ".summary.ecosystems.npm": [
+        "number"
+      ],
+      ".summary.ecosystems.php": [
+        "number"
+      ],
+      ".summary.ecosystems.python": [
+        "number"
+      ],
+      ".summary.ecosystems.rust": [
+        "number"
+      ],
+      ".summary.packages_total": [
+        "number"
+      ],
+      ".target": [
+        "string"
+      ],
+      ".timestamp": [
+        "string"
+      ],
+      ".tool_status": [
+        "object"
+      ],
+      ".tool_status.grype": [
+        "object"
+      ],
+      ".tool_status.grype.note": [
+        "null"
+      ],
+      ".tool_status.grype.status": [
+        "string"
+      ],
+      ".tool_status.osv-scanner": [
+        "object"
+      ],
+      ".tool_status.osv-scanner.note": [
+        "null",
+        "string"
+      ],
+      ".tool_status.osv-scanner.status": [
+        "string"
+      ],
+      ".tool_status.syft": [
+        "object"
+      ],
+      ".tool_status.syft.note": [
+        "null",
+        "string"
+      ],
+      ".tool_status.syft.status": [
+        "string"
+      ],
+      ".verdict": [
+        "string"
+      ]
+    }
+  },
+  "socket_answer": {
+    "allowed": {
+      "": [
+        "object"
+      ],
+      ".cache_gap": [
+        "string"
+      ],
+      ".cached_blocks": [
+        "array"
+      ],
+      ".cached_blocks[]": [
+        "object"
+      ],
+      ".cached_blocks[].line": [
+        "string"
+      ],
+      ".cached_blocks[].name": [
+        "string"
+      ],
+      ".cached_blocks[].version": [
+        "string"
+      ],
+      ".roots": [
+        "array"
+      ],
+      ".roots[]": [
+        "object"
+      ],
+      ".roots[].cached": [
+        "boolean"
+      ],
+      ".roots[].causes": [
+        "array"
+      ],
+      ".roots[].causes[]": [
+        "string"
+      ],
+      ".roots[].gate_exit": [
+        "number"
+      ],
+      ".roots[].line": [
+        "string"
+      ],
+      ".roots[].name": [
+        "string"
+      ],
+      ".roots[].outcome": [
+        "string"
+      ],
+      ".roots[].version": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    },
+    "required": {
+      "": [
+        "object"
+      ],
+      ".cache_gap": [
+        "string"
+      ],
+      ".cached_blocks": [
+        "array"
+      ],
+      ".cached_blocks[]": [
+        "object"
+      ],
+      ".cached_blocks[].line": [
+        "string"
+      ],
+      ".cached_blocks[].name": [
+        "string"
+      ],
+      ".cached_blocks[].version": [
+        "string"
+      ],
+      ".roots": [
+        "array"
+      ],
+      ".roots[]": [
+        "object"
+      ],
+      ".roots[].cached": [
+        "boolean"
+      ],
+      ".roots[].causes": [
+        "array"
+      ],
+      ".roots[].gate_exit": [
+        "number"
+      ],
+      ".roots[].line": [
+        "string"
+      ],
+      ".roots[].name": [
+        "string"
+      ],
+      ".roots[].outcome": [
+        "string"
+      ],
+      ".roots[].version": [
+        "string"
+      ],
+      ".schema_version": [
+        "number"
+      ]
+    }
   }
 }

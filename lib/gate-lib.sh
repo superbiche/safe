@@ -4759,7 +4759,8 @@ safe_gate_project_lane_socket_cache_doc() {
 # not (each line one document). Exactly one consistent row per identity asked: a row that is missing, repeated, for another
 # version, or contradicting itself becomes an unavailable result for the root asked, never a clear one; the whole rows
 # are kept. Operands that could not be tied travel apart (`untied`): they are not asked and are missing evidence of the
-# command. That statement is the GATE's own (the reader is never given them and cannot know them): the reader's answer carries
+# command. That statement is the GATE's own (the request carries what the reader is asked and nothing else; the gate keeps the operands it
+# could not tie in a file of its own, which the reader never sees and could not know): the reader's answer carries
 # `schema_version`, `roots`, `cached_blocks` and `cache_gap` and nothing more is required of it.
 # $1 request, $2 raw answer, $3 output, $4 why the call failed, $5 progress file (may be absent), $6 untied
 # file, $7 core.
@@ -4775,13 +4776,15 @@ safe_gate_project_lane_socket_roots_doc() {
   fi
   if [[ -n "${why}" ]]; then
     src="${out}.null"; printf 'null\n' >"${src}"
-    # what the reader completed before it stopped survives, each row on its own
-    if [[ -s "${progress}" ]]; then
-      while IFS= read -r line; do
-        [[ -n "${line}" ]] || continue
-        printf '%s' "${line}" | "${core}" repeated-members >/dev/null 2>&1 && printf '%s\n' "${line}" >>"${kept}"
-      done <"${progress}"
-    fi
+  fi
+  # The rows the reader appended as it went (each line one document) are read whatever the end of the call was: with the final answer
+  # accepted they are held against it (a root the two disagree on is unavailable, never the weaker of the two), and without one they are
+  # what the reader completed before it stopped.
+  if [[ -s "${progress}" ]]; then
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      printf '%s' "${line}" | "${core}" repeated-members >/dev/null 2>&1 && printf '%s\n' "${line}" >>"${kept}"
+    done <"${progress}"
   fi
   [[ -s "${untied}" ]] || printf '[]\n' >"${untied}"
   jq -c --slurpfile q "${request}" --slurpfile u "${untied}" --slurpfile k "${kept}" --arg why "${why:-the Socket evidence reader did not answer}" '
@@ -4797,13 +4800,28 @@ safe_gate_project_lane_socket_roots_doc() {
       and (($r.outcome == "blocked") == ($r.causes | index("socket_malware") != null))
       and (if $r.outcome == "adverse" then ($r.causes | length > 0) else true end)
       and (if $r.outcome == "rate_limited" then ($r.causes | length > 0 and all(. == "socket_rate_limited")) else true end);
+    def row: {name, version, outcome, gate_exit, line, causes, cached};
     def missing($w; $line): {name: $w.name, version: $w.version, outcome: "unavailable", gate_exit: 11, line: $line, causes: [], cached: false};
-    (if type == "object" and .schema_version == 1 and (.roots | type == "array") then .roots else $k end) as $rows
+    (type == "object" and .schema_version == 1 and (.roots | type == "array")) as $answered
+    | (if $answered then .roots else [] end) as $final
     | {schema_version: 1,
        roots: [$q[0].roots[] as $w
-           | ([$rows[] | select(type == "object" and .name == $w.name and .version == $w.version)]) as $m
-           | if ($m | length) == 1 and whole($m[0]) then ($m[0] | {name, version, outcome, gate_exit, line, causes, cached})
-             else missing($w; (if ($m | length) == 0 then "audit infrastructure unavailable (" + $why + ")" else "audit infrastructure unavailable (the reader answered inconsistently for this package)" end)) end],
+           | ([$final[] | select(type == "object" and .name == $w.name and .version == $w.version)]) as $f
+           | ([$k[] | select(type == "object" and .name == $w.name and .version == $w.version)]) as $p
+           | if $answered then
+               # the final answer decides for a completed call, and a row written on the way that it does not repeat is a disagreement
+               (if ($f | length) == 1 and whole($f[0]) then
+                  (if ($p | length) == 0 or ([$p[] | whole(.) and (row == ($f[0] | row))] | all) then ($f[0] | row)
+                   else missing($w; "audit infrastructure unavailable (the reader'"'"'s final answer and a row it wrote on the way disagree for this package)") end)
+                elif ($f | length) == 0 and ($p | length) > 0 then
+                  missing($w; "audit infrastructure unavailable (the reader'"'"'s final answer does not hold this package, a row it wrote on the way does)")
+                elif ($f | length) == 0 then
+                  missing($w; "audit infrastructure unavailable (the reader'"'"'s answer does not hold this package)")
+                else missing($w; "audit infrastructure unavailable (the reader answered inconsistently for this package)") end)
+             else
+               (if ($p | length) == 1 and whole($p[0]) then ($p[0] | row)
+                else missing($w; (if ($p | length) == 0 then "audit infrastructure unavailable (" + $why + ")" else "audit infrastructure unavailable (the reader answered inconsistently for this package)" end)) end)
+             end],
        untied: $u[0]}' "${src}" >"${out}" 2>/dev/null
 }
 
@@ -5006,11 +5024,13 @@ safe_gate_project_lane_late_evidence() {
                        and (.version == $r.version or .version == ($r.version | sub("[+].*$"; "")))) | {name, version}] | unique) as $hit
                    | if ($hit | length) == 1 then {tie: "tied", identity: $hit[0]} else {tie: "untied", root: $r} end end)) as $ties
         | {roots: ([$ties[] | select(.tie == "tied") | .identity] | unique), cached: [], untied: [$ties[] | select(.tie == "untied") | .root]}' \
-        <<<"{}" >"${scratch}/socket-roots-request.json" 2>/dev/null; then
+        <<<"{}" >"${scratch}/socket-ties.json" 2>/dev/null \
+      || ! jq -c '{roots, cached}' "${scratch}/socket-ties.json" >"${scratch}/socket-roots-request.json" 2>/dev/null; then
     safe_gate_project_lane_refuse 100 "${verb}" "the Socket request cannot be formed (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
-  jq -c '.untied' "${scratch}/socket-roots-request.json" >"${scratch}/socket-untied.json" 2>/dev/null
+  # what the reader is asked (the request) and the gate's own statement of the operands it could not tie (a file of its own, never sent)
+  jq -c '.untied' "${scratch}/socket-ties.json" >"${scratch}/socket-untied.json" 2>/dev/null
   socket_why=""
   : >"${scratch}/socket-roots.progress"
   if jq -e '.roots | length > 0' "${scratch}/socket-roots-request.json" >/dev/null 2>&1; then
@@ -5020,7 +5040,7 @@ safe_gate_project_lane_late_evidence() {
   else
     printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}\n' >"${scratch}/socket-roots.raw"
   fi
-  if jq -e '(.roots | length > 0) or (.untied | length > 0)' "${scratch}/socket-roots-request.json" >/dev/null 2>&1; then
+  if jq -e '(.roots | length > 0) or (.untied | length > 0)' "${scratch}/socket-ties.json" >/dev/null 2>&1; then
     if ! safe_gate_project_lane_socket_roots_doc "${scratch}/socket-roots-request.json" "${scratch}/socket-roots.raw" "${socket_roots}" "${socket_why}" \
           "${scratch}/socket-roots.progress" "${scratch}/socket-untied.json" "${safe_core}" \
         || ! jq -ec --slurpfile r "${socket_roots}" '.roots = $r[0].roots | .untied = $r[0].untied' "${socket_cache}" >"${socket}" 2>/dev/null; then
@@ -5805,7 +5825,7 @@ safe_gate_project_lane_scan_lines() {
                   "failed": "it failed", "no_result": "it left no readable result", "interrupted": "it was interrupted"};
     def count: type == "number" and . >= 0 and . == floor;
     def sname: type == "string" and test("\\A[a-z][a-z0-9._-]{0,31}\\z");
-    def sstatus: type == "string" and IN("partial", "skipped", "unavailable", "error");
+    def sstatus: type == "string" and IN("partial", "skipped", "unavailable", "error", "unsupported");
     (if length == 1 then .[0] else bad("no document or more than one document") end)
     | if (type != "object") or (.status | IN("completed", "not_completed") | not) or (.lockfile_published | type != "boolean") then bad("the document is not the summary") else . end
     | (if .status == "not_completed" then (if (.reason | type == "string") and (reasons[.reason] != null) then . else bad("a token outside its grammar") end)

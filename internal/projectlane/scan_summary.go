@@ -48,8 +48,10 @@ type ScanGap struct {
 	Status  string `json:"status"`
 }
 
-// ScanStatuses is the closed list of the producer's non-ok statuses.
-var ScanStatuses = map[string]bool{"partial": true, "skipped": true, "unavailable": true, "error": true}
+// ScanStatuses is the closed list of the producer's non-ok statuses: every status the real scan writes for a scanner (a tool of the
+// scan's core, or an ecosystem's audit). tests/contract/lane_auditor.sh holds this list to the statuses of the scan's own results,
+// taken from fixtures, and the gate's reading of the summary (sstatus in lib/gate-lib.sh) to this one.
+var ScanStatuses = map[string]bool{"partial": true, "skipped": true, "unavailable": true, "error": true, "unsupported": true}
 
 // ErrNoVerdict: the document is not one that carries a verdict.
 var ErrNoVerdict = errors.New("the scan result carries no verdict")

@@ -711,12 +711,12 @@ if [[ "${1:-}" == "repo-audit" ]]; then
     # Defaults are assigned first: inside a heredoc, ${var:-'{"a":1}'} keeps
     # the quotes literally and the document stops being JSON.
     stub_tool_status="${SAFE_AUDIT_SCAN_TOOL_STATUS:-}"
-    [[ -n "${stub_tool_status}" ]] || stub_tool_status='{"osv-scanner":{"status":"ok","note":null}}'
+    [[ -n "${stub_tool_status}" ]] || stub_tool_status='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"ok","note":null}}'
     stub_eco_audits="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}"
-    [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[]'
+    [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[{"scanner":"npm-audit","status":"ok","total":0,"critical":0,"high":0,"medium":0,"low":0,"unknown":0,"note":null,"root":"."}]'
     scan_critical="${SAFE_AUDIT_SCAN_CRITICAL:-0}"
-    stub_by_ecosystem=""
-    [[ -z "${SAFE_AUDIT_SCAN_BY_ECOSYSTEM:-}" ]] || stub_by_ecosystem=", \"by_ecosystem\": ${SAFE_AUDIT_SCAN_BY_ECOSYSTEM}"
+    # the real scan always writes the breakdown (an empty one when it has none); a case that wants a result without one deletes it
+    stub_by_ecosystem=", \"by_ecosystem\": ${SAFE_AUDIT_SCAN_BY_ECOSYSTEM:-{\}}"
     if [[ -n "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" ]]; then
       if [[ "$PWD" == "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT}" ]]; then
         scan_critical=1
@@ -726,8 +726,11 @@ if [[ "${1:-}" == "repo-audit" ]]; then
     fi
     cat > "${result_out}" <<JSON
 {
+  "machine": "local", "date": "2026-11-28", "timestamp": "2026-11-28T00:00:00+00:00", "target": ".", "strategy": "local-direct", "scan_mode": "deps", "sbom": "/dev/null",
   "verdict": "${SAFE_AUDIT_SCAN_VERDICT:-GO}",
-  "summary": {"packages_total": 3},
+  "summary": {"packages_total": 3, "ecosystems": {"npm": 3, "python": 0, "php": 0, "rust": 0, "go": 0}},
+  "source_scan": {"status": "skipped", "note": "source scan disabled in deps-only mode", "scanned_files": 0, "total": 0, "findings": []},
+  "delta": {"previous_scan": null, "packages_added": 0, "packages_removed": 0, "new_cves": []},
   "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "findings": []},
   "audit_totals": {
     "critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
@@ -8311,6 +8314,9 @@ assert_lane_untouched() {
 }
 
 LANE_HIT_CRITICAL='[{"id":"GHSA-crit-0001","severity":"critical","malware":false}]'
+# the audit a host-allow grant runs before it writes (`package-audit <spec> --ecosystem npm --json`), as the cases that script it answer it: the
+# members and types of the real answer (tests/contract/lane_auditor.sh holds the shape), here a WARN for a low Socket score
+LANE_PREFLIGHT_WARN='{"timestamp":"2026-11-28T00:00:00+00:00","source_identity":"implicit-default","spec":"fixture@1.0.0","package":"fixture","op":"install","ecosystem":"npm","installer":"npm","verdict":"WARN","resolved_versions":["1.0.0"],"resolution":{"status":"ok","method":"exact","source":"","range":""},"warn_causes":["socket_low_score"],"block":null,"has_install_script":null,"checks":{"socket":"WARN (score=40)","osv":"PASS (no known advisories for 1.0.0)","blocklist":"PASS (not blocked)","release_age":null},"release":null,"socket":{"available":true,"status":"ok","note":null,"cached":false,"cache_age_seconds":null,"raw":{"ok":true,"data":{}}},"osv":{"status":"ok","note":null,"vulns":[],"classification":{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]},"versions":[{"version":"1.0.0","classification":{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]}}]}}'
 LANE_HIT_HIGH='[{"id":"GHSA-high-0001","severity":"high","malware":false}]'
 LANE_HIT_MEDIUM='[{"id":"GHSA-med-00001","severity":"moderate","malware":false}]'
 LANE_CLEAN_ADD_MANIFEST='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","clean":"^2.0.0"}}'
@@ -8393,9 +8399,10 @@ case_project_lane_update_that_fixes_a_critical_passes() {
 # that writes a member the real entry does not (it once wrote `untied`, and the gate then required it of the real reader), or misses one, fails here.
 case_stand_in_auditor_answers_the_contract() {
   prepare_case "stand-in-contract"
-  local stub="${BIN_DIR}/safe-audit" out="${CASE_DIR}/answer.json" ok=1 problems label
+  local stub="${BIN_DIR}/safe-audit" out="${CASE_DIR}/answer.json" ok=1 problems
   local -a base=(env SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}")
-  shape() { # <label> <entry>: the answer in ${out} conforms
+  [[ "${SAFE_CORE_TEST_AVAILABLE}" != "1" ]] || export LANE_SHAPE_CORE="${SAFE_CORE_TEST_BIN}"
+  shape() { # <label> <entry>: the answer in ${out} is one document, no member repeated, with the members and types of the real answers
     if problems="$(lane_shape_check "$2" "${out}")"; then :; else printf '%s: %s\n' "$1" "${problems}" >&2; ok=0; fi
   }
   "${base[@]}" SAFE_AUDIT_EVIDENCE_HITS="{\"kept@1.0.0\":${LANE_HIT_CRITICAL}}" SAFE_AUDIT_EVIDENCE_MISSING='["gone@1.0.0"]' \
@@ -8404,14 +8411,18 @@ case_stand_in_auditor_answers_the_contract() {
   shape "the advisory evidence" evidence
   "${base[@]}" SAFE_AUDIT_SOCKET_OUTCOMES='{"a@1.0.0":"blocked","b@1.0.0":"adverse"}' SAFE_AUDIT_SOCKET_CACHED_BLOCKS='["c@1.0.0"]' SAFE_AUDIT_SOCKET_CACHE_GAP="" \
     "${stub}" package-audit --ecosystem npm --evidence-only <<<'{"roots":[{"name":"a","version":"1.0.0"},{"name":"b","version":"1.0.0"}],"cached":[{"name":"c","version":"1.0.0"}]}' >"${out}"
-  shape "the Socket evidence of named roots" socket_answer
-  "${base[@]}" "${stub}" package-audit --ecosystem npm --evidence-only <<<'{"roots":[],"cached":[]}' >"${out}"
-  shape "the Socket cache alone" socket_answer
+  shape "the Socket evidence of named roots and of the cache" socket_answer
   ( cd "${WORK_DIR}" && "${base[@]}" SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"npm":{"critical":0,"high":0,"medium":0,"low":0,"unknown":0}}' \
       "${stub}" repo-audit . --deps-only --allow-missing-tools --result-out "${out}" ) >/dev/null
   shape "the project scan" scan_result
   ( cd "${WORK_DIR}" && "${base[@]}" "${stub}" repo-audit . --deps-only --allow-missing-tools --result-out "${out}" ) >/dev/null
-  shape "the project scan without a breakdown" scan_result
+  shape "the project scan with no breakdown given" scan_result
+  # the audit a host-allow grant runs before it writes, as the cases that script it answer it (LANE_PREFLIGHT_WARN)
+  "${base[@]}" SAFE_AUDIT_PREFLIGHT_JSON="${LANE_PREFLIGHT_WARN}" SAFE_AUDIT_PREFLIGHT_STATUS=10 "${stub}" package-audit fixture@1.0.0 --ecosystem npm --json >"${out}" || true
+  shape "the audit a host-allow grant runs before it writes" package_audit_json
+  # a stand-in that stops answering is refused: no bytes, two documents
+  : >"${out}"
+  if lane_shape_check scan_result "${out}" >/dev/null 2>&1; then printf 'an empty answer was accepted\n' >&2; ok=0; fi
   if (( ok )); then pass "$FUNCNAME"; else fail "$FUNCNAME: the stub auditor differs from the real auditor's answers"; fi
 }
 
@@ -17101,7 +17112,7 @@ case_project_lane_tty3_a_cancellation_during_the_host_grant_reconfirmation_frees
     lane_prepare "lane-tty3-reconfirm-${sig}" kept@1.0.0
     before="$(lane_digests)"
     rm -f "$(lane_store)/host-allow.json"
-    export SAFE_AUDIT_PREFLIGHT_JSON='{"verdict":"WARN","warn_causes":["socket_low_score"]}' SAFE_AUDIT_PREFLIGHT_STATUS=10
+    export SAFE_AUDIT_PREFLIGHT_JSON="${LANE_PREFLIGHT_WARN}" SAFE_AUDIT_PREFLIGHT_STATUS=10
     cancel_run_at_prompt "${sig}" "{\"clean@2.0.0\":${LANE_HIT_HIGH}}" "$(lane_lock kept@1.0.0 clean@2.0.0)" $'a\n' 'anyway' "${OUT_FILE}"
     local crc=$?
     unset SAFE_AUDIT_PREFLIGHT_JSON SAFE_AUDIT_PREFLIGHT_STATUS

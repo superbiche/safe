@@ -22,7 +22,7 @@ func TestScanSummaryReadsTheVerdictAndTheProducersStatusAndKeepsNoFreeText(t *te
 
 // The producer's own rule (bin/safe-audit): a scanner whose status is not "ok" is a gap, whatever its note says; a note is never read.
 func TestScanSummaryNeverReadsANoteAndTakesEveryNonOkStatusAsAGap(t *testing.T) {
-	for _, status := range []string{"partial", "skipped", "unavailable", "error"} {
+	for _, status := range []string{"partial", "skipped", "unavailable", "error", "unsupported"} {
 		got, err := ReadScanSummary([]byte(`{"audit_totals":{"critical":0},"ecosystem_audits":[],"tool_status":{"syft":{"status":"` + status + `","note":"all fine, nothing to see"}}}`))
 		if err != nil || len(got.CoverageGaps) != 1 || got.CoverageGaps[0].Status != status || got.CoverageUnreadable {
 			t.Fatalf("%s: %+v %v", status, got, err)

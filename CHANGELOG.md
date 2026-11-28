@@ -9,6 +9,12 @@
   entry of the auditor the lane calls, for real and in an isolated home, and gives its answer to the gate's own consumer; the members and types of each
   answer are defined once (`tests/lib/lane_auditor_shapes.json`) and the stand-ins of the install suite and of the live binding suite are held to the
   same definition (the live stand-in lacked `cve_scan`). A live scenario runs the real auditor end to end.
+  Review round 1: the definition of the answers is no longer written by hand: the suite computes it from the real answers (fixtures that fill every
+  array) and generates `tests/lib/lane_auditor_shapes.json`; each case gives the real answer to the gate's real consumer and asserts an outcome that
+  depends on its content; the writers are called as the gate calls them; the live scenario builds its environment from nothing, with no `socket`
+  program reachable (the machine's own is never run), stdin closed and a home per case; the final answer of the Socket reader and the rows it wrote on
+  the way must agree or the root is unavailable; the audit a host-allow grant runs joins the list; the scan's `unsupported` status is named by the
+  summary; the gate no longer sends `untied` to the reader.
 ## 1.76.0 - 2026-11-28
 
 - Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a

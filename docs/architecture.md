@@ -305,13 +305,22 @@ defined once in `tests/lib/lane_auditor_shapes.json`, and every stand-in a suite
 | `package-audit --ecosystem npm --evidence-only` (no roots) | the identities whose cached Socket result may block | `safe_gate_project_lane_socket_cache_doc` |
 | `package-audit --ecosystem npm --evidence-only` (named roots) | the named roots | `safe_gate_project_lane_socket_roots_doc` |
 | `lane-acceptances` | the artifacts the decision left outstanding | `safe-core project-decide --acceptances` |
-| `lane-revoke` | the identities whose receipts adverse evidence supersedes | the gate's reading of `.revoked` |
+| `lane-revoke` | the identities whose receipts adverse evidence supersedes | `safe_gate_project_lane_revoke` (its reading of `.revoked`) |
 | `package-audit <spec> --gate install --op install` | a named root, after a verified publication | its exit, and the receipt it leaves (`safe_gate_project_lane_receipt`) |
-| `repo-audit . --deps-only --result-out` | the project, after a verified publication | `safe-core project-scan-summary` |
+| `package-audit <spec> --ecosystem npm --json` | the audit `safe-run host-allow add` runs before it writes (closed stdin, no initialisation) | `safe-run host-allow review` and the grant's preflight (`.verdict`, `.warn_causes`, `.block`, `.resolved_versions`) |
+| `repo-audit . --deps-only --result-out` | the project, after a verified publication | `safe_gate_project_lane_scan_report` (its exit status, then `safe-core project-scan-summary`) |
 | `record-installed`, `safe-run` host-allow | an answer the operator gave at a terminal | the stores the gate reads back; refuse in an agent session |
 
-The Socket entry answers `schema_version`, `roots`, `cached_blocks` and `cache_gap`. The operands the gate could not tie to the plan (`untied`)
-are the gate's own statement; the reader is never given them, and the gate does not ask the reader for them.
+The Socket entry answers `schema_version`, `roots`, `cached_blocks` and `cache_gap`. The request carries what the reader is asked (`roots` and
+`cached`) and nothing else. The operands the gate could not tie to the plan (`untied`) are the gate's own statement, kept in a file of its own that
+the reader never sees; the gate does not ask the reader for them. With the final answer accepted, it alone decides for a completed call; a root
+for which it and a row the reader appended as it went DISAGREE (or that the answer lacks and a row holds) is an unavailable result, never the
+weaker of the two.
+
+What each entry answers is not described by hand anywhere: `tests/contract/lane_auditor.sh` runs every real entry on fixtures that fill every
+array, computes the member paths and types of the real answers, and holds them byte for byte to `tests/lib/lane_auditor_shapes.json`, which it
+generates (`LANE_SHAPES_UPDATE=1` rewrites it; the file carries `generated_by`, and an edit by hand fails the suite). Every stand-in a suite uses is
+held to that file: no path and no type the real answers lack, every path they all have, exactly one document, no member repeated.
 
 ## Trust Tiers
 
