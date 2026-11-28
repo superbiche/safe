@@ -55,6 +55,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "project-releases" {
 		return projectReleases(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-advisory-get" {
+		return projectAdvisoryGet(args[1:], stdin, stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-advisory-put" {
+		return projectAdvisoryPut(args[1:], stdin, stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "project-roots" {
 		return projectRoots(args[1:], stdin, stdout, stderr)
 	}
@@ -104,6 +110,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectDiffUsage)
 		fmt.Fprintln(stderr, projectDecideUsage)
 		fmt.Fprintln(stderr, projectReleasesUsage)
+		fmt.Fprintln(stderr, projectAdvisoryGetUsage)
+		fmt.Fprintln(stderr, projectAdvisoryPutUsage)
 		fmt.Fprintln(stderr, projectRootsUsage)
 		fmt.Fprintln(stderr, projectBindUsage)
 		fmt.Fprintln(stderr, projectBaselineUsage)

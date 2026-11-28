@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Project lane (behind `install.project_lane`): a cache of the advisory reading (ticket 1671). The reader (`safe audit scanner-batch --evidence`,
+  the evidence mode only; the mode today's gate uses is unchanged) keeps the classified reading of one advisory record, per advisory, the
+  modification stamp the service gave with the membership answer, and the package, in the lane's state directory (`advisory-records/`, the
+  checks of the publish-time store, one writer: two new core commands, `project-advisory-get` and `project-advisory-put`). Which advisories
+  each identity carries is still asked of the service on every command (a known-malware record or a new advisory is seen by the next command),
+  now in calls of up to 1,000 identities (it was 100), and the blocklist is read once for all names instead of name by name (the per-name
+  reading still decides every name found). A reading is trusted for one day at most, never when dated in the future; 10,000 entries at most; a
+  failed, malformed or unclassifiable record stores nothing; without the state-directory argument the gate now passes, there is no cache. The
+  gate names nothing of the cache (lane lint R14). `lane_instrument` of the install suite copies the library as a directory of its own.
+
 ## 1.76.0 - 2026-11-28
 
 - Project lane (behind `install.project_lane`): reports, third pass (ticket 1639, last). Nothing this ticket added can refuse a command: a

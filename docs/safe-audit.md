@@ -841,3 +841,15 @@ lane runs the one installed beside safe's own dispatcher, never one named by `SA
 `PATH`). It keeps each validated answer per exact identity with its coverage. An advisory whose OSV record carries a
 withdrawal date (`withdrawn`) is removed before it can count: it is no hit and no gap, so it can neither be present,
 introduced nor fixed.
+
+Which advisories each identity carries is asked of OSV on every call, in requests of up to 1,000 identities (the
+service's limit; the plain batch keeps its 100). An advisory's record is the costly part (one fetch each), so the
+evidence mode may keep the classified reading of a record between two calls (ticket 1671), only when the caller names
+its state directory with `--state-dir <absolute path>` (never from the environment; without it nothing is kept). A
+reading is addressed by the advisory, the modification stamp OSV gave with the membership answer, and the queried
+package; it is trusted for one day at most and never when dated in the future, is held in
+`<state-dir>/advisory-records/` by `safe-core project-advisory-get` and `project-advisory-put` under the checks of
+the lane's other stores, and is never a decision, a policy label, a coverage statement or a hit list. A record that
+could not be fetched, read or classified is not stored, so a known-malware record or a new advisory is seen by the
+next call. The blocklist is read once for all the names (the per-name reading still decides each name a store holds
+an entry for).

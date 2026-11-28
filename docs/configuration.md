@@ -328,7 +328,21 @@ pass and warnings under `environment.release_follow`.
   recorded lockfiles get (a chain of private directories held by descriptor, entries that are regular files of mode
   0600 owned by the user, opened without following a link, and read with the repository's exact-object validator:
   repeated members, a second spelling of a field or trailing data make the entry ignored); an entry that fails a check
-  is ignored and read again, and a reading bounded by the last-modified time is never cached. A version the caller
+  is ignored and read again, and a reading bounded by the last-modified time is never cached. **The advisory reading
+  keeps one thing between two commands** (ticket 1671): which advisories each identity carries is asked of the service
+  on EVERY command, in calls of at most 1,000 identities (the service's limit; 1,000 queries took 1.6 s, the cap is 30 s),
+  so a known-malware record or a new advisory on a version already read is seen by the next command; the blocklist is
+  read on every command, once for all names. What is kept is the classified reading of one advisory record, per
+  (advisory, the modification stamp the service gave with that answer, the package it was read for), under
+  `project-lane/state/advisory-records/` with the same checks as the publish times; nothing else, in particular no
+  decision, no label the policy gave, no coverage and no hit list. A reading is trusted for one day at most whatever its
+  stamp (a constant: 86,400 s, the bound the scan cache sets for a reading) and never when it is dated in the future; the
+  store holds 10,000 entries, the oldest pruned by the one writer; a hit writes nothing. Nothing is stored for a record
+  that could not be fetched, read or classified. The reader is given the state directory as an argument by the gate
+  and has no cache without it. Measured (1,291 identities of a public lockfile, 117 advisories): the reading took 40 s cold
+  of which 24 s were the record fetches and 11 s local work (7 s of it the blocklist read name by name). A second command
+  fetches no record. A new advisory on the same version is therefore never delayed, and the cost of the bound
+  is that a record re-scored without a new stamp is read again within a day. A version the caller
   named exactly is waived under `exempt` (and waits under `enforce`, which says so) only when it REPLACES, at the same
   place in the graph, a baseline version of the same package that an advisory affects and that advisory is gone from
   the result, as the lane's own advisory evidence shows (aliases are matched by registry identity); when several

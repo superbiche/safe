@@ -821,6 +821,8 @@ if [[ "${1:-}" == "scanner-batch" ]]; then
   [[ -z "${SAFE_AUDIT_EVIDENCE_SLEEP:-}" ]] || sleep "${SAFE_AUDIT_EVIDENCE_SLEEP}"
   printf 'EVIDENCE_INPUT\t%s\n' "$(jq -c '[.packages[] | "\(.name)@\(.version)"] | sort' <<<"${evidence_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
   printf 'EVIDENCE_NAMES\t%s\n' "$(jq -c '(.blocklist_names // []) | sort' <<<"${evidence_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  # the arguments the reader was started with, in a file of their own (ticket 1671): the command log's shape is the cases' contract
+  printf '%s\n' "$*" >> "${SAFE_INSTALL_COMMAND_LOG}.evidence-args"
   [[ -z "${SAFE_AUDIT_EVIDENCE_STATUS:-}" ]] || exit "${SAFE_AUDIT_EVIDENCE_STATUS}"
   [[ -z "${SAFE_AUDIT_EVIDENCE_RAW:-}" ]] || { printf '%s' "${SAFE_AUDIT_EVIDENCE_RAW}"; exit 0; }
   ev_hits="${SAFE_AUDIT_EVIDENCE_HITS:-}"; [[ -n "${ev_hits}" ]] || ev_hits='{}'
@@ -8385,6 +8387,30 @@ case_project_lane_update_that_fixes_a_critical_passes() {
   pass "$FUNCNAME"
 }
 
+# ---- ticket 1671: the advisory reading's cache is the reader's alone ----------------------------------------------------------------------
+# The gate hands the reader the lane's state directory as an argument (the one directory its records are kept in, which the reader's own cache is
+# below) and names nothing of the cache; the lint (R14) holds the second half. Without the switch the reader is not started at all.
+case_project_lane_hands_the_reader_its_state_directory() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-reader-state" kept@1.0.0 vuln@1.0.0
+  local target
+  target="$(lane_lock kept@1.0.0 vuln@1.0.1)"
+  rm -f -- "${LOG_FILE}.evidence-args"
+  NPM_LOCK_MUTATION_JSON="${target}" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" \
+    lane_run 'npm update'
+  assert_status 0 "$FUNCNAME" || return
+  [[ -f "${LOG_FILE}.evidence-args" && "$(wc -l < "${LOG_FILE}.evidence-args")" == 1 ]] || { fail "$FUNCNAME: the reader was not started exactly once"; return; }
+  local args expected
+  args="$(cat -- "${LOG_FILE}.evidence-args")"
+  expected="scanner-batch --evidence --state-dir ${HOME_DIR}/.local/share/safe/project-lane/state"
+  [[ "${args}" == "${expected}" ]] || { fail "$FUNCNAME: the reader was started with '${args}', want '${expected}'"; return; }
+  [[ -d "${HOME_DIR}/.local/share/safe/project-lane/state" ]] || { fail "$FUNCNAME: the state directory the reader was given does not exist"; return; }
+  # the gate itself keeps nothing of the cache: no entry directory beside what the gate made
+  [[ ! -e "${HOME_DIR}/.local/share/safe/project-lane/state/advisory-records" ]] || { fail "$FUNCNAME: the gate made the cache's directory"; return; }
+  pass "$FUNCNAME"
+}
+
 # ---- ticket 1638: the lane runs no lifecycle script and says which ones it did not run --------------------------------------------
 # The report reads the judged lockfile and the published tree (safe-core project-scripts), never npm's messages. The stub's `ci` writes
 # what NPM_CI_PKG_EXTRA (members of a package's package.json, by install path) and NPM_CI_PKG_FILES (files, by install path) ask for.
@@ -8896,7 +8922,11 @@ SCAN_LINE='safe: project lane: project scan:'
 lane_instrument() {
   local lib="${CASE_DIR}/lib"
   [[ -L "${lib}" ]] || { fail "lane_instrument: the case's library is not the link it was"; return 1; }
-  rm -f -- "${lib}" && cp -a -- "${ROOT_DIR}/lib" "${lib}" || return 1
+  # The copy is a directory of its own whatever ROOT_DIR/lib is (a link, in a scratch tree of links, would be copied as a link and the
+  # instrumentation below would be written into the repository): the contents are copied, links dereferenced, then the copy is asserted.
+  rm -f -- "${lib}" && mkdir -- "${lib}" && cp -aL -- "${ROOT_DIR}/lib/." "${lib}" || return 1
+  [[ -d "${lib}" && ! -L "${lib}" && -f "${lib}/gate-lib.sh" && ! -L "${lib}/gate-lib.sh" ]] || { fail "lane_instrument: the case's library is not a directory of its own"; return 1; }
+  [[ "$(stat -c %i -- "${lib}/gate-lib.sh")" != "$(stat -c %i -- "${ROOT_DIR}/lib/gate-lib.sh")" ]] || { fail "lane_instrument: the case's library is the repository's file"; return 1; }
   [[ "$(grep -c '^  SAFE_GATE_LANE_SCRATCH="${scratch}"$' "${lib}/gate-lib.sh")" == 1 ]] || { fail "lane_instrument: the anchor is not there once"; return 1; }
   sed -i 's|^  SAFE_GATE_LANE_SCRATCH="${scratch}"$|&\n  printf "%s\\n" "${BASHPID}" > "${HOME}/lane.pid"|' "${lib}/gate-lib.sh"
   grep -q 'lane.pid' "${lib}/gate-lib.sh" || { fail "lane_instrument: not instrumented"; return 1; }
@@ -18346,6 +18376,7 @@ main() {
     case_project_lane_switch_off_keeps_todays_gate \
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
+    case_project_lane_hands_the_reader_its_state_directory \
     case_project_lane_scan_report_prints_critical_findings_by_ecosystem_and_coverage_failures_and_keeps_the_status \
     case_project_lane_scan_faults_leave_the_exit_status_exactly_as_it_is \
     case_project_lane_report_a_ci_count_that_cannot_be_read_refuses_nothing \

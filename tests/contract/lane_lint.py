@@ -32,6 +32,8 @@ Rules
       which returns 0 only and is called once, from the lane's entry, as `|| true`, between the scan and the scratch's removal; a path
       into `reports` (the lane's reports directory) appears only on the line that makes it private: nothing of the gate reads, lists, copies
       or removes a report. The facts the document rests on have owners.
+  R14 the advisory reading's cache is the reader's alone (ticket 1671): the gate hands the reader its state directory as an argument and names
+      neither the cache's directory nor the core commands that read and write it, anywhere in the file.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -88,6 +90,9 @@ STATE = {
 # is made private and nowhere else: nothing of the gate reads, lists, copies or removes a report
 REPORT_WRITER = "safe_gate_project_lane_report_write"
 REPORTS_DIR = re.compile(r"/reports(?![A-Za-z0-9_-])|(?<![A-Za-z0-9_-])reports/|\"reports\"|'reports'")
+# R14: the advisory reading's cache (ticket 1671) belongs to the reader (the auditor's evidence mode, through two commands of the core): the
+# gate gives the reader its state directory and names neither the directory the readings are kept in nor the commands that read and write it
+ADVISORY_CACHE = re.compile(r"advisory-records|project-advisory")
 # R12: the scan after the lane is a report: it ends the lane's own business never (its function returns 0 and nothing else, never exits),
 # it is called once, from the entry, as `|| true`, after the lock is released and before the scratch is freed
 SCAN_ENTRY = "safe_gate_project_lane_scan_report"
@@ -397,6 +402,9 @@ def main(path):
     for n, fn, t in logical:
         if REPORTS_DIR.search(t):
             problems.append(f"{n}:{fn}:R13: the reports directory is named in the gate (the writer alone establishes it)")
+    for n, fn, t in logical:
+        if ADVISORY_CACHE.search(t):
+            problems.append(f"{n}:{fn}:R14: the advisory reading's cache is named in the gate (the reader alone keeps it)")
     if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
         problems.append("0::R9: the runner does not read the standing decision exactly once")
     # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them

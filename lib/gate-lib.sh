@@ -7201,7 +7201,7 @@ safe_gate_project_lane_run() {
   SAFE_GATE_LANE_PHASE=judging
   evidence_read_at="${SECONDS}"
   local evidence_why=""
-  "${lane_audit}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
+  "${lane_audit}" scanner-batch --evidence --state-dir "${state_dir}" <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
   if (( rc != 0 )); then
     evidence_why="the advisory reader exited ${rc}"
   elif ! jq -e '.schema_version == 1 and (.identities | type == "array") and (.blocklist | type == "array")' "${evidence}" >/dev/null 2>&1; then
